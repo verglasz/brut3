@@ -9,7 +9,9 @@ const HELP: &str = "\
 commands:
   <move>               play a move: r1c2/r0c0 (board/square), or four digits: 1 2 0 0
   new [x|o]            new game; you play X (default) or O
-  agent <spec>         choose the opponent: random [seed] | mcts [simulations] [seed]
+  agent <spec>         choose the opponent:
+                         random [seed] | greedy [seed] | minimax [depth] [seed]
+                         | mcts [simulations] [seed]
   moves                list legal moves
   show                 print the board
   hint                 ask the agent what it would play here

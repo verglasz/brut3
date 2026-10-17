@@ -9,7 +9,8 @@ use super::{BoardStatus, GameState, LINES, Move, Outcome, Player, Position, Squa
 /// All nine squares set.
 const FULL: u16 = 0x1FF;
 
-const LINE_MASKS: [u16; 8] = {
+/// The eight lines as 9-bit masks.
+pub(crate) const LINE_MASKS: [u16; 8] = {
     let mut masks = [0u16; 8];
     let mut i = 0;
     while i < 8 {
@@ -114,6 +115,20 @@ impl BitState {
 
     pub fn last_move(&self) -> Option<Move> {
         self.last_move
+    }
+
+    // --- Mask accessors for in-crate heuristics. Not public: the bit layout is private. ---
+
+    pub(crate) fn board_marks(&self, player: Player, board: usize) -> u16 {
+        self.marks[player.index()][board]
+    }
+
+    pub(crate) fn big_marks(&self, player: Player) -> u16 {
+        self.big[player.index()]
+    }
+
+    pub(crate) fn done_mask(&self) -> u16 {
+        self.done
     }
 }
 

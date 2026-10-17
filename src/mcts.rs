@@ -311,6 +311,7 @@ impl<A: UtttAgent> UtttAgent for Mcts<A> {
 mod tests {
     use super::*;
     use crate::agent::RandomAgent;
+    use crate::game::test_positions::x_wins_in_one;
     use crate::game::{BitState, Outcome, Player, Position, sq};
 
     fn cfg(simulations: u32) -> MctsConfig {
@@ -318,28 +319,6 @@ mod tests {
             simulations,
             ..Default::default()
         }
-    }
-
-    /// X has won boards (0,0) and (0,1), has two in a row on (0,2), and is forced to play there.
-    fn x_wins_in_one() -> BitState {
-        let mut p = Position::initial();
-        for b in [sq(0, 0), sq(0, 1)] {
-            for s in [sq(1, 0), sq(1, 1), sq(1, 2)] {
-                p.set_cell(Move::new(b, s), Some(Player::X));
-            }
-        }
-        p.set_cell(Move::new(sq(0, 2), sq(0, 0)), Some(Player::X));
-        p.set_cell(Move::new(sq(0, 2), sq(0, 1)), Some(Player::X));
-        // Some O marks so O's last move (into square (0,2) of board (1,1)) is plausible.
-        for s in [sq(2, 0), sq(2, 1), sq(0, 2)] {
-            p.set_cell(Move::new(sq(1, 1), s), Some(Player::O));
-        }
-        p.set_last_move(Some(Move::new(sq(1, 1), sq(0, 2))));
-        p.set_to_move(Player::X);
-        let state = BitState::from_position(&p);
-        assert_eq!(state.outcome(), None);
-        assert_eq!(state.legal_moves_vec().len(), 7);
-        state
     }
 
     #[test]

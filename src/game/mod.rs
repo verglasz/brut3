@@ -287,6 +287,85 @@ pub(crate) fn sq(row: u8, col: u8) -> Square {
     Square::new(row, col).expect("test square in range")
 }
 
+/// Positions shared by tests across modules.
+#[cfg(test)]
+pub(crate) mod test_positions {
+    use super::*;
+
+    /// X has won boards (0,0) and (0,1), has two in a row on (0,2), and is forced to play
+    /// there. `r0c2/r0c2` wins on the spot; 7 legal moves.
+    pub fn x_wins_in_one() -> BitState {
+        let mut p = Position::initial();
+        for b in [sq(0, 0), sq(0, 1)] {
+            for s in [sq(1, 0), sq(1, 1), sq(1, 2)] {
+                p.set_cell(Move::new(b, s), Some(Player::X));
+            }
+        }
+        p.set_cell(Move::new(sq(0, 2), sq(0, 0)), Some(Player::X));
+        p.set_cell(Move::new(sq(0, 2), sq(0, 1)), Some(Player::X));
+        // Some O marks so O's last move (into square (0,2) of board (1,1)) is plausible.
+        for s in [sq(2, 0), sq(2, 1), sq(0, 2)] {
+            p.set_cell(Move::new(sq(1, 1), s), Some(Player::O));
+        }
+        p.set_last_move(Some(Move::new(sq(1, 1), sq(0, 2))));
+        p.set_to_move(Player::X);
+        let state = BitState::from_position(&p);
+        assert_eq!(state.outcome(), None);
+        assert_eq!(state.legal_moves_vec().len(), 7);
+        state
+    }
+
+    pub const X_WINNING_MOVE: Move = Move::new(Square::from_index(2), Square::from_index(2));
+
+    /// Same as [`x_wins_in_one`] but with O to move, forced to board (0,2), where X threatens
+    /// to win the game on square (0,2). Blocking is the obvious move, but not forced: O can
+    /// instead send X to another board.
+    pub fn o_threatened() -> BitState {
+        let mut p = x_wins_in_one().to_position();
+        p.set_to_move(Player::O);
+        BitState::from_position(&p)
+    }
+
+    /// O to move, forced to board (0,2), where X has `r0c0 r0c1` and O holds the centre;
+    /// every other board is decided with no big line, so any non-blocking move gives X a free
+    /// move and the game, while blocking holds (O can parry X's one remaining line).
+    ///
+    /// Big board: `X X .` / `O X O` / `O # O`.
+    pub fn o_must_block() -> BitState {
+        let mut p = Position::initial();
+        let won = [
+            (sq(0, 0), Player::X),
+            (sq(0, 1), Player::X),
+            (sq(1, 0), Player::O),
+            (sq(1, 1), Player::X),
+            (sq(1, 2), Player::O),
+            (sq(2, 0), Player::O),
+            (sq(2, 2), Player::O),
+        ];
+        for (b, w) in won {
+            for s in [sq(1, 0), sq(1, 1), sq(1, 2)] {
+                p.set_cell(Move::new(b, s), Some(w));
+            }
+        }
+        let x = Some(Player::X);
+        let o = Some(Player::O);
+        for (i, v) in [x, o, x, x, o, o, o, x, x].into_iter().enumerate() {
+            p.set_cell(Move::new(sq(2, 1), Square::from_index(i)), v);
+        }
+        p.set_cell(Move::new(sq(0, 2), sq(0, 0)), Some(Player::X));
+        p.set_cell(Move::new(sq(0, 2), sq(0, 1)), Some(Player::X));
+        p.set_cell(Move::new(sq(0, 2), sq(1, 1)), Some(Player::O));
+        // X's last move went to square (0,2) of a board X owns, sending O to board (0,2).
+        p.set_cell(Move::new(sq(1, 1), sq(0, 2)), Some(Player::X));
+        p.set_last_move(Some(Move::new(sq(1, 1), sq(0, 2))));
+        p.set_to_move(Player::O);
+        let state = BitState::from_position(&p);
+        assert_eq!(state.outcome(), None);
+        assert_eq!(state.legal_moves_vec().len(), 6);
+        state
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

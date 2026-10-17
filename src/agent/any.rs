@@ -5,14 +5,23 @@
 
 use std::fmt;
 
-use super::{Evaluation, RandomAgent, UtttAgent};
+use super::{Evaluation, GreedyAgent, MinimaxAgent, RandomAgent, UtttAgent};
 use crate::game::{BitState, Move};
 use crate::mcts::{Mcts, MctsConfig};
 
-/// How to build an agent. Parsed from words like `random`, `random 7`, `mcts`, `mcts 800 3`.
+/// How to build an agent. Parsed from words like `random`, `greedy 7`, `minimax 4`, `mcts 800 3`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentSpec {
     Random {
+        seed: u64,
+    },
+    /// One-ply lookahead on the static heuristic.
+    Greedy {
+        seed: u64,
+    },
+    /// Alpha-beta search of `depth` plies on the static heuristic.
+    Minimax {
+        depth: u32,
         seed: u64,
     },
     /// MCTS with random playouts.
@@ -22,10 +31,13 @@ pub enum AgentSpec {
     },
 }
 
+const NAMES: &str = "`random`, `greedy`, `minimax` or `mcts`";
+
 impl AgentSpec {
     pub const DEFAULT_SIMULATIONS: u32 = 400;
 
-    /// Parses `random [seed]` or `mcts [simulations] [seed]`.
+    /// Parses `random [seed]`, `greedy [seed]`, `minimax [depth] [seed]` or
+    /// `mcts [simulations] [seed]`.
     pub fn parse(words: &[&str]) -> Result<Self, String> {
         fn num<T: std::str::FromStr>(
             words: &[&str],
@@ -44,18 +56,27 @@ impl AgentSpec {
             Some("random") => Ok(Self::Random {
                 seed: num(words, 1, "seed", 0)?,
             }),
+            Some("greedy") => Ok(Self::Greedy {
+                seed: num(words, 1, "seed", 0)?,
+            }),
+            Some("minimax") => Ok(Self::Minimax {
+                depth: num(words, 1, "depth", MinimaxAgent::DEFAULT_DEPTH)?,
+                seed: num(words, 2, "seed", 0)?,
+            }),
             Some("mcts") => Ok(Self::Mcts {
                 simulations: num(words, 1, "simulations", Self::DEFAULT_SIMULATIONS)?,
                 seed: num(words, 2, "seed", 0)?,
             }),
-            Some(other) => Err(format!("unknown agent {other:?}; try `random` or `mcts`")),
-            None => Err("missing agent name; try `random` or `mcts`".into()),
+            Some(other) => Err(format!("unknown agent {other:?}; try {NAMES}")),
+            None => Err(format!("missing agent name; try {NAMES}")),
         }
     }
 
     pub fn build(&self) -> AnyAgent {
         match *self {
             AgentSpec::Random { seed } => AnyAgent::Random(RandomAgent::new(seed)),
+            AgentSpec::Greedy { seed } => AnyAgent::Greedy(GreedyAgent::new(seed)),
+            AgentSpec::Minimax { depth, seed } => AnyAgent::Minimax(MinimaxAgent::new(depth, seed)),
             AgentSpec::Mcts { simulations, seed } => AnyAgent::Mcts(Mcts::new(
                 RandomAgent::new(seed ^ 0x9E37_79B9_7F4A_7C15),
                 MctsConfig {
@@ -81,6 +102,8 @@ impl fmt::Display for AgentSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AgentSpec::Random { seed } => write!(f, "random (seed {seed})"),
+            AgentSpec::Greedy { seed } => write!(f, "greedy (seed {seed})"),
+            AgentSpec::Minimax { depth, seed } => write!(f, "minimax (depth {depth}, seed {seed})"),
             AgentSpec::Mcts { simulations, seed } => {
                 write!(
                     f,
@@ -96,6 +119,8 @@ impl fmt::Display for AgentSpec {
 #[allow(clippy::large_enum_variant)]
 pub enum AnyAgent {
     Random(RandomAgent<BitState>),
+    Greedy(GreedyAgent),
+    Minimax(MinimaxAgent),
     Mcts(Mcts<RandomAgent<BitState>>),
 }
 
@@ -105,6 +130,8 @@ impl UtttAgent for AnyAgent {
     fn choose_move(&mut self, state: &BitState) -> Move {
         match self {
             AnyAgent::Random(a) => a.choose_move(state),
+            AnyAgent::Greedy(a) => a.choose_move(state),
+            AnyAgent::Minimax(a) => a.choose_move(state),
             AnyAgent::Mcts(a) => a.choose_move(state),
         }
     }
@@ -112,6 +139,8 @@ impl UtttAgent for AnyAgent {
     fn evaluate(&mut self, state: &BitState) -> Evaluation {
         match self {
             AnyAgent::Random(a) => a.evaluate(state),
+            AnyAgent::Greedy(a) => a.evaluate(state),
+            AnyAgent::Minimax(a) => a.evaluate(state),
             AnyAgent::Mcts(a) => a.evaluate(state),
         }
     }
@@ -119,6 +148,8 @@ impl UtttAgent for AnyAgent {
     fn evaluate_batch(&mut self, states: &[BitState], out: &mut Vec<Evaluation>) {
         match self {
             AnyAgent::Random(a) => a.evaluate_batch(states, out),
+            AnyAgent::Greedy(a) => a.evaluate_batch(states, out),
+            AnyAgent::Minimax(a) => a.evaluate_batch(states, out),
             AnyAgent::Mcts(a) => a.evaluate_batch(states, out),
         }
     }
@@ -154,7 +185,15 @@ mod tests {
             })
         );
         assert!(AgentSpec::parse(&["mcts", "lots"]).is_err());
-        assert!(AgentSpec::parse(&["minimax"]).is_err());
+        assert_eq!(
+            AgentSpec::parse(&["greedy"]),
+            Ok(AgentSpec::Greedy { seed: 0 })
+        );
+        assert_eq!(
+            AgentSpec::parse(&["minimax", "3", "2"]),
+            Ok(AgentSpec::Minimax { depth: 3, seed: 2 })
+        );
+        assert!(AgentSpec::parse(&["alphabeta"]).is_err());
         assert!(AgentSpec::parse(&[]).is_err());
     }
 
@@ -162,6 +201,8 @@ mod tests {
     fn built_agents_play_legal_moves() {
         for spec in [
             AgentSpec::Random { seed: 1 },
+            AgentSpec::Greedy { seed: 1 },
+            AgentSpec::Minimax { depth: 2, seed: 1 },
             AgentSpec::Mcts {
                 simulations: 20,
                 seed: 1,

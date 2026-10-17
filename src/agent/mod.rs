@@ -1,9 +1,14 @@
 //! The [`UtttAgent`] trait: anything that can pick a move and evaluate a position.
 
 pub mod any;
+pub mod greedy;
+pub mod heuristic;
+pub mod minimax;
 pub mod random;
 
 pub use any::{AgentSpec, AnyAgent};
+pub use greedy::GreedyAgent;
+pub use minimax::MinimaxAgent;
 pub use random::RandomAgent;
 
 use crate::game::{GameState, Move};
