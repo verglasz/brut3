@@ -1,7 +1,9 @@
 //! The [`UtttAgent`] trait: anything that can pick a move and evaluate a position.
 
+pub mod any;
 pub mod random;
 
+pub use any::{AgentSpec, AnyAgent};
 pub use random::RandomAgent;
 
 use crate::game::{GameState, Move};

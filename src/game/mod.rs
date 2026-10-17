@@ -11,6 +11,7 @@ pub use bitboard::BitState;
 pub use position::Position;
 
 use std::fmt;
+use std::str::FromStr;
 
 /// One of the two players. `X` moves first.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -108,6 +109,32 @@ impl fmt::Display for Square {
     }
 }
 
+/// Error from parsing a [`Square`] or [`Move`] from text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParseError(pub String);
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+impl FromStr for Square {
+    type Err = ParseError;
+
+    /// Parses the `Display` form, e.g. `r1c2`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let err = || ParseError(format!("expected a square like r1c2, got {s:?}"));
+        let rest = s.strip_prefix('r').ok_or_else(err)?;
+        let (row, col) = rest.split_once('c').ok_or_else(err)?;
+        let row: u8 = row.parse().map_err(|_| err())?;
+        let col: u8 = col.parse().map_err(|_| err())?;
+        Square::new(row, col).ok_or_else(err)
+    }
+}
+
 /// A move: which small board, and which square inside it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub struct Move {
@@ -135,6 +162,18 @@ impl Move {
 impl fmt::Display for Move {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.board, self.square)
+    }
+}
+
+impl FromStr for Move {
+    type Err = ParseError;
+
+    /// Parses the `Display` form, e.g. `r1c2/r0c0` (board, then square).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (board, square) = s
+            .split_once('/')
+            .ok_or_else(|| ParseError(format!("expected a move like r1c2/r0c0, got {s:?}")))?;
+        Ok(Move::new(board.parse()?, square.parse()?))
     }
 }
 
@@ -270,6 +309,17 @@ mod tests {
         let mv = Move::new(sq(2, 1), sq(0, 2));
         assert_eq!(mv.index(), 7 * 9 + 2);
         assert_eq!(mv.to_string(), "r2c1/r0c2");
+    }
+
+    #[test]
+    fn parse_square_and_move() {
+        assert_eq!("r2c1".parse::<Square>(), Ok(sq(2, 1)));
+        assert!("r3c1".parse::<Square>().is_err());
+        assert!("2,1".parse::<Square>().is_err());
+        let mv = Move::new(sq(2, 1), sq(0, 2));
+        assert_eq!(mv.to_string().parse::<Move>(), Ok(mv));
+        assert!("r2c1".parse::<Move>().is_err());
+        assert!("r2c1/r0c3".parse::<Move>().is_err());
     }
 
     #[test]
