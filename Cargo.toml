@@ -4,4 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-burn = { version = "0.21.0", features = ["cuda", "wgpu", "cpu"] }
+burn = { version = "0.21.0", optional = true }
+rand = { version = "0.9", features = ["small_rng"] }
+
+[features]
+# Default: every backend that builds with no extra system requirements.
+default = ["ndarray", "wgpu"]
+# Pulls in burn itself plus the pieces every backend needs (training + weight storage).
+nn = ["dep:burn", "burn/autodiff", "burn/store"]
+# Pure-Rust CPU backend.
+ndarray = ["nn", "burn/ndarray"]
+# Portable GPU backend (Vulkan/Metal/DX12); no SDK needed at build time.
+wgpu = ["nn", "burn/wgpu"]
+# Opt-in backends, each needing something on the system:
+# CUDA toolkit + nvcc (CUDA_PATH) and nccl.h at build time.
+cuda = ["nn", "burn/cuda"]
+# CubeCL CPU backend; downloads a prebuilt LLVM/MLIR 20 on first build.
+cpu-mlir = ["nn", "burn/cpu"]
