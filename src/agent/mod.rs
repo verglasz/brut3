@@ -1,5 +1,9 @@
 //! The [`UtttAgent`] trait: anything that can pick a move and evaluate a position.
 
+pub mod random;
+
+pub use random::RandomAgent;
+
 use crate::game::{GameState, Move};
 
 /// What an agent thinks of a position, from the perspective of the side to move.
@@ -61,44 +65,7 @@ pub trait UtttAgent {
 }
 
 #[cfg(test)]
-pub(crate) mod test_agents {
-    use std::marker::PhantomData;
-
-    use rand::{Rng, SeedableRng, rngs::SmallRng};
-
-    use super::UtttAgent;
-    use crate::game::{GameState, Move};
-
-    /// Uniformly random legal moves. Test-only for now; the public simple agents come later.
-    pub struct RandomAgent<S> {
-        rng: SmallRng,
-        buf: Vec<Move>,
-        _state: PhantomData<S>,
-    }
-
-    impl<S> RandomAgent<S> {
-        pub fn new(seed: u64) -> Self {
-            Self {
-                rng: SmallRng::seed_from_u64(seed),
-                buf: Vec::new(),
-                _state: PhantomData,
-            }
-        }
-    }
-
-    impl<S: GameState> UtttAgent for RandomAgent<S> {
-        type State = S;
-
-        fn choose_move(&mut self, state: &S) -> Move {
-            state.legal_moves(&mut self.buf);
-            self.buf[self.rng.random_range(0..self.buf.len())]
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use super::test_agents::RandomAgent;
     use super::*;
     use crate::game::{BitState, Outcome, Player, Position, sq};
 

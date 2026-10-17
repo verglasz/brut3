@@ -310,7 +310,7 @@ impl<A: UtttAgent> UtttAgent for Mcts<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::test_agents::RandomAgent;
+    use crate::agent::RandomAgent;
     use crate::game::{BitState, Outcome, Player, Position, sq};
 
     fn cfg(simulations: u32) -> MctsConfig {

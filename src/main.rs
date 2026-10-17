@@ -1,27 +1,28 @@
-use ultimate_ttt_burn::game::{BitState, GameState, Move, Position, Square};
+use ultimate_ttt_burn::agent::{RandomAgent, UtttAgent};
+use ultimate_ttt_burn::game::{BitState, GameState, Player};
+use ultimate_ttt_burn::mcts::{Mcts, MctsConfig};
 
+/// Demo: MCTS with random playouts (as X) against a random agent (as O).
 fn main() {
-    let sq = |r, c| Square::new(r, c).expect("in range");
-    let mut state = BitState::initial();
-    // A short opening showing the forced-board rule.
-    for mv in [
-        Move::new(sq(1, 1), sq(0, 2)),
-        Move::new(sq(0, 2), sq(1, 1)),
-        Move::new(sq(1, 1), sq(2, 0)),
-        Move::new(sq(2, 0), sq(1, 1)),
-    ] {
-        state.apply(mv);
-    }
-    let position: Position = state.to_position();
-    println!("{position}");
-    let moves = state.legal_moves_vec();
-    println!(
-        "{} legal moves: {}",
-        moves.len(),
-        moves
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(" ")
+    let mut mcts = Mcts::new(
+        RandomAgent::<BitState>::new(1),
+        MctsConfig {
+            simulations: 400,
+            ..Default::default()
+        },
     );
+    let mut random = RandomAgent::<BitState>::new(2);
+    let mut state = BitState::initial();
+    let outcome = loop {
+        if let Some(outcome) = state.outcome() {
+            break outcome;
+        }
+        let mv = match state.to_move() {
+            Player::X => mcts.choose_move(&state),
+            Player::O => random.choose_move(&state),
+        };
+        println!("{} plays {mv}", state.to_move());
+        state.apply(mv);
+    };
+    println!("\n{}\n\nresult: {outcome:?}", state.to_position());
 }

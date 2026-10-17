@@ -102,12 +102,12 @@ The search is generic over the agent that evaluates leaves:
 Present:
 
 - Game rules with two `GameState` implementations, cross-checked by a differential fuzz test.
-- `UtttAgent` trait and `Mcts` search, tested against a random opponent.
+- `UtttAgent` trait, `RandomAgent`, and `Mcts` search, tested against the random agent.
 - Cargo feature layout for the burn backends (no network code yet).
 
 Planned next, roughly in order:
 
-- [ ] Public simple agents: random, one-ply greedy, shallow minimax
+- [ ] More simple agents: one-ply greedy, shallow minimax
 - [ ] Batched leaf evaluation with virtual loss, tree reuse between moves
 - [ ] Network definition in burn, position -> tensor encoding, runtime backend selection
 - [ ] Self-play, replay buffer, training loop, model checkpointing
@@ -121,8 +121,9 @@ src/
   game/mod.rs       Player, Square, Move, Outcome, BoardStatus, GameState trait
   game/position.rs  Position: reference implementation + Display
   game/bitboard.rs  BitState: bitboard implementation
-  agent.rs          UtttAgent trait, Evaluation
+  agent/mod.rs      UtttAgent trait, Evaluation
+  agent/random.rs   RandomAgent
   mcts.rs           Mcts, MctsConfig, SearchResult
-  main.rs           small demo
+  main.rs           demo game: Mcts<RandomAgent> vs RandomAgent
 Cargo.toml          burn 0.21 behind backend features
 ```
