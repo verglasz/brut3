@@ -95,7 +95,8 @@ The search is generic over the agent that evaluates leaves:
   the fast bitboard used by search.
 - `agent::UtttAgent` has an associated `State: GameState`, `choose_move`, and `evaluate`, which
   returns a value in `[-1, 1]` plus optional move priors. The default `evaluate` is a playout
-  using `choose_move`; a network agent overrides it (and `evaluate_batch`).
+  using `choose_move`; the heuristic agents return their static value; a network agent will
+  override `evaluate_batch` to run one forward pass per batch of leaves.
 - `mcts::Mcts<A: UtttAgent>` is a PUCT search over an arena tree. With no priors it behaves as
   plain UCT with rollouts; with network priors it is the AlphaZero search. `Mcts<A>` itself
   implements `UtttAgent`, so searches compose and its visit distribution can feed training.
@@ -105,14 +106,16 @@ The search is generic over the agent that evaluates leaves:
 Present:
 
 - Game rules with two `GameState` implementations, cross-checked by a differential fuzz test.
-- `UtttAgent` trait, `RandomAgent`, and `Mcts` search, tested against the random agent.
+- `UtttAgent` trait and simple agents: random, greedy (one ply of a static heuristic), and
+  depth-limited alpha-beta minimax on the same heuristic.
+- `Mcts` search with batched leaf evaluation and virtual loss (`batch_size` in `MctsConfig`),
+  tested against the random agent.
 - `AnyAgent`, one concrete enum over the built agents, and a REPL for interactive play.
 - Cargo feature layout for the burn backends (no network code yet).
 
 Planned next, roughly in order:
 
-- [ ] More simple agents: one-ply greedy, shallow minimax
-- [ ] Batched leaf evaluation with virtual loss, tree reuse between moves
+- [ ] Tree reuse between moves
 - [ ] Network definition in burn, position -> tensor encoding, runtime backend selection
 - [ ] Self-play, replay buffer, training loop, model checkpointing
 - [ ] CLI for agent-vs-agent matches, training, benchmarks
@@ -127,6 +130,9 @@ src/
   game/bitboard.rs  BitState: bitboard implementation
   agent/mod.rs      UtttAgent trait, Evaluation
   agent/random.rs   RandomAgent
+  agent/heuristic.rs static evaluation shared by greedy and minimax
+  agent/greedy.rs   GreedyAgent
+  agent/minimax.rs  MinimaxAgent
   agent/any.rs      AgentSpec, AnyAgent (concrete enum over all agents)
   repl.rs           interactive play
   mcts.rs           Mcts, MctsConfig, SearchResult

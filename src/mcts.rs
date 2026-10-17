@@ -3,6 +3,11 @@
 //! With an agent whose [`UtttAgent::evaluate`] does random playouts and returns no priors this
 //! is classic rollout MCTS; with a network agent returning priors and a value it is the
 //! AlphaZero search. One code path covers both.
+//!
+//! Leaves are evaluated in batches: up to `batch_size` paths are selected per round, each
+//! claimed leaf carrying a virtual loss so the next selection goes elsewhere, and the agent's
+//! [`UtttAgent::evaluate_batch`] sees them all at once. With `batch_size = 1` this is plain
+//! sequential MCTS.
 
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
@@ -11,13 +16,18 @@ use crate::game::{GameState, Move, Outcome};
 
 #[derive(Clone, Debug)]
 pub struct MctsConfig {
-    /// Simulations per search (one leaf expansion each).
+    /// Leaf evaluations per search (terminal leaves count too).
     pub simulations: u32,
     /// Exploration constant in the PUCT formula.
     pub c_puct: f32,
     /// Move selection: `0` picks the most visited move; `> 0` samples proportionally to
     /// `visits^(1/temperature)` (used for self-play diversity).
     pub temperature: f32,
+    /// Leaves selected per evaluation round. `1` = sequential search.
+    pub batch_size: usize,
+    /// Value a claimed-but-unevaluated leaf is assumed to have, from its parent's view, while
+    /// the rest of the batch is selected. Keeps one round from piling onto a single leaf.
+    pub virtual_loss: f32,
     pub seed: u64,
 }
 
@@ -27,6 +37,8 @@ impl Default for MctsConfig {
             simulations: 800,
             c_puct: 1.4,
             temperature: 0.0,
+            batch_size: 1,
+            virtual_loss: 1.0,
             seed: 0x5EED,
         }
     }
@@ -65,28 +77,36 @@ struct Node<S> {
     state: S,
     /// Move that led here; `None` for the root.
     mv: Option<Move>,
+    parent: u32,
     /// Children are contiguous: `first_child..first_child + n_children`.
     first_child: u32,
     n_children: u8,
     expanded: bool,
+    /// Claimed by the current batch, awaiting evaluation.
+    pending: bool,
     visits: u32,
     /// Sum of backed-up values, from the perspective of the side to move *at this node*.
     value_sum: f32,
+    /// Virtual losses currently applied (paths through here claimed in the current batch).
+    virtual_losses: u32,
     prior: f32,
     outcome: Option<Outcome>,
 }
 
 impl<S: GameState> Node<S> {
-    fn new(state: S, mv: Option<Move>, prior: f32) -> Self {
+    fn new(state: S, mv: Option<Move>, parent: u32, prior: f32) -> Self {
         let outcome = state.outcome();
         Self {
             state,
             mv,
+            parent,
             first_child: NO_NODE,
             n_children: 0,
             expanded: false,
+            pending: false,
             visits: 0,
             value_sum: 0.0,
+            virtual_losses: 0,
             prior,
             outcome,
         }
@@ -96,12 +116,19 @@ impl<S: GameState> Node<S> {
         self.first_child..self.first_child + self.n_children as u32
     }
 
-    /// Mean value from the perspective of the *parent's* side to move.
-    fn q_for_parent(&self) -> f32 {
-        if self.visits == 0 {
+    /// Visits including virtual ones.
+    fn effective_visits(&self) -> u32 {
+        self.visits + self.virtual_losses
+    }
+
+    /// Mean value from the perspective of the *parent's* side to move, with each virtual loss
+    /// counted as `virtual_loss` for this node's side (i.e. a loss for the parent).
+    fn q_for_parent(&self, virtual_loss: f32) -> f32 {
+        let n = self.effective_visits();
+        if n == 0 {
             0.0
         } else {
-            -self.value_sum / self.visits as f32
+            -(self.value_sum + virtual_loss * self.virtual_losses as f32) / n as f32
         }
     }
 }
@@ -112,7 +139,9 @@ pub struct Mcts<A: UtttAgent> {
     nodes: Vec<Node<A::State>>,
     rng: SmallRng,
     move_buf: Vec<Move>,
-    path: Vec<u32>,
+    leaves: Vec<u32>,
+    states: Vec<A::State>,
+    evals: Vec<Evaluation>,
     prior_buf: [f32; 81],
 }
 
@@ -125,7 +154,9 @@ impl<A: UtttAgent> Mcts<A> {
             nodes: Vec::new(),
             rng,
             move_buf: Vec::new(),
-            path: Vec::new(),
+            leaves: Vec::new(),
+            states: Vec::new(),
+            evals: Vec::new(),
             prior_buf: [0.0; 81],
         }
     }
@@ -149,15 +180,17 @@ impl<A: UtttAgent> Mcts<A> {
     /// Runs a full search from `state` and returns the root statistics.
     pub fn search(&mut self, state: &A::State) -> SearchResult {
         self.nodes.clear();
-        self.nodes.push(Node::new(state.clone(), None, 1.0));
+        self.nodes
+            .push(Node::new(state.clone(), None, NO_NODE, 1.0));
         if let Some(outcome) = self.nodes[0].outcome {
             return SearchResult {
                 root_value: outcome.value_for(state.to_move()),
                 visits: Vec::new(),
             };
         }
-        for _ in 0..self.cfg.simulations {
-            self.simulate();
+        let mut done = 0u32;
+        while done < self.cfg.simulations {
+            done += self.run_batch(self.cfg.simulations - done);
         }
         let root = &self.nodes[0];
         let visits = root
@@ -173,43 +206,131 @@ impl<A: UtttAgent> Mcts<A> {
         }
     }
 
-    fn simulate(&mut self) {
-        self.path.clear();
+    /// Selects up to `min(batch_size, budget)` leaves, evaluates them together, backs up.
+    /// Returns how many simulations were completed (terminal hits included).
+    fn run_batch(&mut self, budget: u32) -> u32 {
+        let want = self.cfg.batch_size.max(1).min(budget as usize);
+        let mut completed = 0u32;
+        self.leaves.clear();
+        for _ in 0..want {
+            match self.select_leaf() {
+                Selection::Terminal(idx, value) => {
+                    self.backup(idx, value);
+                    completed += 1;
+                }
+                Selection::Leaf(idx) => {
+                    self.nodes[idx as usize].pending = true;
+                    self.add_virtual_loss(idx);
+                    self.leaves.push(idx);
+                }
+                // Every path leads to an already-claimed leaf: evaluate what we have.
+                Selection::Blocked => break,
+            }
+        }
+        if self.leaves.is_empty() {
+            return completed;
+        }
+
+        self.states.clear();
+        self.states.extend(
+            self.leaves
+                .iter()
+                .map(|&i| self.nodes[i as usize].state.clone()),
+        );
+        self.evals.clear();
+        self.agent.evaluate_batch(&self.states, &mut self.evals);
+        debug_assert_eq!(self.evals.len(), self.leaves.len());
+
+        let leaves = std::mem::take(&mut self.leaves);
+        let evals = std::mem::take(&mut self.evals);
+        for (&idx, eval) in leaves.iter().zip(&evals) {
+            self.remove_virtual_loss(idx);
+            self.nodes[idx as usize].pending = false;
+            let value = self.expand(idx, eval);
+            self.backup(idx, value);
+            completed += 1;
+        }
+        self.leaves = leaves;
+        self.evals = evals;
+        completed
+    }
+
+    fn select_leaf(&self) -> Selection {
         let mut idx = 0u32;
-        self.path.push(idx);
-        let leaf_value = loop {
+        loop {
             let node = &self.nodes[idx as usize];
             if let Some(outcome) = node.outcome {
-                break outcome.value_for(node.state.to_move());
+                return Selection::Terminal(idx, outcome.value_for(node.state.to_move()));
             }
             if !node.expanded {
-                break self.expand(idx);
+                return if node.pending {
+                    Selection::Blocked
+                } else {
+                    Selection::Leaf(idx)
+                };
             }
             idx = self.select_child(idx);
-            self.path.push(idx);
-        };
-        let mut value = leaf_value;
-        for &n in self.path.iter().rev() {
-            let node = &mut self.nodes[n as usize];
-            node.visits += 1;
-            node.value_sum += value;
-            value = -value;
         }
     }
 
-    /// Evaluates the node, creates its children, returns the value for the node's side to move.
-    fn expand(&mut self, idx: u32) -> f32 {
+    fn select_child(&self, idx: u32) -> u32 {
+        let node = &self.nodes[idx as usize];
+        let sqrt_n = (node.effective_visits() as f32).sqrt();
+        let mut best = node.first_child;
+        let mut best_score = f32::NEG_INFINITY;
+        for c in node.children() {
+            let child = &self.nodes[c as usize];
+            let exploration =
+                self.cfg.c_puct * child.prior * sqrt_n / (1.0 + child.effective_visits() as f32);
+            let score = child.q_for_parent(self.cfg.virtual_loss) + exploration;
+            if score > best_score {
+                best_score = score;
+                best = c;
+            }
+        }
+        best
+    }
+
+    fn add_virtual_loss(&mut self, mut idx: u32) {
+        while idx != NO_NODE {
+            let node = &mut self.nodes[idx as usize];
+            node.virtual_losses += 1;
+            idx = node.parent;
+        }
+    }
+
+    fn remove_virtual_loss(&mut self, mut idx: u32) {
+        while idx != NO_NODE {
+            let node = &mut self.nodes[idx as usize];
+            node.virtual_losses -= 1;
+            idx = node.parent;
+        }
+    }
+
+    /// Adds `value` (for the side to move at `idx`) along the path to the root, flipping sign
+    /// at each step.
+    fn backup(&mut self, mut idx: u32, mut value: f32) {
+        while idx != NO_NODE {
+            let node = &mut self.nodes[idx as usize];
+            node.visits += 1;
+            node.value_sum += value;
+            value = -value;
+            idx = node.parent;
+        }
+    }
+
+    /// Creates the children of `idx` from `eval`'s priors; returns the clamped value.
+    fn expand(&mut self, idx: u32, eval: &Evaluation) -> f32 {
         let state = self.nodes[idx as usize].state.clone();
         let mut moves = std::mem::take(&mut self.move_buf);
         state.legal_moves(&mut moves);
         debug_assert!(!moves.is_empty(), "non-terminal state without legal moves");
-        let Evaluation { value, priors } = self.agent.evaluate(&state);
 
         // Keep only legal moves' priors; fall back to uniform if nothing usable was given.
         let mut total = 0.0f32;
-        if !priors.is_empty() {
+        if !eval.priors.is_empty() {
             self.prior_buf.fill(0.0);
-            for (mv, p) in &priors {
+            for (mv, p) in &eval.priors {
                 self.prior_buf[mv.index()] += p.max(0.0);
             }
             total = moves.iter().map(|m| self.prior_buf[m.index()]).sum();
@@ -226,7 +347,8 @@ impl<A: UtttAgent> Mcts<A> {
             };
             let mut child_state = state.clone();
             child_state.apply(mv);
-            self.nodes.push(Node::new(child_state, Some(mv), prior));
+            self.nodes
+                .push(Node::new(child_state, Some(mv), idx, prior));
         }
         self.move_buf = moves;
 
@@ -234,24 +356,7 @@ impl<A: UtttAgent> Mcts<A> {
         node.first_child = first_child;
         node.n_children = n as u8;
         node.expanded = true;
-        value.clamp(-1.0, 1.0)
-    }
-
-    fn select_child(&self, idx: u32) -> u32 {
-        let node = &self.nodes[idx as usize];
-        let sqrt_n = (node.visits as f32).sqrt();
-        let mut best = node.first_child;
-        let mut best_score = f32::NEG_INFINITY;
-        for c in node.children() {
-            let child = &self.nodes[c as usize];
-            let exploration = self.cfg.c_puct * child.prior * sqrt_n / (1.0 + child.visits as f32);
-            let score = child.q_for_parent() + exploration;
-            if score > best_score {
-                best_score = score;
-                best = c;
-            }
-        }
-        best
+        eval.value.clamp(-1.0, 1.0)
     }
 
     fn pick_move(&mut self, result: &SearchResult) -> Move {
@@ -287,6 +392,30 @@ impl<A: UtttAgent> Mcts<A> {
             })
             .collect()
     }
+
+    /// Checks the tree after a search: no virtual losses or pending leaves remain, and every
+    /// expanded node's visits equal its own evaluation plus its children's visits.
+    #[cfg(test)]
+    fn assert_tree_consistent(&self) {
+        for (i, node) in self.nodes.iter().enumerate() {
+            assert_eq!(node.virtual_losses, 0, "node {i} has virtual losses");
+            assert!(!node.pending, "node {i} still pending");
+            if node.expanded {
+                let child_visits: u32 =
+                    node.children().map(|c| self.nodes[c as usize].visits).sum();
+                assert_eq!(node.visits, child_visits + 1, "node {i} visit mismatch");
+            }
+        }
+    }
+}
+
+enum Selection {
+    /// An unexpanded, unclaimed leaf.
+    Leaf(u32),
+    /// A terminal node and its value for the side to move there.
+    Terminal(u32, f32),
+    /// Selection ran into a leaf already claimed in this batch.
+    Blocked,
 }
 
 impl<A: UtttAgent> UtttAgent for Mcts<A> {
@@ -340,6 +469,101 @@ mod tests {
             .find(|(m, _)| *m == Move::new(sq(0, 2), sq(0, 2)))
             .unwrap();
         assert!(*wins > 50);
+    }
+
+    #[test]
+    fn batched_search_finds_win_and_keeps_tree_consistent() {
+        let state = x_wins_in_one();
+        for batch_size in [1, 4, 16, 64] {
+            let mut mcts = Mcts::new(
+                RandomAgent::<BitState>::new(1),
+                MctsConfig {
+                    simulations: 120,
+                    batch_size,
+                    ..Default::default()
+                },
+            );
+            let result = mcts.search(&state);
+            mcts.assert_tree_consistent();
+            let total: u32 = result.visits.iter().map(|(_, n)| n).sum();
+            assert_eq!(total, 119, "batch {batch_size}");
+            assert_eq!(
+                result.best_move(),
+                Some(Move::new(sq(0, 2), sq(0, 2))),
+                "batch {batch_size}"
+            );
+            assert!(
+                result.root_value > 0.5,
+                "batch {batch_size}: {}",
+                result.root_value
+            );
+        }
+    }
+
+    /// Records the largest batch handed to `evaluate_batch`.
+    struct Counting {
+        inner: RandomAgent<BitState>,
+        max_batch: usize,
+        calls: usize,
+    }
+
+    impl UtttAgent for Counting {
+        type State = BitState;
+
+        fn choose_move(&mut self, state: &BitState) -> Move {
+            self.inner.choose_move(state)
+        }
+
+        fn evaluate_batch(&mut self, states: &[BitState], out: &mut Vec<Evaluation>) {
+            self.max_batch = self.max_batch.max(states.len());
+            self.calls += 1;
+            self.inner.evaluate_batch(states, out);
+        }
+    }
+
+    #[test]
+    fn batches_really_form() {
+        let agent = Counting {
+            inner: RandomAgent::new(1),
+            max_batch: 0,
+            calls: 0,
+        };
+        let mut mcts = Mcts::new(
+            agent,
+            MctsConfig {
+                simulations: 200,
+                batch_size: 8,
+                ..Default::default()
+            },
+        );
+        mcts.search(&BitState::initial());
+        mcts.assert_tree_consistent();
+        let agent = mcts.agent();
+        assert!(
+            agent.max_batch >= 4,
+            "largest batch was {}",
+            agent.max_batch
+        );
+        assert!(
+            agent.calls < 200,
+            "{} calls for 200 simulations",
+            agent.calls
+        );
+    }
+
+    #[test]
+    fn batch_of_one_matches_sequential_search() {
+        // batch_size 1 must be bit-for-bit the old sequential behaviour, which the
+        // deterministic seed makes checkable against itself under the same config.
+        let state = BitState::initial();
+        let run = |seed| {
+            let mut m = Mcts::new(RandomAgent::<BitState>::new(seed), cfg(60));
+            let r = m.search(&state);
+            m.assert_tree_consistent();
+            r
+        };
+        assert_eq!(run(5), run(5));
+        assert_ne!(run(5), run(6));
     }
 
     #[test]
