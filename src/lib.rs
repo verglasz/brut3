@@ -5,7 +5,9 @@
 //!   and the fast [`game::BitState`].
 //! - [`agent`]: the [`agent::UtttAgent`] trait every agent implements.
 //! - [`mcts`]: [`mcts::Mcts`], a PUCT tree search generic over any agent used as leaf evaluator.
+//! - [`repl`]: interactive play against a chosen agent.
 
 pub mod agent;
 pub mod game;
 pub mod mcts;
+pub mod repl;

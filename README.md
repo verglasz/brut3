@@ -78,9 +78,12 @@ cargo build --release --features cuda
 # Slow tests and throughput numbers
 cargo test --release --no-default-features -- --ignored --nocapture
 
-# Demo
-cargo run --no-default-features
+# Play against an agent in the terminal (default: mcts 400)
+cargo run --release --no-default-features -- mcts 800 3
 ```
+
+In the REPL, moves are entered as `r1c2/r0c0` (board, then square) or as four digits
+`1 2 0 0`; `help` lists the commands (`new o` to play O, `agent random`, `hint`, `undo`).
 
 ## Design
 
@@ -103,6 +106,7 @@ Present:
 
 - Game rules with two `GameState` implementations, cross-checked by a differential fuzz test.
 - `UtttAgent` trait, `RandomAgent`, and `Mcts` search, tested against the random agent.
+- `AnyAgent`, one concrete enum over the built agents, and a REPL for interactive play.
 - Cargo feature layout for the burn backends (no network code yet).
 
 Planned next, roughly in order:
@@ -111,7 +115,7 @@ Planned next, roughly in order:
 - [ ] Batched leaf evaluation with virtual loss, tree reuse between moves
 - [ ] Network definition in burn, position -> tensor encoding, runtime backend selection
 - [ ] Self-play, replay buffer, training loop, model checkpointing
-- [ ] CLI for play / match / train / bench
+- [ ] CLI for agent-vs-agent matches, training, benchmarks
 
 ## Layout
 
@@ -123,7 +127,9 @@ src/
   game/bitboard.rs  BitState: bitboard implementation
   agent/mod.rs      UtttAgent trait, Evaluation
   agent/random.rs   RandomAgent
+  agent/any.rs      AgentSpec, AnyAgent (concrete enum over all agents)
+  repl.rs           interactive play
   mcts.rs           Mcts, MctsConfig, SearchResult
-  main.rs           demo game: Mcts<RandomAgent> vs RandomAgent
+  main.rs           launches the REPL
 Cargo.toml          burn 0.21 behind backend features
 ```
