@@ -75,8 +75,9 @@ cargo build --release
 # With CUDA (needs nvcc / CUDA_PATH)
 cargo build --release --features cuda
 
-# Slow tests and throughput numbers
+# Slow tests, and throughput numbers for engine, agents and search
 cargo test --release --no-default-features -- --ignored --nocapture
+cargo run --release --no-default-features --example bench
 
 # Play against an agent in the terminal (default: mcts 400)
 cargo run --release --no-default-features -- mcts 800 3
@@ -137,5 +138,6 @@ src/
   repl.rs           interactive play
   mcts.rs           Mcts, MctsConfig, SearchResult
   main.rs           launches the REPL
+examples/bench.rs   throughput benchmark
 Cargo.toml          burn 0.21 behind backend features
 ```
