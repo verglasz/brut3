@@ -3,20 +3,18 @@
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use super::{Evaluation, UtttAgent, heuristic};
-use crate::game::{BitState, GameState, Move};
+use crate::game::{BitState, GameState, Move, MoveSet};
 
 /// Plays the move whose resulting position scores best under [`heuristic::score`], breaking
 /// ties at random. Takes wins and board wins when offered, but sees nothing deeper.
 pub struct GreedyAgent {
     rng: SmallRng,
-    buf: Vec<Move>,
 }
 
 impl GreedyAgent {
     pub fn new(seed: u64) -> Self {
         Self {
             rng: SmallRng::seed_from_u64(seed),
-            buf: Vec::new(),
         }
     }
 }
@@ -26,15 +24,12 @@ impl UtttAgent for GreedyAgent {
 
     fn choose_move(&mut self, state: &BitState) -> Move {
         let me = state.to_move();
-        state.legal_moves(&mut self.buf);
-        assert!(
-            !self.buf.is_empty(),
-            "choose_move called on a terminal state"
-        );
-        let mut best = self.buf[0];
+        let legal = state.legal_moves();
+        assert!(!legal.is_empty(), "choose_move called on a terminal state");
+        let mut best = Move::from_index(0);
         let mut best_score = i32::MIN;
         let mut ties = 0u32;
-        for &mv in &self.buf {
+        for mv in legal {
             let mut next = *state;
             next.apply(mv);
             let s = heuristic::score(&next, me);

@@ -91,9 +91,11 @@ In the REPL, moves are entered as `r1c2/r0c0` (board, then square) or as four di
 The search is generic over the agent that evaluates leaves:
 
 - `game::GameState` is the rules trait. Shared types are explicit: `Square { row, col }`,
-  `Move { board, square }`, `Outcome`, `BoardStatus`. Each implementation picks its own internal
-  representation: `Position` is the readable reference (arrays of `Option<Player>`), `BitState`
-  the fast bitboard used by search.
+  `Move { board, square }`, `Outcome`, `BoardStatus`. Legal moves come back as the
+  implementation's own `MoveSet` type (associated type `Moves`), whose API speaks only in
+  `Move`s. Each implementation picks its representations: `Position` is the readable reference
+  (arrays of `Option<Player>`, a `MoveList`), `BitState` the fast bitboard used by search with a
+  `u128`-backed `BitMoveSet`.
 - `agent::UtttAgent` has an associated `State: GameState`, `choose_move`, and `evaluate`, which
   returns a value in `[-1, 1]` plus optional move priors. The default `evaluate` is a playout
   using `choose_move`; the heuristic agents return their static value; a network agent will

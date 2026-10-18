@@ -77,7 +77,7 @@ mod tests {
 
     use super::*;
     use crate::game::test_positions::{X_WINNING_MOVE, x_wins_in_one};
-    use crate::game::{Move, sq};
+    use crate::game::{Move, MoveSet, sq};
 
     #[test]
     fn terminal_scores_are_exact() {
@@ -92,15 +92,15 @@ mod tests {
     #[test]
     fn antisymmetric_and_bounded_on_random_positions() {
         let mut rng = SmallRng::seed_from_u64(4);
-        let mut buf = Vec::new();
         for _ in 0..200 {
             let mut s = BitState::initial();
             while s.outcome().is_none() {
                 assert_eq!(score(&s, Player::X), -score(&s, Player::O));
                 let v = value(&s, Player::X);
                 assert!((-1.0..=1.0).contains(&v));
-                s.legal_moves(&mut buf);
-                s.apply(buf[rng.random_range(0..buf.len())]);
+                let legal = s.legal_moves();
+                let k = rng.random_range(0..legal.len());
+                s.apply(legal.iter().nth(k).unwrap());
             }
         }
     }

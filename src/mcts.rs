@@ -12,7 +12,7 @@
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use crate::agent::{Evaluation, UtttAgent};
-use crate::game::{GameState, Move, Outcome};
+use crate::game::{GameState, Move, MoveSet, Outcome};
 
 #[derive(Clone, Debug)]
 pub struct MctsConfig {
@@ -138,7 +138,6 @@ pub struct Mcts<A: UtttAgent> {
     cfg: MctsConfig,
     nodes: Vec<Node<A::State>>,
     rng: SmallRng,
-    move_buf: Vec<Move>,
     leaves: Vec<u32>,
     states: Vec<A::State>,
     evals: Vec<Evaluation>,
@@ -153,7 +152,6 @@ impl<A: UtttAgent> Mcts<A> {
             cfg,
             nodes: Vec::new(),
             rng,
-            move_buf: Vec::new(),
             leaves: Vec::new(),
             states: Vec::new(),
             evals: Vec::new(),
@@ -322,8 +320,7 @@ impl<A: UtttAgent> Mcts<A> {
     /// Creates the children of `idx` from `eval`'s priors; returns the clamped value.
     fn expand(&mut self, idx: u32, eval: &Evaluation) -> f32 {
         let state = self.nodes[idx as usize].state.clone();
-        let mut moves = std::mem::take(&mut self.move_buf);
-        state.legal_moves(&mut moves);
+        let moves = state.legal_moves();
         debug_assert!(!moves.is_empty(), "non-terminal state without legal moves");
 
         // Keep only legal moves' priors; fall back to uniform if nothing usable was given.
@@ -339,7 +336,7 @@ impl<A: UtttAgent> Mcts<A> {
         let n = moves.len();
 
         let first_child = self.nodes.len() as u32;
-        for &mv in &moves {
+        for mv in moves {
             let prior = if uniform {
                 1.0 / n as f32
             } else {
@@ -350,7 +347,6 @@ impl<A: UtttAgent> Mcts<A> {
             self.nodes
                 .push(Node::new(child_state, Some(mv), idx, prior));
         }
-        self.move_buf = moves;
 
         let node = &mut self.nodes[idx as usize];
         node.first_child = first_child;

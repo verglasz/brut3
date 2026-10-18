@@ -5,7 +5,10 @@
 
 use std::fmt;
 
-use super::{BoardStatus, GameState, Move, Outcome, Player, Square, board_status_of, line_winner};
+use super::{
+    BoardStatus, GameState, Move, MoveList, MoveSet, Outcome, Player, Square, board_status_of,
+    line_winner,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Position {
@@ -68,6 +71,8 @@ impl Position {
 }
 
 impl GameState for Position {
+    type Moves = MoveList;
+
     fn initial() -> Self {
         Self {
             cells: [[None; 9]; 9],
@@ -88,8 +93,8 @@ impl GameState for Position {
         self.to_move
     }
 
-    fn legal_moves(&self, out: &mut Vec<Move>) {
-        out.clear();
+    fn legal_moves(&self) -> MoveList {
+        let mut out = MoveList::empty();
         let boards: Vec<Square> = match self.forced_board() {
             Some(b) => vec![b],
             None => Square::ALL
@@ -101,14 +106,15 @@ impl GameState for Position {
             for square in Square::ALL {
                 let mv = Move::new(board, square);
                 if self.cell(mv).is_none() {
-                    out.push(mv);
+                    out.insert(mv);
                 }
             }
         }
+        out
     }
 
     fn apply(&mut self, mv: Move) {
-        debug_assert!(self.legal_moves_vec().contains(&mv), "illegal move {mv}");
+        debug_assert!(self.legal_moves().contains(mv), "illegal move {mv}");
         self.set_cell(mv, Some(self.to_move));
         self.last_move = Some(mv);
         self.to_move = self.to_move.other();

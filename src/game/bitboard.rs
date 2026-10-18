@@ -4,7 +4,7 @@
 //! of 9-bit masks of won boards. Win detection is a 512-entry table lookup. All of this is
 //! private: the public surface is the [`GameState`] trait with its explicit [`Move`]s.
 
-use super::{BoardStatus, GameState, LINES, Move, Outcome, Player, Position, Square};
+use super::{BoardStatus, GameState, LINES, Move, MoveSet, Outcome, Player, Position, Square};
 
 /// All nine squares set.
 const FULL: u16 = 0x1FF;
@@ -39,6 +39,89 @@ const WIN: [bool; 512] = {
     table
 };
 
+/// A set of moves as one bit per [`Move::index`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct BitMoveSet(u128);
+
+impl BitMoveSet {
+    const fn bit(mv: Move) -> u128 {
+        1u128 << mv.index()
+    }
+}
+
+impl MoveSet for BitMoveSet {
+    fn empty() -> Self {
+        Self(0)
+    }
+
+    #[inline]
+    fn contains(&self, mv: Move) -> bool {
+        self.0 & Self::bit(mv) != 0
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    #[inline]
+    fn insert(&mut self, mv: Move) {
+        self.0 |= Self::bit(mv);
+    }
+
+    #[inline]
+    fn remove(&mut self, mv: Move) {
+        self.0 &= !Self::bit(mv);
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Move> + '_ {
+        BitMoveIter(self.0)
+    }
+}
+
+impl IntoIterator for BitMoveSet {
+    type Item = Move;
+    type IntoIter = BitMoveIter;
+
+    fn into_iter(self) -> BitMoveIter {
+        BitMoveIter(self.0)
+    }
+}
+
+impl FromIterator<Move> for BitMoveSet {
+    fn from_iter<I: IntoIterator<Item = Move>>(iter: I) -> Self {
+        let mut set = Self::empty();
+        for mv in iter {
+            set.insert(mv);
+        }
+        set
+    }
+}
+
+/// Yields moves in increasing [`Move::index`] order.
+pub struct BitMoveIter(u128);
+
+impl Iterator for BitMoveIter {
+    type Item = Move;
+
+    #[inline]
+    fn next(&mut self) -> Option<Move> {
+        if self.0 == 0 {
+            return None;
+        }
+        let index = self.0.trailing_zeros() as usize;
+        self.0 &= self.0 - 1;
+        Some(Move::from_index(index))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.0.count_ones() as usize;
+        (n, Some(n))
+    }
+}
+
+impl ExactSizeIterator for BitMoveIter {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BitState {
     /// `marks[player][board]`: 9-bit mask of that player's squares on that board.
@@ -68,14 +151,10 @@ impl BitState {
         (!self.board_done(board)).then_some(board)
     }
 
-    fn push_board_moves(&self, board: usize, out: &mut Vec<Move>) {
-        let board_sq = Square::from_index(board);
-        let mut free = !self.occupied(board) & FULL;
-        while free != 0 {
-            let square = free.trailing_zeros() as usize;
-            out.push(Move::new(board_sq, Square::from_index(square)));
-            free &= free - 1;
-        }
+    /// Free squares of `board`, positioned at that board's 9 bits of a move set.
+    #[inline]
+    fn board_moves(&self, board: usize) -> u128 {
+        ((!self.occupied(board) & FULL) as u128) << (board * 9)
     }
 
     pub fn is_legal(&self, mv: Move) -> bool {
@@ -133,6 +212,8 @@ impl BitState {
 }
 
 impl GameState for BitState {
+    type Moves = BitMoveSet;
+
     fn initial() -> Self {
         Self {
             marks: [[0; 9]; 2],
@@ -186,16 +267,17 @@ impl GameState for BitState {
         self.to_move
     }
 
-    fn legal_moves(&self, out: &mut Vec<Move>) {
-        out.clear();
+    fn legal_moves(&self) -> BitMoveSet {
         match self.forced_board() {
-            Some(board) => self.push_board_moves(board, out),
+            Some(board) => BitMoveSet(self.board_moves(board)),
             None => {
+                let mut bits = 0u128;
                 for board in 0..9 {
                     if !self.board_done(board) {
-                        self.push_board_moves(board, out);
+                        bits |= self.board_moves(board);
                     }
                 }
+                BitMoveSet(bits)
             }
         }
     }
@@ -248,6 +330,27 @@ mod tests {
     }
 
     #[test]
+    fn bit_move_set_is_a_set() {
+        let a = Move::from_index(0);
+        let b = Move::from_index(80);
+        let mut set = BitMoveSet::empty();
+        assert!(set.is_empty());
+        set.insert(b);
+        set.insert(a);
+        set.insert(a);
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(a) && set.contains(b));
+        assert!(!set.contains(Move::from_index(40)));
+        assert_eq!(set.to_vec(), vec![a, b]);
+        assert_eq!(set.into_iter().len(), 2);
+        set.remove(a);
+        assert_eq!(set.to_vec(), vec![b]);
+        let all: BitMoveSet = (0..81).map(Move::from_index).collect();
+        assert_eq!(all.len(), 81);
+        assert_eq!(all, BitState::initial().legal_moves());
+    }
+
+    #[test]
     fn initial_matches_position() {
         let b = BitState::initial();
         assert_eq!(b.to_position(), Position::initial());
@@ -270,8 +373,6 @@ mod tests {
     /// Plays random games on both implementations in lockstep, comparing after every move.
     fn differential(games: usize, seed: u64) {
         let mut rng = SmallRng::seed_from_u64(seed);
-        let mut ref_moves = Vec::new();
-        let mut bit_moves = Vec::new();
         for _ in 0..games {
             let mut pos = Position::initial();
             let mut bit = BitState::initial();
@@ -283,11 +384,13 @@ mod tests {
                 if pos.outcome().is_some() {
                     break;
                 }
-                pos.legal_moves(&mut ref_moves);
-                bit.legal_moves(&mut bit_moves);
+                let mut ref_moves = pos.legal_moves().to_vec();
                 ref_moves.sort();
-                bit_moves.sort();
-                assert_eq!(ref_moves, bit_moves, "\n{pos}");
+                let bit_moves = bit.legal_moves();
+                assert_eq!(ref_moves, bit_moves.to_vec(), "\n{pos}");
+                for mv in &ref_moves {
+                    assert!(bit_moves.contains(*mv) && bit.is_legal(*mv));
+                }
                 let mv = ref_moves[rng.random_range(0..ref_moves.len())];
                 pos.apply(mv);
                 bit.apply(mv);
@@ -310,15 +413,15 @@ mod tests {
     #[ignore = "throughput measurement; run with --release --nocapture"]
     fn random_playout_throughput() {
         let mut rng = SmallRng::seed_from_u64(7);
-        let mut buf = Vec::new();
         let games = 200_000;
         let mut moves = 0u64;
         let start = std::time::Instant::now();
         for _ in 0..games {
             let mut s = BitState::initial();
             while s.outcome().is_none() {
-                s.legal_moves(&mut buf);
-                s.apply(buf[rng.random_range(0..buf.len())]);
+                let legal = s.legal_moves();
+                let k = rng.random_range(0..legal.len());
+                s.apply(legal.iter().nth(k).unwrap());
                 moves += 1;
             }
         }

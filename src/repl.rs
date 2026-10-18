@@ -3,7 +3,7 @@
 use std::io::{self, BufRead, Write};
 
 use crate::agent::{AgentSpec, AnyAgent, UtttAgent};
-use crate::game::{BitState, GameState, Move, Player, Position};
+use crate::game::{BitState, GameState, Move, MoveSet, Player, Position};
 
 const HELP: &str = "\
 commands:
@@ -135,8 +135,8 @@ impl<W: Write> Repl<W> {
         if self.state.outcome().is_some() {
             return writeln!(self.out, "game over; `new` to start another");
         }
-        let moves = self.state.legal_moves_vec();
-        let text: Vec<String> = moves.iter().map(ToString::to_string).collect();
+        let moves = self.state.legal_moves();
+        let text: Vec<String> = moves.iter().map(|m| m.to_string()).collect();
         writeln!(self.out, "{} legal moves: {}", moves.len(), text.join(" "))
     }
 

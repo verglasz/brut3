@@ -7,7 +7,7 @@
 pub mod bitboard;
 pub mod position;
 
-pub use bitboard::BitState;
+pub use bitboard::{BitMoveSet, BitState};
 pub use position::Position;
 
 use std::fmt;
@@ -243,6 +243,82 @@ pub fn board_status_of(cells: &[Option<Player>; 9]) -> BoardStatus {
     }
 }
 
+/// A set of moves. The API speaks only in [`Move`]s; the representation is the
+/// implementation's business (a bitset for [`BitMoveSet`], a plain `Vec<Move>` as reference).
+pub trait MoveSet: Clone + IntoIterator<Item = Move> {
+    fn empty() -> Self;
+    fn contains(&self, mv: Move) -> bool;
+    fn len(&self) -> usize;
+    fn insert(&mut self, mv: Move);
+    fn remove(&mut self, mv: Move);
+    fn iter(&self) -> impl Iterator<Item = Move> + '_;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn to_vec(&self) -> Vec<Move> {
+        self.iter().collect()
+    }
+}
+
+/// Reference [`MoveSet`]: a plain list without duplicates. Used by [`Position`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MoveList(Vec<Move>);
+
+impl MoveList {
+    pub fn as_slice(&self) -> &[Move] {
+        &self.0
+    }
+}
+
+impl MoveSet for MoveList {
+    fn empty() -> Self {
+        Self(Vec::new())
+    }
+
+    fn contains(&self, mv: Move) -> bool {
+        self.0.contains(&mv)
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn insert(&mut self, mv: Move) {
+        if !self.0.contains(&mv) {
+            self.0.push(mv);
+        }
+    }
+
+    fn remove(&mut self, mv: Move) {
+        self.0.retain(|m| *m != mv);
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Move> + '_ {
+        self.0.iter().copied()
+    }
+}
+
+impl IntoIterator for MoveList {
+    type Item = Move;
+    type IntoIter = std::vec::IntoIter<Move>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl FromIterator<Move> for MoveList {
+    fn from_iter<I: IntoIterator<Item = Move>>(iter: I) -> Self {
+        let mut list = Self::empty();
+        for mv in iter {
+            list.insert(mv);
+        }
+        list
+    }
+}
+
 /// A full game state under the standard rules:
 ///
 /// - the square of the previous move names the board the next player must play on;
@@ -253,6 +329,9 @@ pub fn board_status_of(cells: &[Option<Player>; 9]) -> BoardStatus {
 /// Implementations choose their own internal representation; [`Position`] is the readable
 /// reference, [`BitState`] the fast one.
 pub trait GameState: Clone {
+    /// How this implementation represents a set of moves.
+    type Moves: MoveSet;
+
     /// The empty board, `X` to move.
     fn initial() -> Self;
 
@@ -261,8 +340,8 @@ pub trait GameState: Clone {
 
     fn to_move(&self) -> Player;
 
-    /// Clears `out` and fills it with every legal move. Empty only in terminal states.
-    fn legal_moves(&self, out: &mut Vec<Move>);
+    /// Every legal move. Empty only in terminal states.
+    fn legal_moves(&self) -> Self::Moves;
 
     /// Plays `mv` for the side to move. Must be legal (checked in debug builds).
     fn apply(&mut self, mv: Move);
@@ -274,11 +353,9 @@ pub trait GameState: Clone {
         self.outcome().is_some()
     }
 
-    /// Allocating convenience wrapper around [`GameState::legal_moves`].
+    /// [`GameState::legal_moves`] as a `Vec`, for tests and display.
     fn legal_moves_vec(&self) -> Vec<Move> {
-        let mut out = Vec::new();
-        self.legal_moves(&mut out);
-        out
+        self.legal_moves().to_vec()
     }
 }
 
@@ -399,6 +476,23 @@ mod tests {
         assert_eq!(mv.to_string().parse::<Move>(), Ok(mv));
         assert!("r2c1".parse::<Move>().is_err());
         assert!("r2c1/r0c3".parse::<Move>().is_err());
+    }
+
+    #[test]
+    fn move_list_is_a_set() {
+        let a = Move::from_index(3);
+        let b = Move::from_index(80);
+        let mut set = MoveList::empty();
+        assert!(set.is_empty());
+        set.insert(a);
+        set.insert(a);
+        set.insert(b);
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(a) && set.contains(b));
+        set.remove(a);
+        assert_eq!(set.to_vec(), vec![b]);
+        let from: MoveList = [a, b, a].into_iter().collect();
+        assert_eq!(from.as_slice(), &[a, b]);
     }
 
     #[test]

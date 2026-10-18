@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use ultimate_ttt_burn::agent::{GreedyAgent, MinimaxAgent, RandomAgent, UtttAgent};
-use ultimate_ttt_burn::game::{BitState, GameState};
+use ultimate_ttt_burn::game::{BitState, GameState, MoveSet};
 use ultimate_ttt_burn::mcts::{Mcts, MctsConfig};
 
 fn time<R>(label: &str, f: impl FnOnce() -> (R, u64, &'static str)) -> R {
@@ -34,13 +34,13 @@ fn self_play<A: UtttAgent<State = BitState>>(agent: &mut A, games: u64) -> u64 {
 fn main() {
     time("random playouts (engine only)", || {
         let mut rng = SmallRng::seed_from_u64(1);
-        let mut buf = Vec::new();
         let mut moves = 0u64;
         for _ in 0..200_000 {
             let mut s = BitState::initial();
             while s.outcome().is_none() {
-                s.legal_moves(&mut buf);
-                s.apply(buf[rng.random_range(0..buf.len())]);
+                let legal = s.legal_moves();
+                let k = rng.random_range(0..legal.len());
+                s.apply(legal.iter().nth(k).unwrap());
                 moves += 1;
             }
         }

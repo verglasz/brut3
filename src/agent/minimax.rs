@@ -3,12 +3,11 @@
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use super::{Evaluation, UtttAgent, heuristic};
-use crate::game::{BitState, GameState, Move};
+use crate::game::{BitState, GameState, Move, MoveSet};
 
 pub struct MinimaxAgent {
     depth: u32,
     rng: SmallRng,
-    buf: Vec<Move>,
 }
 
 impl MinimaxAgent {
@@ -19,7 +18,6 @@ impl MinimaxAgent {
         Self {
             depth: depth.max(1),
             rng: SmallRng::seed_from_u64(seed),
-            buf: Vec::new(),
         }
     }
 
@@ -32,10 +30,8 @@ impl MinimaxAgent {
         if depth == 0 || state.is_terminal() {
             return heuristic::score(state, state.to_move());
         }
-        let mut moves = Vec::with_capacity(9);
-        state.legal_moves(&mut moves);
         let mut best = i32::MIN;
-        for mv in moves {
+        for mv in state.legal_moves() {
             let mut next = *state;
             next.apply(mv);
             let v = -Self::negamax(&next, depth - 1, -beta, -alpha);
@@ -57,17 +53,14 @@ impl UtttAgent for MinimaxAgent {
     type State = BitState;
 
     fn choose_move(&mut self, state: &BitState) -> Move {
-        state.legal_moves(&mut self.buf);
-        assert!(
-            !self.buf.is_empty(),
-            "choose_move called on a terminal state"
-        );
+        let legal = state.legal_moves();
+        assert!(!legal.is_empty(), "choose_move called on a terminal state");
         // Root moves are searched with a full window so that ties are exact and can be broken
         // at random.
-        let mut best = self.buf[0];
+        let mut best = Move::from_index(0);
         let mut best_score = i32::MIN;
         let mut ties = 0u32;
-        for &mv in &self.buf {
+        for mv in legal {
             let mut next = *state;
             next.apply(mv);
             let s = -Self::negamax(&next, self.depth - 1, i32::MIN + 1, i32::MAX);
