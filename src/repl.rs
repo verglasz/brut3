@@ -11,7 +11,8 @@ commands:
   new [x|o]            new game; you play X (default) or O
   agent <spec>         choose the opponent:
                          random [seed] | greedy [seed] | minimax [depth] [seed]
-                         | mcts [simulations] [seed]
+                         | mcts [simulations] [seed] | nn <weights> [backend]
+                         | mcts-nn <weights> [backend] [simulations] [batch] [seed]
   moves                list legal moves
   show                 print the board
   hint                 ask the agent what it would play here
@@ -52,6 +53,7 @@ pub fn run(input: impl BufRead, out: impl Write, spec: AgentSpec) -> io::Result<
 
 impl<W: Write> Repl<W> {
     pub fn new(mut out: W, spec: AgentSpec) -> io::Result<Self> {
+        let agent = spec.build().map_err(io::Error::other)?;
         writeln!(
             out,
             "Ultimate Tic Tac Toe. You are X against {spec}. Type `help` for commands."
@@ -60,7 +62,7 @@ impl<W: Write> Repl<W> {
         out.flush()?;
         Ok(Self {
             out,
-            agent: spec.build(),
+            agent,
             spec,
             state: BitState::initial(),
             human: Player::X,
@@ -121,9 +123,9 @@ impl<W: Write> Repl<W> {
     }
 
     fn set_agent(&mut self, words: &[&str]) -> io::Result<()> {
-        match AgentSpec::parse(words) {
-            Ok(spec) => {
-                self.agent = spec.build();
+        match AgentSpec::parse(words).and_then(|spec| Ok((spec.build()?, spec))) {
+            Ok((agent, spec)) => {
+                self.agent = agent;
                 self.spec = spec;
                 writeln!(self.out, "opponent: {}", self.spec)
             }

@@ -56,9 +56,17 @@ burn is backend-agnostic, so the same model and training code runs on:
 | `NdArray` | `ndarray` (default) | Pure-Rust CPU backend for tests and GPU-less machines. |
 | CubeCL CPU | `cpu-mlir` (opt-in) | MLIR-based CPU backend; downloads a prebuilt LLVM on first build. |
 
-Default features are everything that builds with no extra system requirements. Every backend
-compiled in will be selectable at runtime, so one binary can exercise all of them.
-`cargo build --no-default-features` skips burn entirely for fast iteration on the engine.
+Default features are everything that builds with no extra system requirements. All tensors go
+through burn's `Dispatch` backend, whose device enum selects among the compiled-in backends at
+runtime (`--backend cuda`, `nn models/value wgpu`, ...), so one binary can exercise all of them;
+`backends` lists what a binary has. `cargo build --no-default-features` skips burn entirely for
+fast iteration on the engine. Development builds use `--all-features`.
+
+Known upstream issue worked around in `nn/model.rs`: in burn 0.21, on the CubeCL backends
+(cuda, wgpu, cpu-mlir), an elementwise op fused onto a matmul with a single output column
+returns wrong values for all rows but the first, which breaks `burn::nn::Linear` with one
+output. The value head is therefore written as multiply-and-sum, and a test checks the forward
+pass against a host computation on every compiled backend.
 
 ## Building and running
 
@@ -72,8 +80,14 @@ cargo test --no-default-features
 # Default: burn with ndarray + wgpu
 cargo build --release
 
-# With CUDA (needs nvcc / CUDA_PATH)
-cargo build --release --features cuda
+# Everything, including CUDA (needs nvcc / CUDA_PATH) and the MLIR CPU backend
+cargo build --release --all-features
+cargo test --all-features
+cargo run --release --all-features -- backends
+
+# Train the value network on self-play data, then play against it
+cargo run --release --all-features -- train --backend cuda --data-agent "mcts 50" --games 2000 --epochs 15
+cargo run --release --all-features -- play mcts-nn models/value cuda 400 16
 
 # Slow tests, and throughput numbers for engine, agents and search
 cargo test --release --no-default-features -- --ignored --nocapture
@@ -84,7 +98,7 @@ cargo run --release --no-default-features -- mcts 800 3
 ```
 
 In the REPL, moves are entered as `r1c2/r0c0` (board, then square) or as four digits
-`1 2 0 0`; `help` lists the commands (`new o` to play O, `agent random`, `hint`, `undo`).
+`1 2 0 0`; `help` lists the commands (`new o` to play O, `agent nn models/value`, `hint`, `undo`).
 
 ## Design
 
@@ -103,6 +117,11 @@ The search is generic over the agent that evaluates leaves:
 - `mcts::Mcts<A: UtttAgent>` is a PUCT search over an arena tree. With no priors it behaves as
   plain UCT with rollouts; with network priors it is the AlphaZero search. `Mcts<A>` itself
   implements `UtttAgent`, so searches compose and its visit distribution can feed training.
+- `nn` holds the network side: `encode` turns a `BitState` into 199 binary features from the
+  side to move's view; `ValueNet` is a single-layer perceptron (`tanh(x . w + b)`) over them;
+  `train` generates self-play positions labelled with the game result and fits the net with
+  AdamW; `ValueNetAgent` plays one-ply lookahead with it and serves as a batched leaf evaluator
+  for `Mcts`; `BackendKind` names the compiled backends and gives their `Dispatch` device.
 
 ## Status
 
@@ -114,14 +133,18 @@ Present:
 - `Mcts` search with batched leaf evaluation and virtual loss (`batch_size` in `MctsConfig`),
   tested against the random agent.
 - `AnyAgent`, one concrete enum over the built agents, and a REPL for interactive play.
-- Cargo feature layout for the burn backends (no network code yet).
+- A single-layer value network trained from self-play results on any compiled backend (ndarray,
+  wgpu, cuda, cpu-mlir), with `nn` and `mcts-nn` agents using it. Being linear over raw
+  features it only shaves a little off the baseline error; it is the plumbing for what follows.
 
 Planned next, roughly in order:
 
 - [ ] Tree reuse between moves
-- [ ] Network definition in burn, position -> tensor encoding, runtime backend selection
-- [ ] Self-play, replay buffer, training loop, model checkpointing
-- [ ] CLI for agent-vs-agent matches, training, benchmarks
+- [ ] A real network: hidden layers / residual conv blocks, a policy head, priors into MCTS
+- [ ] Iterated self-play with the current network, replay buffer, evaluation against the
+      previous generation before promotion
+- [ ] Shared batching inference service so many searches feed one GPU batch
+- [ ] CLI for agent-vs-agent matches and benchmarks
 
 ## Layout
 
@@ -141,5 +164,5 @@ src/
   mcts.rs           Mcts, MctsConfig, SearchResult
   main.rs           launches the REPL
 examples/bench.rs   throughput benchmark
-Cargo.toml          burn 0.21 behind backend features
+Cargo.toml          burn 0.21 (Dispatch + autodiff) behind backend features, clap, rand
 ```

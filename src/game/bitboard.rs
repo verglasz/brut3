@@ -146,9 +146,14 @@ impl BitState {
     }
 
     #[inline]
-    fn forced_board(&self) -> Option<usize> {
+    fn forced_index(&self) -> Option<usize> {
         let board = self.last_move?.square.index();
         (!self.board_done(board)).then_some(board)
+    }
+
+    /// The board the side to move is restricted to, if any.
+    pub fn forced_board(&self) -> Option<Square> {
+        self.forced_index().map(Square::from_index)
     }
 
     /// Free squares of `board`, positioned at that board's 9 bits of a move set.
@@ -162,7 +167,7 @@ impl BitState {
         if self.board_done(board) {
             return false;
         }
-        if self.forced_board().is_some_and(|forced| forced != board) {
+        if self.forced_index().is_some_and(|forced| forced != board) {
             return false;
         }
         self.occupied(board) >> mv.square.index() & 1 == 0
@@ -268,7 +273,7 @@ impl GameState for BitState {
     }
 
     fn legal_moves(&self) -> BitMoveSet {
-        match self.forced_board() {
+        match self.forced_index() {
             Some(board) => BitMoveSet(self.board_moves(board)),
             None => {
                 let mut bits = 0u128;

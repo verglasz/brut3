@@ -4,10 +4,14 @@
 //! every call is a plain match.
 
 use std::fmt;
+#[cfg(feature = "nn")]
+use std::path::PathBuf;
 
 use super::{Evaluation, GreedyAgent, MinimaxAgent, RandomAgent, UtttAgent};
 use crate::game::{BitState, Move};
 use crate::mcts::{Mcts, MctsConfig};
+#[cfg(feature = "nn")]
+use crate::nn::{BackendKind, ValueNetAgent};
 
 /// How to build an agent. Parsed from words like `random`, `greedy 7`, `minimax 4`, `mcts 800 3`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,15 +33,36 @@ pub enum AgentSpec {
         simulations: u32,
         seed: u64,
     },
+    /// One-ply lookahead with a trained value network.
+    #[cfg(feature = "nn")]
+    Nn {
+        path: PathBuf,
+        backend: BackendKind,
+    },
+    /// MCTS with value-network leaf evaluation, batched.
+    #[cfg(feature = "nn")]
+    MctsNn {
+        path: PathBuf,
+        backend: BackendKind,
+        simulations: u32,
+        batch_size: usize,
+        seed: u64,
+    },
 }
 
+#[cfg(not(feature = "nn"))]
 const NAMES: &str = "`random`, `greedy`, `minimax` or `mcts`";
+#[cfg(feature = "nn")]
+const NAMES: &str = "`random`, `greedy`, `minimax`, `mcts`, `nn` or `mcts-nn`";
 
 impl AgentSpec {
     pub const DEFAULT_SIMULATIONS: u32 = 400;
+    #[cfg(feature = "nn")]
+    pub const DEFAULT_NN_BATCH: usize = 16;
 
-    /// Parses `random [seed]`, `greedy [seed]`, `minimax [depth] [seed]` or
-    /// `mcts [simulations] [seed]`.
+    /// Parses `random [seed]`, `greedy [seed]`, `minimax [depth] [seed]`,
+    /// `mcts [simulations] [seed]`, `nn <weights> [backend]` or
+    /// `mcts-nn <weights> [backend] [simulations] [batch] [seed]`.
     pub fn parse(words: &[&str]) -> Result<Self, String> {
         fn num<T: std::str::FromStr>(
             words: &[&str],
@@ -67,26 +92,81 @@ impl AgentSpec {
                 simulations: num(words, 1, "simulations", Self::DEFAULT_SIMULATIONS)?,
                 seed: num(words, 2, "seed", 0)?,
             }),
+            #[cfg(feature = "nn")]
+            Some("nn") => {
+                let (path, backend, rest) = nn_target(&words[1..])?;
+                if let Some(extra) = rest.first() {
+                    return Err(format!("unexpected argument {extra:?} after nn backend"));
+                }
+                Ok(Self::Nn { path, backend })
+            }
+            #[cfg(feature = "nn")]
+            Some("mcts-nn") => {
+                let (path, backend, rest) = nn_target(&words[1..])?;
+                Ok(Self::MctsNn {
+                    path,
+                    backend,
+                    simulations: num(rest, 0, "simulations", Self::DEFAULT_SIMULATIONS)?,
+                    batch_size: num(rest, 1, "batch", Self::DEFAULT_NN_BATCH)?,
+                    seed: num(rest, 2, "seed", 0)?,
+                })
+            }
             Some(other) => Err(format!("unknown agent {other:?}; try {NAMES}")),
             None => Err(format!("missing agent name; try {NAMES}")),
         }
     }
 
-    pub fn build(&self) -> AnyAgent {
-        match *self {
-            AgentSpec::Random { seed } => AnyAgent::Random(RandomAgent::new(seed)),
-            AgentSpec::Greedy { seed } => AnyAgent::Greedy(GreedyAgent::new(seed)),
-            AgentSpec::Minimax { depth, seed } => AnyAgent::Minimax(MinimaxAgent::new(depth, seed)),
+    /// Builds the agent. Fails only for network agents whose weights cannot be loaded.
+    pub fn build(&self) -> Result<AnyAgent, String> {
+        Ok(match self {
+            AgentSpec::Random { seed } => AnyAgent::Random(RandomAgent::new(*seed)),
+            AgentSpec::Greedy { seed } => AnyAgent::Greedy(GreedyAgent::new(*seed)),
+            AgentSpec::Minimax { depth, seed } => {
+                AnyAgent::Minimax(MinimaxAgent::new(*depth, *seed))
+            }
             AgentSpec::Mcts { simulations, seed } => AnyAgent::Mcts(Mcts::new(
                 RandomAgent::new(seed ^ 0x9E37_79B9_7F4A_7C15),
                 MctsConfig {
-                    simulations,
-                    seed,
+                    simulations: *simulations,
+                    seed: *seed,
                     ..Default::default()
                 },
             )),
-        }
+            #[cfg(feature = "nn")]
+            AgentSpec::Nn { path, backend } => AnyAgent::Nn(ValueNetAgent::load(path, *backend)?),
+            #[cfg(feature = "nn")]
+            AgentSpec::MctsNn {
+                path,
+                backend,
+                simulations,
+                batch_size,
+                seed,
+            } => AnyAgent::MctsNn(Mcts::new(
+                ValueNetAgent::load(path, *backend)?,
+                MctsConfig {
+                    simulations: *simulations,
+                    batch_size: *batch_size,
+                    seed: *seed,
+                    ..Default::default()
+                },
+            )),
+        })
     }
+}
+
+/// Parses `<weights> [backend]` and returns the remaining words.
+#[cfg(feature = "nn")]
+fn nn_target<'w, 'a>(
+    words: &'w [&'a str],
+) -> Result<(PathBuf, BackendKind, &'w [&'a str]), String> {
+    let path = words
+        .first()
+        .ok_or("missing weights path; try `nn models/value`")?;
+    let (backend, rest) = match words.get(1) {
+        Some(w) if w.parse::<u64>().is_err() => (w.parse::<BackendKind>()?, &words[2..]),
+        _ => (BackendKind::preferred(), &words[1..]),
+    };
+    Ok((PathBuf::from(path), backend, rest))
 }
 
 impl Default for AgentSpec {
@@ -110,6 +190,22 @@ impl fmt::Display for AgentSpec {
                     "mcts ({simulations} simulations, random playouts, seed {seed})"
                 )
             }
+            #[cfg(feature = "nn")]
+            AgentSpec::Nn { path, backend } => {
+                write!(f, "nn ({} on {backend})", path.display())
+            }
+            #[cfg(feature = "nn")]
+            AgentSpec::MctsNn {
+                path,
+                backend,
+                simulations,
+                batch_size,
+                seed,
+            } => write!(
+                f,
+                "mcts-nn ({simulations} simulations, batch {batch_size}, {} on {backend}, seed {seed})",
+                path.display()
+            ),
         }
     }
 }
@@ -122,6 +218,10 @@ pub enum AnyAgent {
     Greedy(GreedyAgent),
     Minimax(MinimaxAgent),
     Mcts(Mcts<RandomAgent<BitState>>),
+    #[cfg(feature = "nn")]
+    Nn(ValueNetAgent),
+    #[cfg(feature = "nn")]
+    MctsNn(Mcts<ValueNetAgent>),
 }
 
 impl UtttAgent for AnyAgent {
@@ -133,6 +233,10 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Greedy(a) => a.choose_move(state),
             AnyAgent::Minimax(a) => a.choose_move(state),
             AnyAgent::Mcts(a) => a.choose_move(state),
+            #[cfg(feature = "nn")]
+            AnyAgent::Nn(a) => a.choose_move(state),
+            #[cfg(feature = "nn")]
+            AnyAgent::MctsNn(a) => a.choose_move(state),
         }
     }
 
@@ -142,6 +246,10 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Greedy(a) => a.evaluate(state),
             AnyAgent::Minimax(a) => a.evaluate(state),
             AnyAgent::Mcts(a) => a.evaluate(state),
+            #[cfg(feature = "nn")]
+            AnyAgent::Nn(a) => a.evaluate(state),
+            #[cfg(feature = "nn")]
+            AnyAgent::MctsNn(a) => a.evaluate(state),
         }
     }
 
@@ -151,6 +259,10 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Greedy(a) => a.evaluate_batch(states, out),
             AnyAgent::Minimax(a) => a.evaluate_batch(states, out),
             AnyAgent::Mcts(a) => a.evaluate_batch(states, out),
+            #[cfg(feature = "nn")]
+            AnyAgent::Nn(a) => a.evaluate_batch(states, out),
+            #[cfg(feature = "nn")]
+            AnyAgent::MctsNn(a) => a.evaluate_batch(states, out),
         }
     }
 }
@@ -194,6 +306,47 @@ mod tests {
             Ok(AgentSpec::Minimax { depth: 3, seed: 2 })
         );
         assert!(AgentSpec::parse(&["alphabeta"]).is_err());
+        #[cfg(feature = "nn")]
+        {
+            let backend = BackendKind::preferred();
+            assert_eq!(
+                AgentSpec::parse(&["nn", "models/value"]),
+                Ok(AgentSpec::Nn {
+                    path: "models/value".into(),
+                    backend
+                })
+            );
+            assert_eq!(
+                AgentSpec::parse(&["mcts-nn", "w", backend.name(), "100", "8", "3"]),
+                Ok(AgentSpec::MctsNn {
+                    path: "w".into(),
+                    backend,
+                    simulations: 100,
+                    batch_size: 8,
+                    seed: 3
+                })
+            );
+            assert_eq!(
+                AgentSpec::parse(&["mcts-nn", "w", "100"]),
+                Ok(AgentSpec::MctsNn {
+                    path: "w".into(),
+                    backend,
+                    simulations: 100,
+                    batch_size: AgentSpec::DEFAULT_NN_BATCH,
+                    seed: 0
+                })
+            );
+            assert!(AgentSpec::parse(&["nn"]).is_err());
+            assert!(AgentSpec::parse(&["nn", "w", "tpu"]).is_err());
+            assert!(
+                AgentSpec::Nn {
+                    path: "/nonexistent".into(),
+                    backend
+                }
+                .build()
+                .is_err()
+            );
+        }
         assert!(AgentSpec::parse(&[]).is_err());
     }
 
@@ -208,7 +361,7 @@ mod tests {
                 seed: 1,
             },
         ] {
-            let mut agent = spec.build();
+            let mut agent = spec.build().unwrap();
             let state = BitState::initial();
             assert!(state.is_legal(agent.choose_move(&state)));
             let e = agent.evaluate(&state);
