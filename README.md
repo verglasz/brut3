@@ -64,11 +64,14 @@ fast iteration on the engine. Development builds use `--all-features`.
 
 Known upstream issues worked around:
 
-- `nn/model.rs`: in burn 0.21, on the CubeCL backends (cuda, wgpu, cpu-mlir), an elementwise op
-  fused onto a matmul with a single output column returns wrong values for all rows but the
-  first, which breaks `burn::nn::Linear` with one output. The value head is therefore written
-  as multiply-and-sum, and a test checks the forward pass against a host computation on every
-  compiled backend.
+- Kernel fusion is off on the CubeCL backends (cuda, wgpu, cpu-mlir): burn is built without its
+  default features and the pieces we need are enabled one by one (`nn` feature). In burn 0.21
+  fusion returns wrong values when an elementwise op is fused onto a matmul with a single
+  output column (which broke `burn::nn::Linear` with one output), and its multi-stream
+  bookkeeping races under the Learner's threads with the transformer models ("Should have
+  handle for tensor"). The `fusion` cargo feature restores burn's defaults for experiments.
+  `nn/linear.rs` keeps a test of both heads against a host computation on every compiled
+  backend.
 - `nn/train.rs`: on the MLIR CPU backend (cubecl-cpu 0.10), reading a still-lazy tensor from a
   thread other than the one that produced it panics in the memory pool. The Learner's metric
   and checkpoint threads do exactly that, so on that backend the step outputs are read back on
@@ -142,6 +145,16 @@ The search is generic over the agent that evaluates leaves:
   `NetAgent` plays the policy head's best move and serves `Mcts` as a batched leaf evaluator
   with priors, which makes `mcts-nn` the AlphaZero-style search. `BackendKind` names the
   compiled backends and gives their `Dispatch` device.
+- Two transformer models share `heads` (pre-norm encoder body with all-to-all attention, and
+  two-layer perceptron heads reading the flattened final residual stream). `BoardTransformer`
+  uses nine tokens, one per small board: an embedding of the board's full cell configuration
+  (3^9 entries) plus position, status and forced-board embeddings. `CellTransformer` uses 81
+  cell tokens: content, position, the cell's board status, forced flag and legality
+  embeddings. Both are selected with `--model board-transformer [d_model] [layers] [heads]` or
+  `--model cell-transformer ...`.
+- `benchmark` plays round-robin matches between any agents (colours alternate) and prints
+  pairwise results and standings, for comparing trained models with each other and with the
+  search and heuristic baselines.
 
 ## Status
 
@@ -161,11 +174,11 @@ Present:
 Planned next, roughly in order:
 
 - [ ] Tree reuse between moves
-- [ ] Real networks: a transformer over small-board tokens and one over cell tokens
+- [x] Real networks: a transformer over small-board tokens and one over cell tokens
 - [ ] Iterated self-play with the current network, replay buffer, evaluation against the
       previous generation before promotion
 - [ ] Shared batching inference service so many searches feed one GPU batch
-- [ ] CLI for agent-vs-agent matches and benchmarks
+- [x] CLI for agent-vs-agent matches (`benchmark`)
 
 ## Layout
 
@@ -182,6 +195,7 @@ src/
   agent/minimax.rs  MinimaxAgent
   agent/any.rs      AgentSpec, AnyAgent (concrete enum over all agents)
   repl.rs           interactive play
+  benchmark.rs      matches and round-robin tournaments
   mcts.rs           Mcts, MctsConfig, SearchResult
   main.rs           launches the REPL
 examples/bench.rs   throughput benchmark

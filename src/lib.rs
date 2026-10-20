@@ -6,9 +6,11 @@
 //! - [`agent`]: the [`agent::UtttAgent`] trait every agent implements.
 //! - [`mcts`]: [`mcts::Mcts`], a PUCT tree search generic over any agent used as leaf evaluator.
 //! - [`repl`]: interactive play against a chosen agent.
+//! - [`benchmark`]: matches and round-robin tournaments between agents.
 //! - [`nn`] (feature `nn`, on by default): the value network, its training, and backend selection.
 
 pub mod agent;
+pub mod benchmark;
 pub mod game;
 pub mod mcts;
 #[cfg(feature = "nn")]

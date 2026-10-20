@@ -29,6 +29,15 @@ enum Command {
     /// List the backends compiled into this binary.
     #[cfg(feature = "nn")]
     Backends,
+    /// Round-robin tournament between agents, e.g. `benchmark "mcts 400" "nn models/value" random`.
+    Benchmark {
+        /// Games per pair of agents (colours alternate).
+        #[arg(long, default_value_t = 20)]
+        games: usize,
+        /// Agent specs, one per argument, quoted when they contain spaces.
+        #[arg(required = true, num_args = 2..)]
+        specs: Vec<String>,
+    },
 }
 
 #[cfg(feature = "nn")]
@@ -73,6 +82,7 @@ fn main() -> ExitCode {
         Command::Play { spec } => play(&spec),
         #[cfg(feature = "nn")]
         Command::Train(args) => train(&args),
+        Command::Benchmark { games, specs } => benchmark(games, &specs),
         #[cfg(feature = "nn")]
         Command::Backends => {
             use ultimate_ttt_burn::nn::BackendKind;
@@ -99,6 +109,21 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn benchmark(games: usize, specs: &[String]) -> Result<(), String> {
+    use ultimate_ttt_burn::benchmark::round_robin;
+    let specs = specs
+        .iter()
+        .map(|s| {
+            let words: Vec<&str> = s.split_whitespace().collect();
+            AgentSpec::parse(&words)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    println!("round robin, {games} games per pair:");
+    let tournament = round_robin(&specs, games, |m| println!("  {m}"))?;
+    print!("\n{}", tournament.table());
+    Ok(())
 }
 
 fn play(spec: &[String]) -> Result<(), String> {
