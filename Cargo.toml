@@ -17,7 +17,8 @@ default = ["ndarray", "wgpu"]
 # among the compiled backends at runtime, and burn-train (autodiff, datasets, the Learner with
 # its TUI dashboard) for training. burn's default features are off so that kernel fusion stays
 # off on the CubeCL backends (see README: it miscomputes thin matmuls and races under the
-# Learner's threads in 0.21); `fusion` turns the defaults back on.
+# Learner's threads in 0.21). To experiment with fusion, add "burn/default" here; it is not a
+# cargo feature of this crate on purpose, so that `--all-features` builds stay fusion-free.
 nn = [
     "dep:burn",
     "burn/std",
@@ -28,8 +29,6 @@ nn = [
     "dep:serde",
     "dep:serde_json",
 ]
-# Opt in to burn's default features, including kernel fusion on cuda/wgpu/cpu-mlir.
-fusion = ["burn/default"]
 # Pure-Rust CPU backend.
 ndarray = ["nn", "burn/ndarray"]
 # Portable GPU backend (Vulkan/Metal/DX12); no SDK needed at build time.

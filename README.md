@@ -69,7 +69,8 @@ Known upstream issues worked around:
   fusion returns wrong values when an elementwise op is fused onto a matmul with a single
   output column (which broke `burn::nn::Linear` with one output), and its multi-stream
   bookkeeping races under the Learner's threads with the transformer models ("Should have
-  handle for tensor"). The `fusion` cargo feature restores burn's defaults for experiments.
+  handle for tensor"). To experiment with fusion, add `burn/default` to the `nn` feature in
+  `Cargo.toml`; it is deliberately not a cargo feature, so `--all-features` stays fusion-free.
   `nn/linear.rs` keeps a test of both heads against a host computation on every compiled
   backend.
 - `nn/train.rs`: on the MLIR CPU backend (cubecl-cpu 0.10), reading a still-lazy tensor from a
