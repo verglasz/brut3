@@ -4,7 +4,9 @@
 //! of 9-bit masks of won boards. Win detection is a 512-entry table lookup. All of this is
 //! private: the public surface is the [`GameState`] trait with its explicit [`Move`]s.
 
-use super::{BoardStatus, GameState, LINES, Move, MoveSet, Outcome, Player, Position, Square};
+use super::{
+    BoardStatus, GameState, LINES, Move, MoveSet, Outcome, Player, Position, Square, Symmetry,
+};
 
 /// All nine squares set.
 const FULL: u16 = 0x1FF;
@@ -314,6 +316,26 @@ impl GameState for BitState {
             None
         }
     }
+
+    fn transform(&self, symmetry: Symmetry) -> Self {
+        let mut out = Self {
+            marks: [[0; 9]; 2],
+            big: [
+                symmetry.permute_mask(self.big[0]),
+                symmetry.permute_mask(self.big[1]),
+            ],
+            done: symmetry.permute_mask(self.done),
+            last_move: self.last_move.map(|mv| symmetry.apply_move(mv)),
+            to_move: self.to_move,
+        };
+        for (b, board) in Square::ALL.iter().enumerate() {
+            let image = symmetry.apply(*board).index();
+            for p in 0..2 {
+                out.marks[p][image] = symmetry.permute_mask(self.marks[p][b]);
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -381,7 +403,9 @@ mod tests {
         for _ in 0..games {
             let mut pos = Position::initial();
             let mut bit = BitState::initial();
+            let mut ply = 0;
             loop {
+                ply += 1;
                 assert_eq!(pos.outcome(), bit.outcome());
                 assert_eq!(pos.to_move(), bit.to_move());
                 assert_eq!(bit.to_position(), pos);
@@ -393,6 +417,19 @@ mod tests {
                 ref_moves.sort();
                 let bit_moves = bit.legal_moves();
                 assert_eq!(ref_moves, bit_moves.to_vec(), "\n{pos}");
+                // Symmetries on every eighth position keep the fuzz quick in debug builds.
+                for sym in Symmetry::ALL.iter().copied().filter(|_| ply % 8 == 0) {
+                    let t_pos = pos.transform(sym);
+                    let t_bit = bit.transform(sym);
+                    assert_eq!(t_bit.to_position(), t_pos, "{sym:?}\n{pos}");
+                    assert_eq!(t_bit.outcome(), bit.outcome());
+                    // Legal moves move with the board.
+                    let mut mapped: Vec<Move> =
+                        ref_moves.iter().map(|m| sym.apply_move(*m)).collect();
+                    mapped.sort();
+                    assert_eq!(mapped, t_bit.legal_moves().to_vec(), "{sym:?}");
+                    assert_eq!(t_bit.transform(sym.inverse()), bit, "{sym:?} inverse");
+                }
                 for mv in &ref_moves {
                     assert!(bit_moves.contains(*mv) && bit.is_legal(*mv));
                 }

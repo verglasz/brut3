@@ -6,8 +6,8 @@
 use std::fmt;
 
 use super::{
-    BoardStatus, GameState, Move, MoveList, MoveSet, Outcome, Player, Square, board_status_of,
-    line_winner,
+    BoardStatus, GameState, Move, MoveList, MoveSet, Outcome, Player, Square, Symmetry,
+    board_status_of, line_winner,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,6 +131,19 @@ impl GameState for Position {
             return Some(Outcome::Draw);
         }
         None
+    }
+
+    fn transform(&self, symmetry: Symmetry) -> Self {
+        let mut out = Position::initial();
+        for board in Square::ALL {
+            for square in Square::ALL {
+                let mv = Move::new(board, square);
+                out.set_cell(symmetry.apply_move(mv), self.cell(mv));
+            }
+        }
+        out.to_move = self.to_move;
+        out.last_move = self.last_move.map(|mv| symmetry.apply_move(mv));
+        out
     }
 }
 

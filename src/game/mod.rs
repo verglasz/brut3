@@ -6,9 +6,11 @@
 
 pub mod bitboard;
 pub mod position;
+pub mod symmetry;
 
 pub use bitboard::{BitMoveSet, BitState};
 pub use position::Position;
+pub use symmetry::Symmetry;
 
 use std::fmt;
 use std::str::FromStr;
@@ -348,6 +350,10 @@ pub trait GameState: Clone {
 
     /// `None` while the game is ongoing.
     fn outcome(&self) -> Option<Outcome>;
+
+    /// The same position seen through a symmetry of the board: every mark, the forced board
+    /// and the move history move with it, the side to move and the outcome do not.
+    fn transform(&self, symmetry: Symmetry) -> Self;
 
     fn is_terminal(&self) -> bool {
         self.outcome().is_some()

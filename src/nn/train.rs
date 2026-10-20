@@ -23,7 +23,7 @@ use super::any_model::Recorder;
 use super::linear::LinearNet;
 use super::model::{MOVES, Model, Verdict, expected_value, legal_mask, predict_host};
 use crate::agent::{AgentSpec, UtttAgent};
-use crate::game::{BitState, GameState, Move};
+use crate::game::{BitState, GameState, Move, Symmetry};
 
 /// One position with how its game ended (side to move's view) and the move distribution the
 /// generating agent played from it.
@@ -40,6 +40,21 @@ pub struct Sample {
 }
 
 impl Sample {
+    /// The same sample seen through a board symmetry: the position and every move of the
+    /// policy move with it, the verdict and game id stay.
+    pub fn transform(&self, symmetry: Symmetry) -> Sample {
+        Sample {
+            state: self.state.transform(symmetry),
+            verdict: self.verdict,
+            policy: self
+                .policy
+                .iter()
+                .map(|(mv, p)| (symmetry.apply_move(*mv), *p))
+                .collect(),
+            game: self.game,
+        }
+    }
+
     /// The target move: the most probable one.
     pub fn best_move(&self) -> Move {
         self.policy
@@ -107,6 +122,16 @@ impl Dataset {
             .map(|s| 1.0 / s.state.legal_moves_vec().len() as f32)
             .sum::<f32>()
             / self.len() as f32
+    }
+
+    /// Every sample under all eight board symmetries (the identity first): eight times the
+    /// data, with the same game ids.
+    pub fn augmented(&self) -> Dataset {
+        let mut samples = Vec::with_capacity(self.len() * Symmetry::ALL.len());
+        for sym in Symmetry::ALL {
+            samples.extend(self.samples.iter().map(|s| s.transform(sym)));
+        }
+        Dataset { samples }
     }
 
     /// Splits off about `fraction` of the positions as validation data, whole games at a
@@ -380,6 +405,8 @@ pub struct TrainOptions {
     pub weight_decay: f32,
     /// Fraction of positions held out for validation.
     pub validation_fraction: f32,
+    /// Train on every sample under all eight board symmetries. Validation is never augmented.
+    pub augment: bool,
     pub seed: u64,
     /// Where the Learner writes its logs and checkpoints.
     pub artifact_dir: PathBuf,
@@ -395,6 +422,7 @@ impl Default for TrainOptions {
             learning_rate: 1e-3,
             weight_decay: 1e-4,
             validation_fraction: 0.1,
+            augment: true,
             seed: 0,
             artifact_dir: PathBuf::from("artifacts/train"),
             tui: true,
@@ -464,6 +492,11 @@ pub fn train<M: Trainable>(
     Dispatch::seed(&ad_device, opts.seed);
 
     let (train_data, valid_data) = data.split(opts.validation_fraction, opts.seed);
+    let train_data = if opts.augment {
+        train_data.augmented()
+    } else {
+        train_data
+    };
     let report_base = TrainReport {
         train_positions: train_data.len(),
         validation_positions: valid_data.len(),
@@ -622,10 +655,14 @@ pub(crate) mod tests {
     use crate::nn::encode::{FEATURES, encode_into};
     use crate::nn::linear::LinearNetConfig;
 
+    /// Options for tests: no dashboard, a temporary artifact directory, and no symmetry
+    /// augmentation, because the synthetic labels are not symmetric (the self-play test turns
+    /// it back on).
     pub fn opts(kind: BackendKind, tag: &str, epochs: usize) -> TrainOptions {
         TrainOptions {
             epochs,
             tui: false,
+            augment: false,
             artifact_dir: temp_artifact_dir(&format!("{kind}-{tag}")),
             ..Default::default()
         }
@@ -711,6 +748,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn augmentation_maps_positions_and_policies_together() {
+        let data = generate(
+            &AgentSpec::Mcts {
+                simulations: 8,
+                seed: 2,
+            },
+            1,
+            |_| {},
+        )
+        .unwrap();
+        let aug = data.augmented();
+        assert_eq!(aug.len(), 8 * data.len());
+        assert_eq!(
+            &aug.samples[..data.len()],
+            &data.samples[..],
+            "identity first"
+        );
+        for (i, s) in aug.samples.iter().enumerate() {
+            let original = &data.samples[i % data.len()];
+            assert_eq!(s.verdict, original.verdict);
+            assert_eq!(s.game, original.game);
+            assert_eq!(s.policy.len(), original.policy.len());
+            for (mv, p) in &s.policy {
+                assert!(
+                    s.state.is_legal(*mv),
+                    "policy move {mv} legal after transform"
+                );
+                assert!(original.policy.iter().any(|(_, q)| q == p));
+            }
+        }
+        // A symmetric position is its own image.
+        let mut d = Dataset::default();
+        d.samples.push(Sample {
+            state: BitState::initial(),
+            verdict: Verdict::Draw,
+            policy: vec![(Move::new(crate::game::sq(1, 1), crate::game::sq(1, 1)), 1.0)],
+            game: 0,
+        });
+        assert!(d.augmented().samples.iter().all(|s| *s == d.samples[0]));
+    }
+
+    #[test]
     fn split_is_by_game_and_keeps_both_parts_non_empty() {
         let mut data = Dataset::default();
         for i in 0..20 {
@@ -768,11 +847,15 @@ pub(crate) mod tests {
         let device = kind.device();
         let data = generate(&AgentSpec::Greedy { seed: 1 }, 300, |_| {}).unwrap();
         let first = data.samples[0].state;
+        let options = TrainOptions {
+            augment: true,
+            ..opts(kind, "linear-selfplay", 8)
+        };
         let (model, report) = train(
             |d| LinearNetConfig::default().init::<Dispatch>(d),
             &device,
             data,
-            &opts(kind, "linear-selfplay", 8),
+            &options,
         );
         // Greedy play is a deterministic function of the position, so the policy is learnable.
         // The outcome labels of a few hundred greedy games are close to noise, so the value

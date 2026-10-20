@@ -77,6 +77,9 @@ struct TrainArgs {
     /// Log metrics as plain lines instead of the live dashboard (for scripts and CI).
     #[arg(long)]
     no_tui: bool,
+    /// Train only on the positions as played, without the eight board symmetries.
+    #[arg(long)]
+    no_augment: bool,
 }
 
 fn main() -> ExitCode {
@@ -184,6 +187,7 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         seed: args.seed,
         artifact_dir: args.artifact_dir.clone(),
         tui: !args.no_tui,
+        augment: !args.no_augment,
         ..Default::default()
     };
     let (model, report) = match &model_spec {
