@@ -11,9 +11,10 @@ rand = { version = "0.9", features = ["small_rng"] }
 [features]
 # Default: every backend that builds with no extra system requirements.
 default = ["ndarray", "wgpu"]
-# Pulls in burn itself plus the pieces every backend needs: autodiff for training, and the
-# Dispatch backend that selects among the compiled backends at runtime.
-nn = ["dep:burn", "burn/autodiff", "burn/dispatch"]
+# Pulls in burn itself plus the pieces every backend needs: the Dispatch backend that selects
+# among the compiled backends at runtime, and burn-train (autodiff, datasets, the Learner with
+# its TUI dashboard) for training.
+nn = ["dep:burn", "burn/dispatch", "burn/train"]
 # Pure-Rust CPU backend.
 ndarray = ["nn", "burn/ndarray"]
 # Portable GPU backend (Vulkan/Metal/DX12); no SDK needed at build time.

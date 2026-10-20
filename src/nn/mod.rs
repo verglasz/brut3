@@ -15,7 +15,7 @@ pub use agent::ValueNetAgent;
 pub use backend::BackendKind;
 pub use encode::{FEATURES, encode_batch, encode_into};
 pub use model::{ValueNet, ValueNetConfig};
-pub use train::{Dataset, TrainOptions, TrainReport, generate, train};
+pub use train::{Dataset, Sample, TrainOptions, TrainReport, generate, train};
 
 /// Tests that touch a device take this lock: initialising or driving several CubeCL backends
 /// (wgpu, cuda, MLIR CPU) from parallel test threads in one process deadlocks.

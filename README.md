@@ -62,11 +62,17 @@ runtime (`--backend cuda`, `nn models/value wgpu`, ...), so one binary can exerc
 `backends` lists what a binary has. `cargo build --no-default-features` skips burn entirely for
 fast iteration on the engine. Development builds use `--all-features`.
 
-Known upstream issue worked around in `nn/model.rs`: in burn 0.21, on the CubeCL backends
-(cuda, wgpu, cpu-mlir), an elementwise op fused onto a matmul with a single output column
-returns wrong values for all rows but the first, which breaks `burn::nn::Linear` with one
-output. The value head is therefore written as multiply-and-sum, and a test checks the forward
-pass against a host computation on every compiled backend.
+Known upstream issues worked around:
+
+- `nn/model.rs`: in burn 0.21, on the CubeCL backends (cuda, wgpu, cpu-mlir), an elementwise op
+  fused onto a matmul with a single output column returns wrong values for all rows but the
+  first, which breaks `burn::nn::Linear` with one output. The value head is therefore written
+  as multiply-and-sum, and a test checks the forward pass against a host computation on every
+  compiled backend.
+- `nn/train.rs`: on the MLIR CPU backend (cubecl-cpu 0.10), reading a still-lazy tensor from a
+  thread other than the one that produced it panics in the memory pool. The Learner's metric
+  and checkpoint threads do exactly that, so on that backend the loss is read back on the
+  training thread before it is handed over, and file checkpointing is skipped.
 
 ## Building and running
 
@@ -85,9 +91,12 @@ cargo build --release --all-features
 cargo test --all-features
 cargo run --release --all-features -- backends
 
-# Train the value network on self-play data, then play against it
+# Train the value network on self-play data (live metrics dashboard), then play against it
 cargo run --release --all-features -- train --backend cuda --data-agent "mcts 50" --games 2000 --epochs 15
 cargo run --release --all-features -- play mcts-nn models/value cuda 400 16
+
+# For scripts and CI: plain log lines instead of the dashboard
+cargo run --release --all-features -- train --backend ndarray --no-tui --artifact-dir artifacts/run1
 
 # Slow tests, and throughput numbers for engine, agents and search
 cargo test --release --no-default-features -- --ignored --nocapture
@@ -120,8 +129,10 @@ The search is generic over the agent that evaluates leaves:
 - `nn` holds the network side: `encode` turns a `BitState` into 199 binary features from the
   side to move's view; `ValueNet` is a single-layer perceptron (`tanh(x . w + b)`) over them;
   `train` generates self-play positions labelled with the game result and fits the net with
-  AdamW; `ValueNetAgent` plays one-ply lookahead with it and serves as a batched leaf evaluator
-  for `Mcts`; `BackendKind` names the compiled backends and gives their `Dispatch` device.
+  burn's `Learner` (AdamW, loss metrics for both splits, checkpoints, a TUI dashboard or plain
+  logs, an `experiment.log` and metric files under `--artifact-dir`); `ValueNetAgent` plays
+  one-ply lookahead with it and serves as a batched leaf evaluator for `Mcts`; `BackendKind`
+  names the compiled backends and gives their `Dispatch` device.
 
 ## Status
 

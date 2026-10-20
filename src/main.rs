@@ -55,6 +55,12 @@ struct TrainArgs {
     /// Where to save the weights (the `.mpk` extension is added).
     #[arg(long, default_value = "models/value")]
     out: std::path::PathBuf,
+    /// Where the Learner writes logs and checkpoints.
+    #[arg(long, default_value = "artifacts/train")]
+    artifact_dir: std::path::PathBuf,
+    /// Log metrics as plain lines instead of the live dashboard (for scripts and CI).
+    #[arg(long)]
+    no_tui: bool,
 }
 
 fn main() -> ExitCode {
@@ -137,17 +143,17 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         batch_size: args.batch_size,
         learning_rate: args.lr,
         seed: args.seed,
+        artifact_dir: args.artifact_dir.clone(),
+        tui: !args.no_tui,
         ..Default::default()
     };
-    let (model, report) = train(&device, &data, &opts, |e| {
-        println!(
-            "  epoch {:>3}  train mse {:.4}  validation mse {:.4}  ({:.1}s)",
-            e.epoch, e.train_mse, e.validation_mse, e.seconds
-        );
-    });
+    let (model, report) = train(&device, data, &opts);
     println!(
-        "  {} train / {} validation positions",
-        report.train_positions, report.validation_positions
+        "  {} train / {} validation positions; validation mse {:.4} (baseline {:.4})",
+        report.train_positions,
+        report.validation_positions,
+        report.validation_mse,
+        report.baseline_mse
     );
 
     if let Some(dir) = args.out.parent().filter(|d| !d.as_os_str().is_empty()) {
