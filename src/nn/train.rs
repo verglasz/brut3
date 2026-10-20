@@ -24,6 +24,7 @@ use super::linear::LinearNet;
 use super::model::{MOVES, Model, Verdict, expected_value, legal_mask, predict_host};
 use crate::agent::{AgentSpec, UtttAgent};
 use crate::game::{BitState, GameState, Move, Symmetry};
+use crate::selfplay::{SelfPlayConfig, SelfPlayStats, self_play};
 
 /// One position with how its game ended (side to move's view) and the move distribution the
 /// generating agent played from it.
@@ -189,6 +190,31 @@ pub fn generate(
         on_game(game + 1);
     }
     Ok(data)
+}
+
+/// Plays `games` games of search with `evaluator` as the leaf evaluator, many at once so the
+/// evaluator sees large batches (see [`crate::selfplay`]), and records every position with the
+/// final result and the search's move distribution.
+pub fn generate_parallel(
+    evaluator: &AgentSpec,
+    games: usize,
+    cfg: &SelfPlayConfig,
+    on_game: impl FnMut(usize),
+) -> Result<(Dataset, SelfPlayStats), String> {
+    let mut evaluator = evaluator.build()?;
+    let (records, stats) = self_play(&mut evaluator, games, cfg, on_game);
+    let mut data = Dataset::default();
+    for (game, record) in records.into_iter().enumerate() {
+        for (state, policy) in record.positions {
+            data.samples.push(Sample {
+                verdict: Verdict::from_outcome(record.outcome, state.to_move()),
+                state,
+                policy,
+                game,
+            });
+        }
+    }
+    Ok((data, stats))
 }
 
 /// A minibatch on a device, encoded for model `M`.
@@ -787,6 +813,24 @@ pub(crate) mod tests {
             game: 0,
         });
         assert!(d.augmented().samples.iter().all(|s| *s == d.samples[0]));
+    }
+
+    #[test]
+    fn generate_parallel_records_games_with_search_policies() {
+        let cfg = SelfPlayConfig {
+            simulations: 16,
+            tree_batch: 4,
+            concurrent: 2,
+            ..Default::default()
+        };
+        let (data, stats) =
+            generate_parallel(&AgentSpec::Random { seed: 1 }, 3, &cfg, |_| {}).unwrap();
+        assert_eq!(stats.games, 3);
+        assert_eq!(data.len(), stats.positions);
+        assert_eq!(data.samples.last().unwrap().game, 2);
+        for s in &data.samples {
+            assert!(s.policy.iter().all(|(mv, _)| s.state.is_legal(*mv)));
+        }
     }
 
     #[test]

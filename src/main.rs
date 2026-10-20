@@ -46,9 +46,29 @@ struct TrainArgs {
     /// Backend to train on (default: fastest compiled in). See `backends`.
     #[arg(long)]
     backend: Option<String>,
-    /// Agent that plays the self-play games, as a spec like `mcts 50` or `greedy`.
+    /// Agent that plays the self-play games, as a spec like `mcts 50` or `greedy`. Ignored
+    /// when `--selfplay-evaluator` is given.
     #[arg(long, default_value = "mcts 50")]
     data_agent: String,
+    /// Generate the games by lockstep self-play: MCTS with this agent as the leaf evaluator
+    /// (e.g. `nn models/board cuda`, or `random` for playouts), `--concurrent` games at once.
+    #[arg(long)]
+    selfplay_evaluator: Option<String>,
+    /// Self-play: simulations per move.
+    #[arg(long, default_value_t = 200)]
+    simulations: u32,
+    /// Self-play: games searched at once (the evaluator batch is concurrent x tree-batch).
+    #[arg(long, default_value_t = 64)]
+    concurrent: usize,
+    /// Self-play: leaves claimed per tree per round.
+    #[arg(long, default_value_t = 8)]
+    tree_batch: usize,
+    /// Self-play: plies per game with temperature-1 move sampling before switching to argmax.
+    #[arg(long, default_value_t = 16)]
+    temperature_moves: usize,
+    /// Self-play: Dirichlet alpha of the root noise (0 disables it).
+    #[arg(long, default_value_t = 0.3)]
+    dirichlet_alpha: f32,
     /// Model to train: `linear`, `board-transformer [d_model] [layers] [heads]` or
     /// `cell-transformer [d_model] [layers] [heads]`.
     #[arg(long, default_value = "linear")]
@@ -158,21 +178,52 @@ fn train(args: &TrainArgs) -> Result<(), String> {
     let model_words: Vec<&str> = args.model.split_whitespace().collect();
     let model_spec = ModelSpec::parse(&model_words)?;
 
-    println!("generating {} self-play games with {data_spec}", args.games);
     let start = Instant::now();
-    let data = generate(&data_spec, args.games, |n| {
-        if n % 100 == 0 || n == args.games {
+    let progress = |n: usize| {
+        if n.is_multiple_of(100) || n == args.games {
             print!("\r  {n}/{} games", args.games);
             let _ = io::stdout().flush();
         }
-    })?;
+    };
+    let data = match &args.selfplay_evaluator {
+        Some(evaluator) => {
+            use ultimate_ttt_burn::nn::generate_parallel;
+            use ultimate_ttt_burn::selfplay::SelfPlayConfig;
+            let words: Vec<&str> = evaluator.split_whitespace().collect();
+            let evaluator_spec = AgentSpec::parse(&words)?;
+            let cfg = SelfPlayConfig {
+                simulations: args.simulations,
+                tree_batch: args.tree_batch,
+                concurrent: args.concurrent,
+                temperature_moves: args.temperature_moves,
+                root_noise: (args.dirichlet_alpha > 0.0).then_some((args.dirichlet_alpha, 0.25)),
+                seed: args.seed,
+                ..Default::default()
+            };
+            println!(
+                "self-play: {} games, {} simulations/move, {} concurrent x {} leaves, evaluator {evaluator_spec}",
+                args.games, cfg.simulations, cfg.concurrent, cfg.tree_batch
+            );
+            let (data, stats) = generate_parallel(&evaluator_spec, args.games, &cfg, progress)?;
+            println!(
+                "\n  {:.0} simulations/s, mean evaluator batch {:.1} over {} calls",
+                stats.simulations_per_second(),
+                stats.mean_batch(),
+                stats.evaluator_calls
+            );
+            data
+        }
+        None => {
+            println!("generating {} self-play games with {data_spec}", args.games);
+            generate(&data_spec, args.games, progress)?
+        }
+    };
     let [wins, draws, losses] = data.verdict_counts();
     println!(
         "\n  {} positions ({wins} win / {draws} draw / {losses} loss) in {:.1}s",
         data.len(),
         start.elapsed().as_secs_f32(),
     );
-
     let device = backend.device();
     println!(
         "training {model_spec} ({} parameters) on {backend} for {} epochs",

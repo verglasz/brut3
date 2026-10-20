@@ -102,6 +102,11 @@ cargo run --release --all-features -- backends
 cargo run --release --all-features -- train --backend cuda --model linear --data-agent "mcts 50" --games 2000 --epochs 15
 cargo run --release --all-features -- play mcts-nn models/value cuda 400 16
 
+# Self-play data from the current network: 64 games searched at once, 200 simulations per move,
+# Dirichlet root noise, temperature sampling for the first 16 plies
+cargo run --release --all-features -- train --backend cuda --model "board-transformer 64 2 4" \
+  --selfplay-evaluator "nn models/board cuda" --games 5000 --simulations 200 --concurrent 64 --tree-batch 8 --out models/board2
+
 # For scripts and CI: plain log lines instead of the dashboard
 cargo run --release --all-features -- train --backend ndarray --no-tui --artifact-dir artifacts/run1
 
@@ -130,9 +135,16 @@ The search is generic over the agent that evaluates leaves:
   returns a value in `[-1, 1]` plus optional move priors. The default `evaluate` is a playout
   using `choose_move`; the heuristic agents return their static value; a network agent will
   override `evaluate_batch` to run one forward pass per batch of leaves.
-- `mcts::Mcts<A: UtttAgent>` is a PUCT search over an arena tree. With no priors it behaves as
-  plain UCT with rollouts; with network priors it is the AlphaZero search. `Mcts<A>` itself
-  implements `UtttAgent`, so searches compose and its visit distribution can feed training.
+- `mcts::SearchTree` is a PUCT search over an arena tree written as a resumable state machine:
+  it hands out leaves to evaluate (`claim`) and takes their evaluations back (`resolve`), with
+  virtual loss within a round and optional Dirichlet noise on the root priors. With no priors it
+  behaves as plain UCT with rollouts; with network priors it is the AlphaZero search.
+  `mcts::Mcts<A: UtttAgent>` drives one tree with its own agent and implements `UtttAgent`
+  itself, so searches compose and its visit distribution can feed training.
+- `selfplay` runs many games in lockstep: every round, the leaves claimed by all trees go to
+  the evaluator in one `evaluate_batch` call, so a network sees `concurrent x tree_batch`
+  positions per forward pass instead of one tree's batch. Moves are sampled by visit count for
+  the first plies of each game and by argmax afterwards.
 - `nn` holds the network side. Every model implements `Model`: it encodes raw `BitState`s into
   its own input tensors and predicts a `Prediction` with two heads, three win/draw/loss logits
   from the side to move's view (search uses `p_win - p_loss` as the value) and 81 move logits
@@ -180,9 +192,9 @@ Planned next, roughly in order:
 
 - [ ] Tree reuse between moves
 - [x] Real networks: a transformer over small-board tokens and one over cell tokens
-- [ ] Iterated self-play with the current network, replay buffer, evaluation against the
-      previous generation before promotion
-- [ ] Shared batching inference service so many searches feed one GPU batch
+- [x] Self-play with the current network as evaluator, many games batched per forward pass
+- [ ] Iterated generations: replay buffer, evaluation against the previous generation before
+      promotion, a loop command
 - [x] CLI for agent-vs-agent matches (`benchmark`)
 
 ## Layout
@@ -202,6 +214,7 @@ src/
   agent/any.rs      AgentSpec, AnyAgent (concrete enum over all agents)
   repl.rs           interactive play
   benchmark.rs      matches and round-robin tournaments
+  selfplay.rs       lockstep self-play over many games with one batched evaluator
   mcts.rs           Mcts, MctsConfig, SearchResult
   main.rs           launches the REPL
 examples/bench.rs   throughput benchmark

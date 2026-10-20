@@ -7,6 +7,7 @@
 //! - [`mcts`]: [`mcts::Mcts`], a PUCT tree search generic over any agent used as leaf evaluator.
 //! - [`repl`]: interactive play against a chosen agent.
 //! - [`benchmark`]: matches and round-robin tournaments between agents.
+//! - [`selfplay`]: lockstep self-play over many games with one batched evaluator.
 //! - [`nn`] (feature `nn`, on by default): the value network, its training, and backend selection.
 
 pub mod agent;
@@ -16,3 +17,4 @@ pub mod mcts;
 #[cfg(feature = "nn")]
 pub mod nn;
 pub mod repl;
+pub mod selfplay;

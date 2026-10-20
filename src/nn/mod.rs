@@ -29,7 +29,7 @@ pub use cell_transformer::{CellTransformer, CellTransformerConfig};
 pub use encode::{FEATURES, encode_batch, encode_into};
 pub use linear::{LinearNet, LinearNetConfig};
 pub use model::{HostPrediction, MOVES, Model, Prediction, Verdict, expected_value};
-pub use train::{Dataset, Sample, TrainOptions, TrainReport, generate, train};
+pub use train::{Dataset, Sample, TrainOptions, TrainReport, generate, generate_parallel, train};
 
 /// Tests that touch a device take this lock: initialising or driving several CubeCL backends
 /// (wgpu, cuda, MLIR CPU) from parallel test threads in one process deadlocks.
