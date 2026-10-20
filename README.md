@@ -139,7 +139,8 @@ The search is generic over the agent that evaluates leaves:
   binary features from `encode`. `ModelSpec` names a model kind and is saved as JSON next to
   the weights, so `AnyModel::load` rebuilds the right model from a path. `train` generates
   self-play positions labelled with the game result and the generating agent's move
-  distribution (a search's visit counts), then fits the model with burn's `Learner`: AdamW,
+  distribution (a search's visit counts), holds out whole games for validation (positions of
+  one game share their outcome), then fits the model with burn's `Learner`: AdamW,
   the summed cross-entropies as the loss, loss and verdict-accuracy metrics for both splits,
   checkpoints, a TUI dashboard or plain logs, and an `experiment.log` under `--artifact-dir`.
   `NetAgent` plays the policy head's best move and serves `Mcts` as a batched leaf evaluator

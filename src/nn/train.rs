@@ -34,6 +34,9 @@ pub struct Sample {
     /// Probabilities over the legal moves; a search agent's visit distribution, or a single
     /// move with probability 1.
     pub policy: Vec<(Move, f32)>,
+    /// Which game the position came from. Splits keep a game's positions together, since they
+    /// share the outcome and a model could otherwise memorise trajectories.
+    pub game: usize,
 }
 
 impl Sample {
@@ -106,16 +109,25 @@ impl Dataset {
             / self.len() as f32
     }
 
-    /// Shuffles with `seed` and splits off `fraction` of the samples as validation data.
-    /// At least one sample stays in each part when there are two or more.
-    pub fn split(mut self, fraction: f32, seed: u64) -> (Dataset, Dataset) {
+    /// Splits off about `fraction` of the positions as validation data, whole games at a
+    /// time (games are shuffled with `seed`). When there are at least two games, each part
+    /// gets at least one.
+    pub fn split(self, fraction: f32, seed: u64) -> (Dataset, Dataset) {
+        let mut games: Vec<usize> = self.samples.iter().map(|s| s.game).collect();
+        games.sort_unstable();
+        games.dedup();
         let mut rng = SmallRng::seed_from_u64(seed);
-        self.samples.shuffle(&mut rng);
-        let n_val = ((self.len() as f32 * fraction) as usize)
-            .max(usize::from(self.len() >= 2))
-            .min(self.len().saturating_sub(1));
-        let train = self.samples.split_off(n_val);
-        (Dataset { samples: train }, self)
+        games.shuffle(&mut rng);
+        let n_val = ((games.len() as f32 * fraction).round() as usize)
+            .max(usize::from(games.len() >= 2))
+            .min(games.len().saturating_sub(1));
+        let validation_games: std::collections::HashSet<usize> =
+            games.iter().take(n_val).copied().collect();
+        let (valid, train): (Vec<Sample>, Vec<Sample>) = self
+            .samples
+            .into_iter()
+            .partition(|s| validation_games.contains(&s.game));
+        (Dataset { samples: train }, Dataset { samples: valid })
     }
 }
 
@@ -146,6 +158,7 @@ pub fn generate(
                 verdict: Verdict::from_outcome(outcome, state.to_move()),
                 state,
                 policy,
+                game,
             });
         }
         on_game(game + 1);
@@ -573,8 +586,10 @@ pub(crate) mod tests {
             .collect();
         let mut data = Dataset::default();
         let mut features = vec![0.0; FEATURES];
+        let mut game = 0;
         while data.len() < n {
             let mut state = BitState::initial();
+            game += 1;
             while state.outcome().is_none() && data.len() < n {
                 encode_into(&state, &mut features);
                 let mut wdl = [0.0f32; 3];
@@ -600,6 +615,7 @@ pub(crate) mod tests {
                     state,
                     verdict: Verdict::from_index(verdict),
                     policy: vec![(best, 1.0)],
+                    game,
                 });
                 let k = rng.random_range(0..legal.len());
                 state.apply(legal.iter().nth(k).unwrap());
@@ -631,22 +647,29 @@ pub(crate) mod tests {
         assert!(a.value() == -b.value());
         assert_eq!(data.verdict_counts().iter().sum::<usize>(), data.len());
         assert!(data.baseline_policy_accuracy() > 0.0);
+        assert_eq!(data.samples.first().unwrap().game, 0);
+        assert_eq!(data.samples.last().unwrap().game, 1);
     }
 
     #[test]
-    fn split_keeps_both_parts_non_empty() {
+    fn split_is_by_game_and_keeps_both_parts_non_empty() {
         let mut data = Dataset::default();
-        for i in 0..10 {
+        for i in 0..20 {
             data.samples.push(Sample {
                 state: BitState::initial(),
                 verdict: Verdict::from_index(i % 3),
                 policy: vec![(Move::from_index(i), 1.0)],
+                game: i / 4, // 5 games of 4 positions
             });
         }
-        let (train, valid) = data.clone().split(0.1, 1);
-        assert_eq!((train.len(), valid.len()), (9, 1));
+        let (train, valid) = data.clone().split(0.2, 1);
+        assert_eq!((train.len(), valid.len()), (16, 4));
+        let valid_games: std::collections::HashSet<usize> =
+            valid.samples.iter().map(|s| s.game).collect();
+        assert_eq!(valid_games.len(), 1);
+        assert!(train.samples.iter().all(|s| !valid_games.contains(&s.game)));
         let (train, valid) = data.split(0.0, 1);
-        assert_eq!((train.len(), valid.len()), (9, 1));
+        assert_eq!((train.len(), valid.len()), (16, 4));
     }
 
     #[test]
