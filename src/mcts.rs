@@ -1,13 +1,18 @@
-//! [`Mcts`]: PUCT Monte Carlo Tree Search, generic over the agent used to evaluate leaves.
+//! PUCT Monte Carlo Tree Search.
+//!
+//! [`SearchTree`] is the search itself, written as a resumable state machine: it hands out
+//! leaves to evaluate ([`SearchTree::claim`]) and takes their evaluations back
+//! ([`SearchTree::resolve`]), so that any number of trees can share one batched evaluator.
+//! [`Mcts`] drives a single tree with its own agent, which is what the REPL and the
+//! benchmark use.
 //!
 //! With an agent whose [`UtttAgent::evaluate`] does random playouts and returns no priors this
 //! is classic rollout MCTS; with a network agent returning priors and a value it is the
 //! AlphaZero search. One code path covers both.
 //!
-//! Leaves are evaluated in batches: up to `batch_size` paths are selected per round, each
-//! claimed leaf carrying a virtual loss so the next selection goes elsewhere, and the agent's
-//! [`UtttAgent::evaluate_batch`] sees them all at once. With `batch_size = 1` this is plain
-//! sequential MCTS.
+//! Within one tree, up to `batch_size` leaves are selected per round, each claimed leaf
+//! carrying a virtual loss so the next selection goes elsewhere. With `batch_size = 1` this is
+//! plain sequential MCTS.
 
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
@@ -69,6 +74,32 @@ impl SearchResult {
             .map(|(m, n)| (*m, *n as f32 / total as f32))
             .collect()
     }
+
+    /// Samples a move with probability proportional to `visits^(1/temperature)`; with
+    /// temperature `0` (or below) the most visited move.
+    pub fn sample_move(&self, temperature: f32, rng: &mut impl Rng) -> Option<Move> {
+        if self.visits.is_empty() {
+            return None;
+        }
+        if temperature <= 0.0 {
+            return self.best_move();
+        }
+        let inv_t = 1.0 / temperature;
+        let weights: Vec<f32> = self
+            .visits
+            .iter()
+            .map(|(_, n)| (*n as f32).powf(inv_t))
+            .collect();
+        let total: f32 = weights.iter().sum();
+        let mut r = rng.random::<f32>() * total;
+        for ((mv, _), w) in self.visits.iter().zip(&weights) {
+            r -= w;
+            if r <= 0.0 {
+                return Some(*mv);
+            }
+        }
+        self.visits.last().map(|(mv, _)| *mv)
+    }
 }
 
 const NO_NODE: u32 = u32::MAX;
@@ -82,12 +113,12 @@ struct Node<S> {
     first_child: u32,
     n_children: u8,
     expanded: bool,
-    /// Claimed by the current batch, awaiting evaluation.
+    /// Claimed by the current round, awaiting evaluation.
     pending: bool,
     visits: u32,
     /// Sum of backed-up values, from the perspective of the side to move *at this node*.
     value_sum: f32,
-    /// Virtual losses currently applied (paths through here claimed in the current batch).
+    /// Virtual losses currently applied (paths through here claimed in the current round).
     virtual_losses: u32,
     prior: f32,
     outcome: Option<Outcome>,
@@ -133,64 +164,139 @@ impl<S: GameState> Node<S> {
     }
 }
 
-pub struct Mcts<A: UtttAgent> {
-    agent: A,
-    cfg: MctsConfig,
-    nodes: Vec<Node<A::State>>,
-    rng: SmallRng,
-    leaves: Vec<u32>,
-    states: Vec<A::State>,
-    evals: Vec<Evaluation>,
+/// Dirichlet noise mixed into the root priors once the root is expanded (AlphaZero's
+/// self-play exploration).
+#[derive(Clone, Debug)]
+pub struct RootNoise {
+    /// Dirichlet concentration; AlphaZero used `0.3` for chess, smaller for larger boards.
+    pub alpha: f32,
+    /// Weight of the noise in the mixed prior, `0.25` in AlphaZero.
+    pub fraction: f32,
+    pub seed: u64,
+}
+
+enum Selection {
+    /// An unexpanded, unclaimed leaf.
+    Leaf(u32),
+    /// A terminal node and its value for the side to move there.
+    Terminal(u32, f32),
+    /// Selection ran into a leaf already claimed in this round.
+    Blocked,
+}
+
+/// One search, resumable between leaf evaluations.
+///
+/// Call [`SearchTree::claim`] to get leaves to evaluate, evaluate them however you like, and
+/// hand the results to [`SearchTree::resolve`]; repeat until [`SearchTree::is_done`].
+pub struct SearchTree<S: GameState> {
+    nodes: Vec<Node<S>>,
+    c_puct: f32,
+    virtual_loss: f32,
+    /// Leaves claimed in the current round, in claim order.
+    claimed: Vec<u32>,
+    /// Simulations completed (leaf evaluations plus terminal hits).
+    completed: u32,
+    budget: u32,
+    noise: Option<(RootNoise, SmallRng)>,
     prior_buf: [f32; 81],
 }
 
-impl<A: UtttAgent> Mcts<A> {
-    pub fn new(agent: A, cfg: MctsConfig) -> Self {
-        let rng = SmallRng::seed_from_u64(cfg.seed);
+impl<S: GameState> SearchTree<S> {
+    /// A search from `root` of `simulations` leaf evaluations.
+    pub fn new(root: S, simulations: u32, c_puct: f32, virtual_loss: f32) -> Self {
         Self {
-            agent,
-            cfg,
-            nodes: Vec::new(),
-            rng,
-            leaves: Vec::new(),
-            states: Vec::new(),
-            evals: Vec::new(),
+            nodes: vec![Node::new(root, None, NO_NODE, 1.0)],
+            c_puct,
+            virtual_loss,
+            claimed: Vec::new(),
+            completed: 0,
+            budget: simulations,
+            noise: None,
             prior_buf: [0.0; 81],
         }
     }
 
-    pub fn config(&self) -> &MctsConfig {
-        &self.cfg
+    /// Mixes Dirichlet noise into the root priors when the root gets expanded.
+    pub fn with_root_noise(mut self, noise: RootNoise) -> Self {
+        let rng = SmallRng::seed_from_u64(noise.seed);
+        self.noise = Some((noise, rng));
+        self
     }
 
-    pub fn agent(&self) -> &A {
-        &self.agent
+    pub fn root(&self) -> &S {
+        &self.nodes[0].state
     }
 
-    pub fn agent_mut(&mut self) -> &mut A {
-        &mut self.agent
+    pub fn is_done(&self) -> bool {
+        self.completed >= self.budget || self.nodes[0].outcome.is_some()
     }
 
-    pub fn into_agent(self) -> A {
-        self.agent
+    pub fn completed(&self) -> u32 {
+        self.completed
     }
 
-    /// Runs a full search from `state` and returns the root statistics.
-    pub fn search(&mut self, state: &A::State) -> SearchResult {
-        self.nodes.clear();
-        self.nodes
-            .push(Node::new(state.clone(), None, NO_NODE, 1.0));
-        if let Some(outcome) = self.nodes[0].outcome {
+    /// Selects up to `max` leaves (never beyond the remaining budget) and appends their
+    /// states to `out`, in the order [`SearchTree::resolve`] expects evaluations. Terminal
+    /// nodes met on the way are backed up immediately and count as simulations. Returns how
+    /// many leaves were claimed; `0` with the search not done means only terminals were hit
+    /// this round, so just call again.
+    pub fn claim(&mut self, max: usize, out: &mut Vec<S>) -> usize {
+        assert!(self.claimed.is_empty(), "resolve the previous round first");
+        if self.is_done() {
+            return 0;
+        }
+        let want = max.max(1).min((self.budget - self.completed) as usize);
+        for _ in 0..want {
+            match self.select_leaf() {
+                Selection::Terminal(idx, value) => {
+                    self.backup(idx, value);
+                    self.completed += 1;
+                    if self.completed >= self.budget {
+                        break;
+                    }
+                }
+                Selection::Leaf(idx) => {
+                    self.nodes[idx as usize].pending = true;
+                    self.add_virtual_loss(idx);
+                    self.claimed.push(idx);
+                    out.push(self.nodes[idx as usize].state.clone());
+                }
+                // Every path leads to an already-claimed leaf: evaluate what we have.
+                Selection::Blocked => break,
+            }
+        }
+        self.claimed.len()
+    }
+
+    /// Expands the leaves of the last [`SearchTree::claim`] with `evaluations` (same order)
+    /// and backs their values up.
+    pub fn resolve(&mut self, evaluations: &[Evaluation]) {
+        assert_eq!(
+            evaluations.len(),
+            self.claimed.len(),
+            "one evaluation per claimed leaf"
+        );
+        let claimed = std::mem::take(&mut self.claimed);
+        for (&idx, eval) in claimed.iter().zip(evaluations) {
+            self.remove_virtual_loss(idx);
+            self.nodes[idx as usize].pending = false;
+            let value = self.expand(idx, eval);
+            self.backup(idx, value);
+            self.completed += 1;
+        }
+        self.claimed = claimed;
+        self.claimed.clear();
+    }
+
+    /// Root statistics so far.
+    pub fn result(&self) -> SearchResult {
+        let root = &self.nodes[0];
+        if let Some(outcome) = root.outcome {
             return SearchResult {
-                root_value: outcome.value_for(state.to_move()),
+                root_value: outcome.value_for(root.state.to_move()),
                 visits: Vec::new(),
             };
         }
-        let mut done = 0u32;
-        while done < self.cfg.simulations {
-            done += self.run_batch(self.cfg.simulations - done);
-        }
-        let root = &self.nodes[0];
         let visits = root
             .children()
             .map(|c| {
@@ -202,55 +308,6 @@ impl<A: UtttAgent> Mcts<A> {
             root_value: root.value_sum / root.visits.max(1) as f32,
             visits,
         }
-    }
-
-    /// Selects up to `min(batch_size, budget)` leaves, evaluates them together, backs up.
-    /// Returns how many simulations were completed (terminal hits included).
-    fn run_batch(&mut self, budget: u32) -> u32 {
-        let want = self.cfg.batch_size.max(1).min(budget as usize);
-        let mut completed = 0u32;
-        self.leaves.clear();
-        for _ in 0..want {
-            match self.select_leaf() {
-                Selection::Terminal(idx, value) => {
-                    self.backup(idx, value);
-                    completed += 1;
-                }
-                Selection::Leaf(idx) => {
-                    self.nodes[idx as usize].pending = true;
-                    self.add_virtual_loss(idx);
-                    self.leaves.push(idx);
-                }
-                // Every path leads to an already-claimed leaf: evaluate what we have.
-                Selection::Blocked => break,
-            }
-        }
-        if self.leaves.is_empty() {
-            return completed;
-        }
-
-        self.states.clear();
-        self.states.extend(
-            self.leaves
-                .iter()
-                .map(|&i| self.nodes[i as usize].state.clone()),
-        );
-        self.evals.clear();
-        self.agent.evaluate_batch(&self.states, &mut self.evals);
-        debug_assert_eq!(self.evals.len(), self.leaves.len());
-
-        let leaves = std::mem::take(&mut self.leaves);
-        let evals = std::mem::take(&mut self.evals);
-        for (&idx, eval) in leaves.iter().zip(&evals) {
-            self.remove_virtual_loss(idx);
-            self.nodes[idx as usize].pending = false;
-            let value = self.expand(idx, eval);
-            self.backup(idx, value);
-            completed += 1;
-        }
-        self.leaves = leaves;
-        self.evals = evals;
-        completed
     }
 
     fn select_leaf(&self) -> Selection {
@@ -279,8 +336,8 @@ impl<A: UtttAgent> Mcts<A> {
         for c in node.children() {
             let child = &self.nodes[c as usize];
             let exploration =
-                self.cfg.c_puct * child.prior * sqrt_n / (1.0 + child.effective_visits() as f32);
-            let score = child.q_for_parent(self.cfg.virtual_loss) + exploration;
+                self.c_puct * child.prior * sqrt_n / (1.0 + child.effective_visits() as f32);
+            let score = child.q_for_parent(self.virtual_loss) + exploration;
             if score > best_score {
                 best_score = score;
                 best = c;
@@ -328,9 +385,11 @@ impl<A: UtttAgent> Mcts<A> {
         if !eval.priors.is_empty() {
             self.prior_buf.fill(0.0);
             for (mv, p) in &eval.priors {
-                self.prior_buf[mv.index()] += p.max(0.0);
+                if moves.contains(*mv) {
+                    self.prior_buf[mv.index()] += p.max(0.0);
+                    total += p.max(0.0);
+                }
             }
-            total = moves.iter().map(|m| self.prior_buf[m.index()]).sum();
         }
         let uniform = total <= 1e-12;
         let n = moves.len();
@@ -352,34 +411,26 @@ impl<A: UtttAgent> Mcts<A> {
         node.first_child = first_child;
         node.n_children = n as u8;
         node.expanded = true;
+        if idx == 0 {
+            self.apply_root_noise();
+        }
         eval.value.clamp(-1.0, 1.0)
     }
 
-    fn pick_move(&mut self, result: &SearchResult) -> Move {
-        if self.cfg.temperature <= 0.0 {
-            return result
-                .best_move()
-                .expect("search on a non-terminal state has moves");
+    fn apply_root_noise(&mut self) {
+        let Some((noise, rng)) = self.noise.as_mut() else {
+            return;
+        };
+        let children = self.nodes[0].children();
+        let sample = dirichlet(rng, noise.alpha, children.len());
+        for (c, d) in children.zip(sample) {
+            let child = &mut self.nodes[c as usize];
+            child.prior = (1.0 - noise.fraction) * child.prior + noise.fraction * d;
         }
-        let inv_t = 1.0 / self.cfg.temperature;
-        let weights: Vec<f32> = result
-            .visits
-            .iter()
-            .map(|(_, n)| (*n as f32).powf(inv_t))
-            .collect();
-        let total: f32 = weights.iter().sum();
-        let mut r = self.rng.random::<f32>() * total;
-        for ((mv, _), w) in result.visits.iter().zip(&weights) {
-            r -= w;
-            if r <= 0.0 {
-                return *mv;
-            }
-        }
-        result.visits.last().expect("non-empty").0
     }
 
     #[cfg(test)]
-    fn root_children(&self) -> Vec<(Move, f32, u32)> {
+    pub(crate) fn root_children(&self) -> Vec<(Move, f32, u32)> {
         self.nodes[0]
             .children()
             .map(|c| {
@@ -389,10 +440,10 @@ impl<A: UtttAgent> Mcts<A> {
             .collect()
     }
 
-    /// Checks the tree after a search: no virtual losses or pending leaves remain, and every
+    /// Checks the tree between rounds: no virtual losses or pending leaves remain, and every
     /// expanded node's visits equal its own evaluation plus its children's visits.
     #[cfg(test)]
-    fn assert_tree_consistent(&self) {
+    pub(crate) fn assert_consistent(&self) {
         for (i, node) in self.nodes.iter().enumerate() {
             assert_eq!(node.virtual_losses, 0, "node {i} has virtual losses");
             assert!(!node.pending, "node {i} still pending");
@@ -405,13 +456,120 @@ impl<A: UtttAgent> Mcts<A> {
     }
 }
 
-enum Selection {
-    /// An unexpanded, unclaimed leaf.
-    Leaf(u32),
-    /// A terminal node and its value for the side to move there.
-    Terminal(u32, f32),
-    /// Selection ran into a leaf already claimed in this batch.
-    Blocked,
+/// A sample from a symmetric Dirichlet distribution with concentration `alpha`, as
+/// normalised gamma variates (Marsaglia and Tsang, with the `alpha < 1` boost).
+pub fn dirichlet(rng: &mut impl Rng, alpha: f32, n: usize) -> Vec<f32> {
+    let mut sample: Vec<f32> = (0..n).map(|_| gamma(rng, alpha)).collect();
+    let total: f32 = sample.iter().sum();
+    if total <= 0.0 || !total.is_finite() {
+        return vec![1.0 / n.max(1) as f32; n];
+    }
+    for x in &mut sample {
+        *x /= total;
+    }
+    sample
+}
+
+fn gamma(rng: &mut impl Rng, alpha: f32) -> f32 {
+    if alpha < 1.0 {
+        // Gamma(a) = Gamma(a + 1) * U^(1/a)
+        let u: f32 = rng.random::<f32>().max(f32::MIN_POSITIVE);
+        return gamma(rng, alpha + 1.0) * u.powf(1.0 / alpha);
+    }
+    let d = alpha - 1.0 / 3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+    loop {
+        // Standard normal via Box-Muller.
+        let u1: f32 = rng.random::<f32>().max(f32::MIN_POSITIVE);
+        let u2: f32 = rng.random();
+        let x = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos();
+        let v = (1.0 + c * x).powi(3);
+        if v <= 0.0 {
+            continue;
+        }
+        let u: f32 = rng.random();
+        if u < 1.0 - 0.0331 * x.powi(4) || u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) {
+            return d * v;
+        }
+    }
+}
+
+/// A single search driven by its own agent.
+pub struct Mcts<A: UtttAgent> {
+    agent: A,
+    cfg: MctsConfig,
+    rng: SmallRng,
+    states: Vec<A::State>,
+    evals: Vec<Evaluation>,
+    /// The last search, kept for inspection.
+    tree: Option<SearchTree<A::State>>,
+}
+
+impl<A: UtttAgent> Mcts<A> {
+    pub fn new(agent: A, cfg: MctsConfig) -> Self {
+        let rng = SmallRng::seed_from_u64(cfg.seed);
+        Self {
+            agent,
+            cfg,
+            rng,
+            states: Vec::new(),
+            evals: Vec::new(),
+            tree: None,
+        }
+    }
+
+    pub fn config(&self) -> &MctsConfig {
+        &self.cfg
+    }
+
+    pub fn agent(&self) -> &A {
+        &self.agent
+    }
+
+    pub fn agent_mut(&mut self) -> &mut A {
+        &mut self.agent
+    }
+
+    pub fn into_agent(self) -> A {
+        self.agent
+    }
+
+    /// Runs a full search from `state` and returns the root statistics.
+    pub fn search(&mut self, state: &A::State) -> SearchResult {
+        let mut tree = SearchTree::new(
+            state.clone(),
+            self.cfg.simulations,
+            self.cfg.c_puct,
+            self.cfg.virtual_loss,
+        );
+        while !tree.is_done() {
+            self.states.clear();
+            if tree.claim(self.cfg.batch_size, &mut self.states) > 0 {
+                self.evals.clear();
+                self.agent.evaluate_batch(&self.states, &mut self.evals);
+                tree.resolve(&self.evals);
+            }
+        }
+        let result = tree.result();
+        self.tree = Some(tree);
+        result
+    }
+
+    fn pick_move(&mut self, result: &SearchResult) -> Move {
+        result
+            .sample_move(self.cfg.temperature, &mut self.rng)
+            .expect("search on a non-terminal state has moves")
+    }
+
+    #[cfg(test)]
+    fn root_children(&self) -> Vec<(Move, f32, u32)> {
+        self.tree.as_ref().expect("searched").root_children()
+    }
+
+    #[cfg(test)]
+    fn assert_tree_consistent(&self) {
+        self.tree.as_ref().expect("searched").assert_consistent();
+    }
 }
 
 impl<A: UtttAgent> UtttAgent for Mcts<A> {
@@ -567,6 +725,83 @@ mod tests {
         };
         assert_eq!(run(5), run(5));
         assert_ne!(run(5), run(6));
+    }
+
+    #[test]
+    fn search_tree_is_resumable_and_bounded_by_budget() {
+        let mut agent = RandomAgent::<BitState>::new(4);
+        let mut tree = SearchTree::new(x_wins_in_one(), 50, 1.4, 1.0);
+        let mut states = Vec::new();
+        let mut evals = Vec::new();
+        let mut rounds = 0;
+        while !tree.is_done() {
+            states.clear();
+            let claimed = tree.claim(8, &mut states);
+            assert!(claimed <= 8);
+            assert_eq!(claimed, states.len());
+            if claimed > 0 {
+                evals.clear();
+                agent.evaluate_batch(&states, &mut evals);
+                tree.resolve(&evals);
+            }
+            tree.assert_consistent();
+            rounds += 1;
+        }
+        assert_eq!(tree.completed(), 50);
+        assert!(rounds >= 7, "{rounds} rounds");
+        assert_eq!(
+            tree.result().best_move(),
+            Some(Move::new(sq(0, 2), sq(0, 2)))
+        );
+        assert_eq!(tree.claim(8, &mut states), 0, "done trees claim nothing");
+    }
+
+    #[test]
+    fn root_noise_perturbs_priors_but_keeps_them_a_distribution() {
+        let mut agent = RandomAgent::<BitState>::new(1);
+        let mut states = Vec::new();
+        let mut evals = Vec::new();
+        let noise = RootNoise {
+            alpha: 0.3,
+            fraction: 0.25,
+            seed: 9,
+        };
+        let mut tree = SearchTree::new(BitState::initial(), 1, 1.4, 1.0).with_root_noise(noise);
+        tree.claim(1, &mut states);
+        agent.evaluate_batch(&states, &mut evals);
+        tree.resolve(&evals);
+        let priors: Vec<f32> = tree.root_children().iter().map(|c| c.1).collect();
+        assert_eq!(priors.len(), 81);
+        assert!((priors.iter().sum::<f32>() - 1.0).abs() < 1e-4);
+        assert!(
+            priors.iter().any(|p| (p - 1.0 / 81.0).abs() > 1e-3),
+            "noise applied"
+        );
+        assert!(
+            priors.iter().all(|p| *p >= 0.75 / 81.0 - 1e-6),
+            "uniform part kept"
+        );
+    }
+
+    #[test]
+    fn dirichlet_samples_are_distributions() {
+        let mut rng = SmallRng::seed_from_u64(3);
+        for alpha in [0.1, 0.3, 1.0, 5.0] {
+            for n in [1, 2, 9, 81] {
+                let d = dirichlet(&mut rng, alpha, n);
+                assert_eq!(d.len(), n);
+                assert!(
+                    (d.iter().sum::<f32>() - 1.0).abs() < 1e-4,
+                    "alpha {alpha} n {n}"
+                );
+                assert!(d.iter().all(|x| *x >= 0.0 && x.is_finite()));
+            }
+        }
+        // Small alpha concentrates mass, large alpha spreads it.
+        let peaky = dirichlet(&mut rng, 0.05, 81);
+        let flat = dirichlet(&mut rng, 50.0, 81);
+        let max = |v: &Vec<f32>| v.iter().cloned().fold(0.0, f32::max);
+        assert!(max(&peaky) > max(&flat));
     }
 
     #[test]
