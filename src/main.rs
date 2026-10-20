@@ -63,6 +63,9 @@ struct TrainArgs {
     /// Learning rate.
     #[arg(long, default_value_t = 1e-3)]
     lr: f64,
+    /// AdamW weight decay; raise it (e.g. 1e-2) when a large model overfits a small dataset.
+    #[arg(long, default_value_t = 1e-4)]
+    weight_decay: f32,
     #[arg(long, default_value_t = 0)]
     seed: u64,
     /// Where to save the weights (the `.mpk` extension is added).
@@ -177,6 +180,7 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         epochs: args.epochs,
         batch_size: args.batch_size,
         learning_rate: args.lr,
+        weight_decay: args.weight_decay,
         seed: args.seed,
         artifact_dir: args.artifact_dir.clone(),
         tui: !args.no_tui,
@@ -202,8 +206,8 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         }
     };
     println!(
-        "  {} train / {} validation positions",
-        report.train_positions, report.validation_positions
+        "  {} train / {} validation positions; kept epoch {} of {} (lowest validation loss)",
+        report.train_positions, report.validation_positions, report.best_epoch, report.epochs
     );
     println!(
         "  validation: verdict accuracy {:.3} (baseline {:.3}), value mse {:.4} (baseline {:.4}), policy accuracy {:.3} (baseline {:.3})",
