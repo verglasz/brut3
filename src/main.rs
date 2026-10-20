@@ -40,7 +40,8 @@ struct TrainArgs {
     /// Agent that plays the self-play games, as a spec like `mcts 50` or `greedy`.
     #[arg(long, default_value = "mcts 50")]
     data_agent: String,
-    /// Model to train, as a spec like `linear`.
+    /// Model to train: `linear`, `board-transformer [d_model] [layers] [heads]` or
+    /// `cell-transformer [d_model] [layers] [heads]`.
     #[arg(long, default_value = "linear")]
     model: String,
     /// Number of self-play games to generate.
@@ -156,7 +157,7 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         tui: !args.no_tui,
         ..Default::default()
     };
-    let (model, report) = match model_spec {
+    let (model, report) = match &model_spec {
         ModelSpec::Linear => {
             let (m, report) = train(
                 |d| ultimate_ttt_burn::nn::LinearNetConfig::default().init(d),
@@ -165,6 +166,14 @@ fn train(args: &TrainArgs) -> Result<(), String> {
                 &opts,
             );
             (AnyModel::Linear(m), report)
+        }
+        ModelSpec::BoardTransformer(cfg) => {
+            let (m, report) = train(|d| cfg.init(d), &device, data, &opts);
+            (AnyModel::BoardTransformer(m), report)
+        }
+        ModelSpec::CellTransformer(cfg) => {
+            let (m, report) = train(|d| cfg.init(d), &device, data, &opts);
+            (AnyModel::CellTransformer(m), report)
         }
     };
     println!(
