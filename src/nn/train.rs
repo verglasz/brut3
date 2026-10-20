@@ -13,7 +13,7 @@ use burn::tensor::activation::log_softmax;
 use burn::train::metric::{AccuracyInput, AccuracyMetric, Adaptor, LossInput, LossMetric};
 use burn::train::renderer::CliMetricsRenderer;
 use burn::train::{
-    ExecutionStrategy, InferenceStep, ItemLazy, Learner, SupervisedTraining, TrainOutput, TrainStep,
+    ExecutionStrategy, InferenceStep, ItemLazy, Learner, SupervisedTraining, TrainStep,
 };
 use burn::{Dispatch, DispatchDevice};
 use rand::seq::SliceRandom;
@@ -331,27 +331,29 @@ pub fn forward_step<M: Model<Dispatch>>(
 /// Implements burn's step traits for a model type on the [`Dispatch`] backend.
 macro_rules! impl_train_steps {
     ($model:ident) => {
-        impl TrainStep for $model<Dispatch> {
-            type Input = Batch<Dispatch, $model<Dispatch>>;
-            type Output = StepOutput<Dispatch>;
+        impl ::burn::train::TrainStep for $model<::burn::Dispatch> {
+            type Input = $crate::nn::train::Batch<::burn::Dispatch, $model<::burn::Dispatch>>;
+            type Output = $crate::nn::train::StepOutput<::burn::Dispatch>;
 
-            fn step(&self, batch: Self::Input) -> TrainOutput<StepOutput<Dispatch>> {
-                let item = forward_step(self, batch);
-                TrainOutput::new(self, item.loss.backward(), item)
+            fn step(
+                &self,
+                batch: Self::Input,
+            ) -> ::burn::train::TrainOutput<$crate::nn::train::StepOutput<::burn::Dispatch>> {
+                let item = $crate::nn::train::forward_step(self, batch);
+                ::burn::train::TrainOutput::new(self, item.loss.backward(), item)
             }
         }
 
-        impl InferenceStep for $model<Dispatch> {
-            type Input = Batch<Dispatch, $model<Dispatch>>;
-            type Output = StepOutput<Dispatch>;
+        impl ::burn::train::InferenceStep for $model<::burn::Dispatch> {
+            type Input = $crate::nn::train::Batch<::burn::Dispatch, $model<::burn::Dispatch>>;
+            type Output = $crate::nn::train::StepOutput<::burn::Dispatch>;
 
-            fn step(&self, batch: Self::Input) -> StepOutput<Dispatch> {
-                forward_step(self, batch)
+            fn step(&self, batch: Self::Input) -> $crate::nn::train::StepOutput<::burn::Dispatch> {
+                $crate::nn::train::forward_step(self, batch)
             }
         }
     };
 }
-#[allow(unused_imports)]
 pub(crate) use impl_train_steps;
 
 impl_train_steps!(LinearNet);

@@ -13,7 +13,9 @@
 pub mod agent;
 pub mod any_model;
 pub mod backend;
+pub mod board_transformer;
 pub mod encode;
+pub mod heads;
 pub mod linear;
 pub mod model;
 pub mod train;
@@ -21,6 +23,7 @@ pub mod train;
 pub use agent::NetAgent;
 pub use any_model::{AnyModel, ModelSpec};
 pub use backend::BackendKind;
+pub use board_transformer::{BoardTransformer, BoardTransformerConfig};
 pub use encode::{FEATURES, encode_batch, encode_into};
 pub use linear::{LinearNet, LinearNetConfig};
 pub use model::{HostPrediction, MOVES, Model, Prediction, Verdict, expected_value};
