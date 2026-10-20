@@ -301,18 +301,18 @@ mod tests {
         let _device = crate::nn::device_lock();
         let kind = BackendKind::preferred();
         let device = kind.device();
-        let data = synthetic_dataset(1500, 4);
+        let data = synthetic_dataset(8000, 4);
         let untrained = small().init::<Dispatch>(&device);
         let (valid, _) = data.clone().split(0.9, 0);
         let before = evaluate(&untrained, &device, &valid.samples);
         let options = crate::nn::train::TrainOptions {
             batch_size: 64,
             learning_rate: 1e-3,
-            ..opts(kind, "cell-tf", 6)
+            ..opts(kind, "cell-tf", 10)
         };
         let (_, report) = train(|d| small().init::<Dispatch>(d), &device, data, &options);
         assert!(
-            report.validation.verdict_accuracy > report.baseline.verdict_accuracy
+            report.validation.verdict_accuracy > report.baseline.verdict_accuracy + 0.05
                 && report.validation.verdict_accuracy > before.verdict_accuracy,
             "{report:?} (untrained {before:?})"
         );

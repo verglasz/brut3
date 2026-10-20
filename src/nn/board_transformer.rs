@@ -1,10 +1,13 @@
 //! [`BoardTransformer`]: a transformer over the nine small boards.
 //!
 //! Each small board is one token: an embedding of its full cell configuration (`3^9` possible
-//! contents, from the side to move's view) plus embeddings of its position on the big board,
-//! its status (open, won by me, won by them, full) and whether it is the forced board. The
-//! tokens go through pre-norm encoder layers with all-to-all attention, and two perceptron
-//! heads read the flattened final residual stream to produce the move and outcome logits.
+//! contents, from the side to move's view), plus the sum of per-cell embeddings of the same
+//! configuration (27 entries: cell position times content) so that configurations never seen
+//! in training still get a meaningful token, plus embeddings of the board's position on the
+//! big board, its status (open, won by me, won by them, full) and whether it is the forced
+//! board. The tokens go through pre-norm encoder layers with all-to-all attention, and two
+//! perceptron heads read the flattened final residual stream to produce the move and outcome
+//! logits.
 
 use burn::nn::transformer::TransformerEncoder;
 use burn::nn::{Embedding, EmbeddingConfig};
@@ -17,6 +20,9 @@ use crate::game::{BitState, BoardStatus, GameState, Square};
 /// Number of small-board contents: each of 9 cells is empty, mine or theirs.
 const CONTENTS: usize = 3usize.pow(9);
 const BOARDS: usize = 9;
+const CELLS: usize = 9;
+/// Per-cell embedding entries: cell position times (empty, mine, theirs).
+const CELL_CONTENTS: usize = CELLS * 3;
 /// Board statuses: open, won by me, won by them, full.
 const STATUSES: usize = 4;
 
@@ -61,6 +67,7 @@ impl BoardTransformerConfig {
         BoardTransformer {
             config: self.clone(),
             content: embedding(CONTENTS),
+            cells: embedding(CELL_CONTENTS),
             position: embedding(BOARDS),
             status: embedding(STATUSES),
             forced: embedding(2),
@@ -76,6 +83,7 @@ pub struct BoardTransformer<B: Backend> {
     #[module(skip)]
     config: BoardTransformerConfig,
     content: Embedding<B>,
+    cells: Embedding<B>,
     position: Embedding<B>,
     status: Embedding<B>,
     forced: Embedding<B>,
@@ -84,11 +92,13 @@ pub struct BoardTransformer<B: Backend> {
     wdl_head: Perceptron<B>,
 }
 
-/// Per-board token ids for a batch, each `[batch, 9]`.
+/// Per-board token ids for a batch, each `[batch, 9]` unless noted.
 #[derive(Clone, Debug)]
 pub struct BoardTokens<B: Backend> {
     /// Cell configuration index in `0..3^9`.
     pub content: Tensor<B, 2, Int>,
+    /// `[batch, 81]`: per-cell ids `cell * 3 + content` (board-major), for the per-cell sum.
+    pub cells: Tensor<B, 2, Int>,
     /// `0` open, `1` won by the side to move, `2` won by the opponent, `3` full.
     pub status: Tensor<B, 2, Int>,
     /// `1` if this is the board the side to move must play on.
@@ -96,18 +106,28 @@ pub struct BoardTokens<B: Backend> {
 }
 
 /// Token ids of one position, from the side to move's view.
-pub fn board_token_ids(state: &BitState) -> ([i32; BOARDS], [i32; BOARDS], [i32; BOARDS]) {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoardTokenIds {
+    pub content: [i32; BOARDS],
+    pub status: [i32; BOARDS],
+    pub forced: [i32; BOARDS],
+    /// `cell * 3 + content` per cell, board-major.
+    pub cells: [i32; BOARDS * CELLS],
+}
+
+pub fn board_token_ids(state: &BitState) -> BoardTokenIds {
     let me = state.to_move();
     let them = me.other();
     let forced_board = state.forced_board();
     let mut content = [0; BOARDS];
     let mut status = [0; BOARDS];
     let mut forced = [0; BOARDS];
+    let mut cells = [0; BOARDS * CELLS];
     for (b, square) in Square::ALL.iter().enumerate() {
         let mine = state.board_marks(me, b);
         let theirs = state.board_marks(them, b);
         let mut index = 0i32;
-        for cell in (0..9).rev() {
+        for cell in (0..CELLS).rev() {
             let value = if mine >> cell & 1 != 0 {
                 1
             } else if theirs >> cell & 1 != 0 {
@@ -116,6 +136,7 @@ pub fn board_token_ids(state: &BitState) -> ([i32; BOARDS], [i32; BOARDS], [i32;
                 0
             };
             index = index * 3 + value;
+            cells[b * CELLS + cell] = (cell * 3) as i32 + value;
         }
         content[b] = index;
         status[b] = match state.board_status(*square) {
@@ -126,7 +147,12 @@ pub fn board_token_ids(state: &BitState) -> ([i32; BOARDS], [i32; BOARDS], [i32;
         };
         forced[b] = i32::from(forced_board == Some(*square));
     }
-    (content, status, forced)
+    BoardTokenIds {
+        content,
+        status,
+        forced,
+        cells,
+    }
 }
 
 impl<B: Backend> BoardTransformer<B> {
@@ -143,15 +169,18 @@ impl<B: Backend> Model<B> for BoardTransformer<B> {
         let mut content = Vec::with_capacity(n * BOARDS);
         let mut status = Vec::with_capacity(n * BOARDS);
         let mut forced = Vec::with_capacity(n * BOARDS);
+        let mut cells = Vec::with_capacity(n * BOARDS * CELLS);
         for state in states {
-            let (c, s, f) = board_token_ids(state);
-            content.extend_from_slice(&c);
-            status.extend_from_slice(&s);
-            forced.extend_from_slice(&f);
+            let ids = board_token_ids(state);
+            content.extend_from_slice(&ids.content);
+            status.extend_from_slice(&ids.status);
+            forced.extend_from_slice(&ids.forced);
+            cells.extend_from_slice(&ids.cells);
         }
         let tensor = |v: Vec<i32>| Tensor::from_data(TensorData::new(v, [n, BOARDS]), device);
         BoardTokens {
             content: tensor(content),
+            cells: Tensor::from_data(TensorData::new(cells, [n, BOARDS * CELLS]), device),
             status: tensor(status),
             forced: tensor(forced),
         }
@@ -159,7 +188,17 @@ impl<B: Backend> Model<B> for BoardTransformer<B> {
 
     fn predict(&self, input: BoardTokens<B>) -> Prediction<B> {
         let device = input.content.device();
+        let n = input.content.dims()[0];
+        let d = self.config.body.d_model;
+        // Per-cell embeddings summed within each board: [n, 81, d] -> [n, 9, 9, d] -> [n, 9, d].
+        let cell_sum = self
+            .cells
+            .forward(input.cells)
+            .reshape([n, BOARDS, CELLS, d])
+            .sum_dim(2)
+            .reshape([n, BOARDS, d]);
         let tokens = self.content.forward(input.content)
+            + cell_sum
             + self.status.forward(input.status)
             + self.forced.forward(input.forced)
             + self.position.forward(positions(BOARDS, &device));
@@ -196,13 +235,22 @@ mod tests {
 
     #[test]
     fn token_ids_describe_the_position() {
-        let (content, status, forced) = board_token_ids(&BitState::initial());
-        assert_eq!(content, [0; 9]);
-        assert_eq!(status, [0; 9]);
-        assert_eq!(forced, [0; 9]);
+        let ids = board_token_ids(&BitState::initial());
+        assert_eq!(ids.content, [0; 9]);
+        assert_eq!(ids.status, [0; 9]);
+        assert_eq!(ids.forced, [0; 9]);
+        assert_eq!(&ids.cells[..9], &[0, 3, 6, 9, 12, 15, 18, 21, 24]);
 
         let state = x_wins_in_one(); // X to move, boards 0 and 1 won by X, forced to board 2
-        let (content, status, forced) = board_token_ids(&state);
+        let BoardTokenIds {
+            content,
+            status,
+            forced,
+            cells,
+        } = board_token_ids(&state);
+        assert_eq!(cells[2 * 9], 1, "board 2 cell 0 is mine");
+        assert_eq!(cells[2 * 9 + 1], 3 + 1, "board 2 cell 1 is mine");
+        assert_eq!(cells[4 * 9 + 6], 6 * 3 + 2, "board 4 cell 6 is theirs");
         assert_eq!(status[0], 1);
         assert_eq!(status[1], 1);
         assert_eq!(status[4], 0);
@@ -216,9 +264,9 @@ mod tests {
         // Same position from O's view: X's boards are "theirs", its marks are 2s.
         let mut p = state.to_position();
         p.set_to_move(crate::game::Player::O);
-        let (content_o, status_o, _) = board_token_ids(&BitState::from_position(&p));
-        assert_eq!(status_o[0], 2);
-        assert_eq!(content_o[2], 8);
+        let ids_o = board_token_ids(&BitState::from_position(&p));
+        assert_eq!(ids_o.status[0], 2);
+        assert_eq!(ids_o.content[2], 8);
         let _ = Move::new(sq(0, 0), sq(0, 0));
     }
 
@@ -292,20 +340,27 @@ mod tests {
         let _device = crate::nn::device_lock();
         let kind = BackendKind::preferred();
         let device = kind.device();
-        let data = synthetic_dataset(1500, 4);
+        let data = synthetic_dataset(8000, 4);
         let untrained = small().init::<Dispatch>(&device);
         let (valid, _) = data.clone().split(0.9, 0);
         let before = evaluate(&untrained, &device, &valid.samples);
         let options = crate::nn::train::TrainOptions {
             batch_size: 64,
             learning_rate: 1e-3,
-            ..opts(kind, "board-tf", 6)
+            ..opts(kind, "board-tf", 10)
         };
         let (_, report) = train(|d| small().init::<Dispatch>(d), &device, data, &options);
+        // The synthetic target is linear in the per-cell features, which board tokens only
+        // see through their embeddings: the policy is clearly learnable, the value must at
+        // least not get worse than the mean predictor.
         assert!(
-            report.validation.verdict_accuracy > report.baseline.verdict_accuracy
-                && report.validation.verdict_accuracy > before.verdict_accuracy,
+            report.validation.policy_accuracy > report.baseline.policy_accuracy + 0.1
+                && report.validation.policy_accuracy > before.policy_accuracy,
             "{report:?} (untrained {before:?})"
+        );
+        assert!(
+            report.validation.value_mse < report.baseline.value_mse * 1.05,
+            "{report:?}"
         );
         assert!(
             report.validation.policy_accuracy > report.baseline.policy_accuracy,

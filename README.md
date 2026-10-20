@@ -149,7 +149,8 @@ The search is generic over the agent that evaluates leaves:
 - Two transformer models share `heads` (pre-norm encoder body with all-to-all attention, and
   two-layer perceptron heads reading the flattened final residual stream). `BoardTransformer`
   uses nine tokens, one per small board: an embedding of the board's full cell configuration
-  (3^9 entries) plus position, status and forced-board embeddings. `CellTransformer` uses 81
+  (3^9 entries) plus a sum of per-cell embeddings (so unseen configurations still get a
+  meaningful token), plus position, status and forced-board embeddings. `CellTransformer` uses 81
   cell tokens: content, position, the cell's board status, forced flag and legality
   embeddings. Both are selected with `--model board-transformer [d_model] [layers] [heads]` or
   `--model cell-transformer ...`.
