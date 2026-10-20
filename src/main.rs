@@ -40,6 +40,9 @@ struct TrainArgs {
     /// Agent that plays the self-play games, as a spec like `mcts 50` or `greedy`.
     #[arg(long, default_value = "mcts 50")]
     data_agent: String,
+    /// Model to train, as a spec like `linear`.
+    #[arg(long, default_value = "linear")]
+    model: String,
     /// Number of self-play games to generate.
     #[arg(long, default_value_t = 1000)]
     games: usize,
@@ -47,7 +50,7 @@ struct TrainArgs {
     epochs: usize,
     #[arg(long, default_value_t = 256)]
     batch_size: usize,
-    /// Learning rate. Much above 1e-3 saturates the tanh output and training stalls.
+    /// Learning rate.
     #[arg(long, default_value_t = 1e-3)]
     lr: f64,
     #[arg(long, default_value_t = 0)]
@@ -112,7 +115,7 @@ fn play(spec: &[String]) -> Result<(), String> {
 fn train(args: &TrainArgs) -> Result<(), String> {
     use std::io::Write;
     use std::time::Instant;
-    use ultimate_ttt_burn::nn::{BackendKind, TrainOptions, generate, train};
+    use ultimate_ttt_burn::nn::{AnyModel, BackendKind, ModelSpec, TrainOptions, generate, train};
 
     let backend = match &args.backend {
         Some(name) => name.parse::<BackendKind>()?,
@@ -120,6 +123,8 @@ fn train(args: &TrainArgs) -> Result<(), String> {
     };
     let data_words: Vec<&str> = args.data_agent.split_whitespace().collect();
     let data_spec = AgentSpec::parse(&data_words)?;
+    let model_words: Vec<&str> = args.model.split_whitespace().collect();
+    let model_spec = ModelSpec::parse(&model_words)?;
 
     println!("generating {} self-play games with {data_spec}", args.games);
     let start = Instant::now();
@@ -129,15 +134,19 @@ fn train(args: &TrainArgs) -> Result<(), String> {
             let _ = io::stdout().flush();
         }
     })?;
+    let [wins, draws, losses] = data.verdict_counts();
     println!(
-        "\n  {} positions in {:.1}s; baseline mse (predict mean) {:.4}",
+        "\n  {} positions ({wins} win / {draws} draw / {losses} loss) in {:.1}s",
         data.len(),
         start.elapsed().as_secs_f32(),
-        data.baseline_mse()
     );
 
-    println!("training on {backend} for {} epochs", args.epochs);
     let device = backend.device();
+    println!(
+        "training {model_spec} ({} parameters) on {backend} for {} epochs",
+        model_spec.init(&device).num_params(),
+        args.epochs
+    );
     let opts = TrainOptions {
         epochs: args.epochs,
         batch_size: args.batch_size,
@@ -147,22 +156,39 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         tui: !args.no_tui,
         ..Default::default()
     };
-    let (model, report) = train(&device, data, &opts);
+    let (model, report) = match model_spec {
+        ModelSpec::Linear => {
+            let (m, report) = train(
+                |d| ultimate_ttt_burn::nn::LinearNetConfig::default().init(d),
+                &device,
+                data,
+                &opts,
+            );
+            (AnyModel::Linear(m), report)
+        }
+    };
     println!(
-        "  {} train / {} validation positions; validation mse {:.4} (baseline {:.4})",
-        report.train_positions,
-        report.validation_positions,
-        report.validation_mse,
-        report.baseline_mse
+        "  {} train / {} validation positions",
+        report.train_positions, report.validation_positions
+    );
+    println!(
+        "  validation: verdict accuracy {:.3} (baseline {:.3}), value mse {:.4} (baseline {:.4}), policy accuracy {:.3} (baseline {:.3})",
+        report.validation.verdict_accuracy,
+        report.baseline.verdict_accuracy,
+        report.validation.value_mse,
+        report.baseline.value_mse,
+        report.validation.policy_accuracy,
+        report.baseline.policy_accuracy
     );
 
     if let Some(dir) = args.out.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
-    model
-        .save(&args.out)
-        .map_err(|e| format!("cannot save weights to {}: {e}", args.out.display()))?;
-    println!("saved weights to {}.mpk", args.out.display());
+    model.save(&args.out)?;
+    println!(
+        "saved weights to {}.mpk (spec in .json)",
+        args.out.display()
+    );
     Ok(())
 }

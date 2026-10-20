@@ -1,20 +1,29 @@
-//! The value network and everything around it: feature encoding, the model, training on
-//! self-play data, an agent that plays with it, and runtime backend selection.
+//! Policy/value networks and everything around them: position encoding, the models, training
+//! on self-play data, an agent that plays with them, and runtime backend selection.
 //!
 //! All tensors use burn's [`Dispatch`](burn::Dispatch) backend, whose device enum picks the
 //! concrete backend (ndarray, wgpu, CUDA, MLIR CPU) at runtime among those compiled in, and
 //! which doubles as its own autodiff backend for training. One model type serves everywhere.
+//!
+//! Every model implements [`Model`]: it encodes raw [`BitState`](crate::game::BitState)s into
+//! its own input tensors and predicts win/draw/loss logits plus move logits ([`Prediction`]).
+//! [`AnyModel`] is the concrete enum over the model kinds, described by a [`ModelSpec`] that
+//! is saved next to the weights.
 
 pub mod agent;
+pub mod any_model;
 pub mod backend;
 pub mod encode;
+pub mod linear;
 pub mod model;
 pub mod train;
 
-pub use agent::ValueNetAgent;
+pub use agent::NetAgent;
+pub use any_model::{AnyModel, ModelSpec};
 pub use backend::BackendKind;
 pub use encode::{FEATURES, encode_batch, encode_into};
-pub use model::{ValueNet, ValueNetConfig};
+pub use linear::{LinearNet, LinearNetConfig};
+pub use model::{HostPrediction, MOVES, Model, Prediction, Verdict, expected_value};
 pub use train::{Dataset, Sample, TrainOptions, TrainReport, generate, train};
 
 /// Tests that touch a device take this lock: initialising or driving several CubeCL backends

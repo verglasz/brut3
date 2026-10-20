@@ -71,6 +71,20 @@ impl BackendKind {
     }
 }
 
+impl BackendKind {
+    /// The compiled-in kinds minus those named (comma-separated) in `UTTT_SKIP_BACKENDS`,
+    /// for running the per-backend tests on a machine where one backend is unavailable.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Vec<BackendKind> {
+        let skip = std::env::var("UTTT_SKIP_BACKENDS").unwrap_or_default();
+        let skipped: Vec<&str> = skip.split(',').map(str::trim).collect();
+        Self::compiled()
+            .into_iter()
+            .filter(|k| !skipped.contains(&k.name()))
+            .collect()
+    }
+}
+
 impl fmt::Display for BackendKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
@@ -124,7 +138,7 @@ mod tests {
     #[test]
     fn parse_compiled_kinds() {
         let _device = crate::nn::device_lock();
-        for k in BackendKind::compiled() {
+        for k in BackendKind::for_tests() {
             assert_eq!(k.name().parse::<BackendKind>(), Ok(k));
             let _ = k.device();
         }

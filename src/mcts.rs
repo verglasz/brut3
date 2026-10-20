@@ -422,6 +422,13 @@ impl<A: UtttAgent> UtttAgent for Mcts<A> {
         self.pick_move(&result)
     }
 
+    /// One search: the picked move plus the visit distribution.
+    fn choose_move_with_policy(&mut self, state: &Self::State) -> (Move, Vec<(Move, f32)>) {
+        let result = self.search(state);
+        let mv = self.pick_move(&result);
+        (mv, result.policy())
+    }
+
     /// Root value plus the visit distribution as priors: a search-improved evaluation.
     fn evaluate(&mut self, state: &Self::State) -> Evaluation {
         let result = self.search(state);

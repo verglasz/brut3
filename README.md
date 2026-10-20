@@ -71,8 +71,11 @@ Known upstream issues worked around:
   compiled backend.
 - `nn/train.rs`: on the MLIR CPU backend (cubecl-cpu 0.10), reading a still-lazy tensor from a
   thread other than the one that produced it panics in the memory pool. The Learner's metric
-  and checkpoint threads do exactly that, so on that backend the loss is read back on the
-  training thread before it is handed over, and file checkpointing is skipped.
+  and checkpoint threads do exactly that, so on that backend the step outputs are read back on
+  the training thread before they are handed over, and file checkpointing is skipped. Treat
+  cpu-mlir as experimental; `ndarray` is the dependable CPU backend.
+- The per-backend tests honour `UTTT_SKIP_BACKENDS=wgpu,...` for machines where a compiled
+  backend cannot initialise (for example an NVIDIA driver update pending a reboot).
 
 ## Building and running
 
@@ -92,7 +95,7 @@ cargo test --all-features
 cargo run --release --all-features -- backends
 
 # Train the value network on self-play data (live metrics dashboard), then play against it
-cargo run --release --all-features -- train --backend cuda --data-agent "mcts 50" --games 2000 --epochs 15
+cargo run --release --all-features -- train --backend cuda --model linear --data-agent "mcts 50" --games 2000 --epochs 15
 cargo run --release --all-features -- play mcts-nn models/value cuda 400 16
 
 # For scripts and CI: plain log lines instead of the dashboard
@@ -126,13 +129,19 @@ The search is generic over the agent that evaluates leaves:
 - `mcts::Mcts<A: UtttAgent>` is a PUCT search over an arena tree. With no priors it behaves as
   plain UCT with rollouts; with network priors it is the AlphaZero search. `Mcts<A>` itself
   implements `UtttAgent`, so searches compose and its visit distribution can feed training.
-- `nn` holds the network side: `encode` turns a `BitState` into 199 binary features from the
-  side to move's view; `ValueNet` is a single-layer perceptron (`tanh(x . w + b)`) over them;
-  `train` generates self-play positions labelled with the game result and fits the net with
-  burn's `Learner` (AdamW, loss metrics for both splits, checkpoints, a TUI dashboard or plain
-  logs, an `experiment.log` and metric files under `--artifact-dir`); `ValueNetAgent` plays
-  one-ply lookahead with it and serves as a batched leaf evaluator for `Mcts`; `BackendKind`
-  names the compiled backends and gives their `Dispatch` device.
+- `nn` holds the network side. Every model implements `Model`: it encodes raw `BitState`s into
+  its own input tensors and predicts a `Prediction` with two heads, three win/draw/loss logits
+  from the side to move's view (search uses `p_win - p_loss` as the value) and 81 move logits
+  (masked to legal moves). `LinearNet` is the baseline: one linear layer per head over 199
+  binary features from `encode`. `ModelSpec` names a model kind and is saved as JSON next to
+  the weights, so `AnyModel::load` rebuilds the right model from a path. `train` generates
+  self-play positions labelled with the game result and the generating agent's move
+  distribution (a search's visit counts), then fits the model with burn's `Learner`: AdamW,
+  the summed cross-entropies as the loss, loss and verdict-accuracy metrics for both splits,
+  checkpoints, a TUI dashboard or plain logs, and an `experiment.log` under `--artifact-dir`.
+  `NetAgent` plays the policy head's best move and serves `Mcts` as a batched leaf evaluator
+  with priors, which makes `mcts-nn` the AlphaZero-style search. `BackendKind` names the
+  compiled backends and gives their `Dispatch` device.
 
 ## Status
 
@@ -144,14 +153,15 @@ Present:
 - `Mcts` search with batched leaf evaluation and virtual loss (`batch_size` in `MctsConfig`),
   tested against the random agent.
 - `AnyAgent`, one concrete enum over the built agents, and a REPL for interactive play.
-- A single-layer value network trained from self-play results on any compiled backend (ndarray,
-  wgpu, cuda, cpu-mlir), with `nn` and `mcts-nn` agents using it. Being linear over raw
-  features it only shaves a little off the baseline error; it is the plumbing for what follows.
+- A policy/value model interface with a linear baseline, trained from self-play on any compiled
+  backend (ndarray, wgpu, cuda, cpu-mlir) with burn's `Learner`, and `nn` / `mcts-nn` agents
+  using it. The linear model only shaves a little off the baselines; it is the plumbing for
+  the real networks.
 
 Planned next, roughly in order:
 
 - [ ] Tree reuse between moves
-- [ ] A real network: hidden layers / residual conv blocks, a policy head, priors into MCTS
+- [ ] Real networks: a transformer over small-board tokens and one over cell tokens
 - [ ] Iterated self-play with the current network, replay buffer, evaluation against the
       previous generation before promotion
 - [ ] Shared batching inference service so many searches feed one GPU batch

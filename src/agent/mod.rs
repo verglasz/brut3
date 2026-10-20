@@ -44,6 +44,14 @@ pub trait UtttAgent {
     /// Picks a move. `state` is never terminal, so at least one legal move exists.
     fn choose_move(&mut self, state: &Self::State) -> Move;
 
+    /// Picks a move and also reports the move distribution the agent considered, as a
+    /// training target. The default is the chosen move with probability 1; search agents
+    /// return their visit distribution.
+    fn choose_move_with_policy(&mut self, state: &Self::State) -> (Move, Vec<(Move, f32)>) {
+        let mv = self.choose_move(state);
+        (mv, vec![(mv, 1.0)])
+    }
+
     /// Evaluates a position for tree search.
     ///
     /// The default plays the game out with [`UtttAgent::choose_move`] and reports the result

@@ -11,7 +11,7 @@ use super::{Evaluation, GreedyAgent, MinimaxAgent, RandomAgent, UtttAgent};
 use crate::game::{BitState, Move};
 use crate::mcts::{Mcts, MctsConfig};
 #[cfg(feature = "nn")]
-use crate::nn::{BackendKind, ValueNetAgent};
+use crate::nn::{BackendKind, NetAgent};
 
 /// How to build an agent. Parsed from words like `random`, `greedy 7`, `minimax 4`, `mcts 800 3`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,7 +133,7 @@ impl AgentSpec {
                 },
             )),
             #[cfg(feature = "nn")]
-            AgentSpec::Nn { path, backend } => AnyAgent::Nn(ValueNetAgent::load(path, *backend)?),
+            AgentSpec::Nn { path, backend } => AnyAgent::Nn(NetAgent::load(path, *backend)?),
             #[cfg(feature = "nn")]
             AgentSpec::MctsNn {
                 path,
@@ -142,7 +142,7 @@ impl AgentSpec {
                 batch_size,
                 seed,
             } => AnyAgent::MctsNn(Mcts::new(
-                ValueNetAgent::load(path, *backend)?,
+                NetAgent::load(path, *backend)?,
                 MctsConfig {
                     simulations: *simulations,
                     batch_size: *batch_size,
@@ -219,9 +219,9 @@ pub enum AnyAgent {
     Minimax(MinimaxAgent),
     Mcts(Mcts<RandomAgent<BitState>>),
     #[cfg(feature = "nn")]
-    Nn(ValueNetAgent),
+    Nn(NetAgent),
     #[cfg(feature = "nn")]
-    MctsNn(Mcts<ValueNetAgent>),
+    MctsNn(Mcts<NetAgent>),
 }
 
 impl UtttAgent for AnyAgent {
@@ -237,6 +237,19 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Nn(a) => a.choose_move(state),
             #[cfg(feature = "nn")]
             AnyAgent::MctsNn(a) => a.choose_move(state),
+        }
+    }
+
+    fn choose_move_with_policy(&mut self, state: &BitState) -> (Move, Vec<(Move, f32)>) {
+        match self {
+            AnyAgent::Random(a) => a.choose_move_with_policy(state),
+            AnyAgent::Greedy(a) => a.choose_move_with_policy(state),
+            AnyAgent::Minimax(a) => a.choose_move_with_policy(state),
+            AnyAgent::Mcts(a) => a.choose_move_with_policy(state),
+            #[cfg(feature = "nn")]
+            AnyAgent::Nn(a) => a.choose_move_with_policy(state),
+            #[cfg(feature = "nn")]
+            AnyAgent::MctsNn(a) => a.choose_move_with_policy(state),
         }
     }
 

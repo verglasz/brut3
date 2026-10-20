@@ -1,23 +1,23 @@
-//! [`ValueNetAgent`]: plays and evaluates with a trained [`ValueNet`].
+//! [`NetAgent`]: plays and evaluates with a trained policy/value network.
 
 use std::path::Path;
 
-use burn::{Dispatch, DispatchDevice};
+use burn::DispatchDevice;
 
+use super::any_model::AnyModel;
 use super::backend::BackendKind;
-use super::encode::encode_batch;
-use super::model::ValueNet;
+use super::model::{HostPrediction, expected_value};
 use crate::agent::{Evaluation, UtttAgent};
-use crate::game::{BitState, GameState, Move, MoveSet};
+use crate::game::{BitState, GameState, Move};
 
-pub struct ValueNetAgent {
-    model: ValueNet<Dispatch>,
+pub struct NetAgent {
+    model: AnyModel,
     device: DispatchDevice,
     backend: BackendKind,
 }
 
-impl ValueNetAgent {
-    pub fn new(model: ValueNet<Dispatch>, backend: BackendKind) -> Self {
+impl NetAgent {
+    pub fn new(model: AnyModel, backend: BackendKind) -> Self {
         Self {
             model,
             device: backend.device(),
@@ -25,11 +25,10 @@ impl ValueNetAgent {
         }
     }
 
-    /// Loads weights saved by [`ValueNet::save`] onto `backend`'s default device.
+    /// Loads a model saved by [`AnyModel::save`] onto `backend`'s default device.
     pub fn load(path: &Path, backend: BackendKind) -> Result<Self, String> {
         let device = backend.device();
-        let model = ValueNet::<Dispatch>::load(path, &device)
-            .map_err(|e| format!("cannot load value net from {}: {e}", path.display()))?;
+        let model = AnyModel::load(path, &device)?;
         Ok(Self {
             model,
             device,
@@ -41,63 +40,61 @@ impl ValueNetAgent {
         self.backend
     }
 
-    /// Network values for `states` (side-to-move perspective), one forward pass.
-    pub fn values(&self, states: &[BitState]) -> Vec<f32> {
-        self.model.values(&encode_batch(states), &self.device)
+    pub fn model(&self) -> &AnyModel {
+        &self.model
     }
 
-    /// Exact value for terminal states, network value otherwise.
-    fn value_or_exact(state: &BitState, net: f32) -> f32 {
+    /// Network outputs for `states`, one forward pass.
+    pub fn predict(&self, states: &[BitState]) -> HostPrediction {
+        self.model.predict_host(states, &self.device)
+    }
+
+    /// Exact value for terminal states, the network's otherwise.
+    fn evaluation(state: &BitState, wdl: &[f32; 3], policy: Vec<(Move, f32)>) -> Evaluation {
         match state.outcome() {
-            Some(outcome) => outcome.value_for(state.to_move()),
-            None => net,
+            Some(outcome) => Evaluation::value_only(outcome.value_for(state.to_move())),
+            None => Evaluation {
+                value: expected_value(wdl),
+                priors: policy,
+            },
         }
     }
 }
 
-impl UtttAgent for ValueNetAgent {
+impl UtttAgent for NetAgent {
     type State = BitState;
 
-    /// One-ply lookahead: evaluates every child in a single batch and plays the move whose
-    /// resulting position is worst for the opponent.
+    /// The most likely move under the policy head. No search, no lookahead.
     fn choose_move(&mut self, state: &BitState) -> Move {
-        let legal = state.legal_moves();
-        assert!(!legal.is_empty(), "choose_move called on a terminal state");
-        let moves: Vec<Move> = legal.iter().collect();
-        let children: Vec<BitState> = moves
-            .iter()
-            .map(|&mv| {
-                let mut child = *state;
-                child.apply(mv);
-                child
-            })
-            .collect();
-        let values = self.values(&children);
-        let mut best = moves[0];
-        let mut best_value = f32::NEG_INFINITY;
-        for ((mv, child), net) in moves.iter().zip(&children).zip(values) {
-            // The child's value is from the opponent's view; negate for ours.
-            let value = -Self::value_or_exact(child, net);
-            if value > best_value {
-                best_value = value;
-                best = *mv;
-            }
-        }
-        best
+        assert!(
+            state.outcome().is_none(),
+            "choose_move called on a terminal state"
+        );
+        self.predict(std::slice::from_ref(state)).best_moves()[0]
+    }
+
+    fn choose_move_with_policy(&mut self, state: &BitState) -> (Move, Vec<(Move, f32)>) {
+        assert!(
+            state.outcome().is_none(),
+            "choose_move called on a terminal state"
+        );
+        let mut prediction = self.predict(std::slice::from_ref(state));
+        let mv = prediction.best_moves()[0];
+        (mv, prediction.policy.swap_remove(0))
     }
 
     fn evaluate(&mut self, state: &BitState) -> Evaluation {
-        let net = self.values(std::slice::from_ref(state))[0];
-        Evaluation::value_only(Self::value_or_exact(state, net))
+        let mut p = self.predict(std::slice::from_ref(state));
+        Self::evaluation(state, &p.wdl[0], p.policy.swap_remove(0))
     }
 
     fn evaluate_batch(&mut self, states: &[BitState], out: &mut Vec<Evaluation>) {
-        let values = self.values(states);
+        let p = self.predict(states);
         out.extend(
             states
                 .iter()
-                .zip(values)
-                .map(|(s, net)| Evaluation::value_only(Self::value_or_exact(s, net))),
+                .zip(p.wdl.iter().zip(p.policy))
+                .map(|(s, (wdl, policy))| Self::evaluation(s, wdl, policy)),
         );
     }
 }
@@ -107,21 +104,25 @@ mod tests {
     use super::*;
     use crate::game::test_positions::{X_WINNING_MOVE, x_wins_in_one};
     use crate::mcts::{Mcts, MctsConfig};
-    use crate::nn::ValueNetConfig;
+    use crate::nn::ModelSpec;
 
-    fn untrained() -> ValueNetAgent {
-        let device = BackendKind::NdArray.device();
-        ValueNetAgent::new(
-            ValueNetConfig::default().init(&device),
-            BackendKind::NdArray,
-        )
+    fn untrained() -> NetAgent {
+        let kind = BackendKind::preferred();
+        NetAgent::new(ModelSpec::Linear.init(&kind.device()), kind)
     }
 
     #[test]
-    fn takes_an_immediate_win_even_untrained() {
+    fn plays_legal_moves_with_a_policy_over_legal_moves() {
         let _device = crate::nn::device_lock();
         let mut agent = untrained();
-        assert_eq!(agent.choose_move(&x_wins_in_one()), X_WINNING_MOVE);
+        let state = x_wins_in_one();
+        let (mv, policy) = agent.choose_move_with_policy(&state);
+        assert!(state.is_legal(mv));
+        assert_eq!(policy.len(), 7);
+        assert!(policy.iter().all(|(m, _)| state.is_legal(*m)));
+        let sum: f32 = policy.iter().map(|(_, p)| p).sum();
+        assert!((sum - 1.0).abs() < 1e-4);
+        assert_eq!(agent.choose_move(&state), mv);
     }
 
     #[test]
@@ -135,14 +136,14 @@ mod tests {
         agent.evaluate_batch(&[BitState::initial(), won, x_wins_in_one()], &mut out);
         assert_eq!(out.len(), 3);
         assert_eq!(out[1].value, -1.0);
-        assert!(
-            out.iter()
-                .all(|e| (-1.0..=1.0).contains(&e.value) && e.priors.is_empty())
-        );
+        assert!(out[1].priors.is_empty());
+        assert_eq!(out[0].priors.len(), 81);
+        assert_eq!(out[2].priors.len(), 7);
+        assert!(out.iter().all(|e| (-1.0..=1.0).contains(&e.value)));
     }
 
     #[test]
-    fn works_as_mcts_leaf_evaluator_in_batches() {
+    fn works_as_mcts_leaf_evaluator_with_priors() {
         let _device = crate::nn::device_lock();
         let mut mcts = Mcts::new(
             untrained(),
