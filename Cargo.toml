@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-burn = { version = "0.21.0", optional = true }
+burn = { version = "0.21.0", optional = true, default-features = false }
 clap = { version = "4", features = ["derive"] }
 rand = { version = "0.9", features = ["small_rng"] }
 serde = { version = "1", features = ["derive"], optional = true }
@@ -15,8 +15,21 @@ serde_json = { version = "1", optional = true }
 default = ["ndarray", "wgpu"]
 # Pulls in burn itself plus the pieces every backend needs: the Dispatch backend that selects
 # among the compiled backends at runtime, and burn-train (autodiff, datasets, the Learner with
-# its TUI dashboard) for training.
-nn = ["dep:burn", "burn/dispatch", "burn/train", "dep:serde", "dep:serde_json"]
+# its TUI dashboard) for training. burn's default features are off so that kernel fusion stays
+# off on the CubeCL backends (see README: it miscomputes thin matmuls and races under the
+# Learner's threads in 0.21); `fusion` turns the defaults back on.
+nn = [
+    "dep:burn",
+    "burn/std",
+    "burn/autotune",
+    "burn/dispatch",
+    "burn/train",
+    "burn/tui",
+    "dep:serde",
+    "dep:serde_json",
+]
+# Opt in to burn's default features, including kernel fusion on cuda/wgpu/cpu-mlir.
+fusion = ["burn/default"]
 # Pure-Rust CPU backend.
 ndarray = ["nn", "burn/ndarray"]
 # Portable GPU backend (Vulkan/Metal/DX12); no SDK needed at build time.
