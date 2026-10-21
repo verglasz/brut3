@@ -912,6 +912,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "plays many search games; run with: cargo test --release -- --include-ignored"]
     fn beats_random_opponent() {
         let (wins, draws, losses) = play_match(12, 100);
         assert!(

@@ -419,6 +419,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "trains a network; run with: cargo test --release -- --include-ignored"]
     fn two_tiny_generations_run_end_to_end() {
         let _device = crate::nn::device_lock();
         let dir = temp_artifact_dir("loop");

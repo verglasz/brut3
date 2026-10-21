@@ -72,7 +72,12 @@ Known upstream issues worked around:
   handle for tensor"). To experiment with fusion, add `burn/default` to the `nn` feature in
   `Cargo.toml`; it is deliberately not a cargo feature, so `--all-features` stays fusion-free.
   `nn/linear.rs` keeps a test of both heads against a host computation on every compiled
-  backend.
+  backend. Re-measured on 2026-10-21 with `burn/fusion`: the full test suite passes (the value
+  head now has three outputs, and step outputs are read back per tensor rather than through a
+  multi-tensor transaction), but one `loop` generation on an RTX 2080 (200 games, 200
+  simulations, board transformer 64/2/4) took 97-105 s against 70 s without fusion, with
+  self-play at 44k instead of 58k simulations/s. So fusion stays off for speed, not only for
+  correctness.
 - `nn/train.rs`: on the MLIR CPU backend (cubecl-cpu 0.10), reading a still-lazy tensor from a
   thread other than the one that produced it panics in the memory pool. The Learner's metric
   and checkpoint threads do exactly that, so on that backend the step outputs are read back on
@@ -115,7 +120,10 @@ cargo run --release --all-features -- loop --dir models/loop --resume --generati
 # For scripts and CI: plain log lines instead of the dashboard
 cargo run --release --all-features -- train --backend ndarray --no-tui --artifact-dir artifacts/run1
 
-# Slow tests, and throughput numbers for engine, agents and search
+# A plain `cargo test` skips the tests that train networks or play many search games; include them
+# (in release, they are slow) with:
+cargo test --release --all-features -- --include-ignored
+# Throughput numbers for engine, agents and search
 cargo test --release --no-default-features -- --ignored --nocapture
 cargo run --release --no-default-features --example bench
 

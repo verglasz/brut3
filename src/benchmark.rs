@@ -237,6 +237,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "plays many search games; run with: cargo test --release -- --include-ignored"]
     fn round_robin_ranks_stronger_agents_higher() {
         let specs = [
             AgentSpec::Random { seed: 1 },

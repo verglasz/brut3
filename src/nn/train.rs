@@ -880,6 +880,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "trains a network; run with: cargo test --release -- --include-ignored"]
     fn linear_fits_the_synthetic_dataset_on_every_backend() {
         let _device = crate::nn::device_lock();
         let data = synthetic_dataset(4000, 3);
@@ -910,6 +911,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "trains a network; run with: cargo test --release -- --include-ignored"]
     fn training_on_self_play_beats_the_baselines() {
         let _device = crate::nn::device_lock();
         let kind = BackendKind::preferred();

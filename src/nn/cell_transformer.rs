@@ -297,6 +297,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "trains a network; run with: cargo test --release -- --include-ignored"]
     fn learns_the_synthetic_dataset() {
         let _device = crate::nn::device_lock();
         let kind = BackendKind::preferred();
