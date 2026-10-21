@@ -6,8 +6,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use burn::module::Module;
-use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
-use burn::{Dispatch, DispatchDevice};
+use burn::prelude::Device;
 use serde::{Deserialize, Serialize};
 
 use super::board_transformer::{
@@ -20,9 +19,6 @@ use super::heads::BodyConfig;
 use super::linear::{LinearNet, LinearNetConfig};
 use super::model::{HostPrediction, predict_host, predict_logits, predict_logits_tensor};
 use crate::game::BitState;
-
-/// Weights are stored as named MessagePack; the recorder appends its own `.mpk` extension.
-pub type Recorder = NamedMpkFileRecorder<FullPrecisionSettings>;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ModelSpec {
@@ -69,7 +65,7 @@ impl ModelSpec {
         }
     }
 
-    pub fn init(&self, device: &DispatchDevice) -> AnyModel {
+    pub fn init(&self, device: &Device) -> AnyModel {
         match self {
             ModelSpec::Linear => AnyModel::Linear(LinearNetConfig::default().init(device)),
             ModelSpec::BoardTransformer(cfg) => AnyModel::BoardTransformer(cfg.init(device)),
@@ -81,6 +77,11 @@ impl ModelSpec {
 
     fn json_path(weights: &Path) -> PathBuf {
         weights.with_extension("json")
+    }
+
+    /// Where the weights of a model saved at `path` live: burnpack, `<path>.bpk`.
+    pub fn weights_path(path: &Path) -> PathBuf {
+        path.with_extension("bpk")
     }
 }
 
@@ -139,15 +140,15 @@ impl fmt::Display for ModelSpec {
     }
 }
 
-/// Every model kind, on the [`Dispatch`] backend.
+/// Every model kind.
 // A handful of long-lived values per process; variant size does not matter.
 #[allow(clippy::large_enum_variant)]
 pub enum AnyModel {
-    Linear(LinearNet<Dispatch>),
-    BoardTransformer(BoardTransformer<Dispatch>),
-    CellTransformer(CellTransformer<Dispatch>),
-    BoardTransformerV2(BoardTransformerV2<Dispatch>),
-    CellTransformerV2(CellTransformerV2<Dispatch>),
+    Linear(LinearNet),
+    BoardTransformer(BoardTransformer),
+    CellTransformer(CellTransformer),
+    BoardTransformerV2(BoardTransformerV2),
+    CellTransformerV2(CellTransformerV2),
 }
 
 /// Runs `$body` with `$m` bound to the model inside `$any`, whatever its kind.
@@ -178,13 +179,13 @@ impl AnyModel {
         with_model!(self, |m| m.num_params())
     }
 
-    pub fn predict_host(&self, states: &[BitState], device: &DispatchDevice) -> HostPrediction {
+    pub fn predict_host(&self, states: &[BitState], device: &Device) -> HostPrediction {
         with_model!(self, |m| predict_host(m, states, device))
     }
 
     /// Raw logits, one row of [`super::model::LOGITS`] per state; see
     /// [`super::model::predict_logits`].
-    pub fn predict_logits(&self, states: &[BitState], device: &DispatchDevice) -> Vec<f32> {
+    pub fn predict_logits(&self, states: &[BitState], device: &Device) -> Vec<f32> {
         with_model!(self, |m| predict_logits(m, states, device))
     }
 
@@ -192,24 +193,25 @@ impl AnyModel {
     pub fn predict_logits_tensor(
         &self,
         states: &[BitState],
-        device: &DispatchDevice,
-    ) -> burn::prelude::Tensor<Dispatch, 2> {
+        device: &Device,
+    ) -> burn::prelude::Tensor<2> {
         with_model!(self, |m| predict_logits_tensor(m, states, device))
     }
 
-    /// Writes `<path>.mpk` (weights) and `<path>.json` (spec).
+    /// Writes `<path>.bpk` (weights) and `<path>.json` (spec).
     pub fn save(self, path: &Path) -> Result<(), String> {
         let spec = self.spec();
         let json = serde_json::to_string_pretty(&spec).map_err(|e| e.to_string())?;
         let json_path = ModelSpec::json_path(path);
         std::fs::write(&json_path, json)
             .map_err(|e| format!("cannot write {}: {e}", json_path.display()))?;
-        let result = with_model!(self, |m| m.save_file(path.to_path_buf(), &Recorder::new()));
+        let result = with_model!(self, |m| m.save_file(ModelSpec::weights_path(path)));
         result.map_err(|e| format!("cannot save weights to {}: {e}", path.display()))
     }
 
-    /// Reads the spec from `<path>.json` and the weights from `<path>.mpk` onto `device`.
-    pub fn load(path: &Path, device: &DispatchDevice) -> Result<Self, String> {
+    /// Reads the spec from `<path>.json` and the weights from `<path>.bpk` onto `device`, ready
+    /// for inference (training flags off).
+    pub fn load(path: &Path, device: &Device) -> Result<Self, String> {
         let json_path = ModelSpec::json_path(path);
         let json = std::fs::read_to_string(&json_path)
             .map_err(|e| format!("cannot read model spec {}: {e}", json_path.display()))?;
@@ -218,24 +220,29 @@ impl AnyModel {
         let load_err = |e| format!("cannot load weights from {}: {e}", path.display());
         Ok(match spec.init(device) {
             AnyModel::Linear(m) => AnyModel::Linear(
-                m.load_file(path.to_path_buf(), &Recorder::new(), device)
-                    .map_err(load_err)?,
+                m.try_load_file(ModelSpec::weights_path(path))
+                    .map_err(load_err)?
+                    .valid(),
             ),
             AnyModel::BoardTransformer(m) => AnyModel::BoardTransformer(
-                m.load_file(path.to_path_buf(), &Recorder::new(), device)
-                    .map_err(load_err)?,
+                m.try_load_file(ModelSpec::weights_path(path))
+                    .map_err(load_err)?
+                    .valid(),
             ),
             AnyModel::CellTransformer(m) => AnyModel::CellTransformer(
-                m.load_file(path.to_path_buf(), &Recorder::new(), device)
-                    .map_err(load_err)?,
+                m.try_load_file(ModelSpec::weights_path(path))
+                    .map_err(load_err)?
+                    .valid(),
             ),
             AnyModel::BoardTransformerV2(m) => AnyModel::BoardTransformerV2(
-                m.load_file(path.to_path_buf(), &Recorder::new(), device)
-                    .map_err(load_err)?,
+                m.try_load_file(ModelSpec::weights_path(path))
+                    .map_err(load_err)?
+                    .valid(),
             ),
             AnyModel::CellTransformerV2(m) => AnyModel::CellTransformerV2(
-                m.load_file(path.to_path_buf(), &Recorder::new(), device)
-                    .map_err(load_err)?,
+                m.try_load_file(ModelSpec::weights_path(path))
+                    .map_err(load_err)?
+                    .valid(),
             ),
         })
     }
@@ -329,7 +336,7 @@ mod tests {
         let path = dir.join("net");
         model.save(&path).unwrap();
         assert!(path.with_extension("json").exists());
-        assert!(path.with_extension("mpk").exists());
+        assert!(path.with_extension("bpk").exists());
         let loaded = AnyModel::load(&path, &device).unwrap();
         assert_eq!(loaded.spec(), ModelSpec::Linear);
         assert_eq!(loaded.predict_host(&states, &device), before);

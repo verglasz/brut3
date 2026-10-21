@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-burn = { version = "0.21.0", optional = true, default-features = false }
+burn = { version = "0.22.1", optional = true, default-features = false }
 clap = { version = "4", features = ["derive"] }
 rand = { version = "0.9", features = ["small_rng"] }
 serde = { version = "1", features = ["derive"], optional = true }
@@ -13,9 +13,9 @@ serde_json = { version = "1", optional = true }
 [features]
 # Default: every backend that builds with no extra system requirements.
 default = ["ndarray", "wgpu"]
-# Pulls in burn itself plus the pieces every backend needs: the Dispatch backend that selects
-# among the compiled backends at runtime, and burn-train (autodiff, datasets, the Learner with
-# its TUI dashboard) for training. burn's default features are off so that kernel fusion stays
+# Pulls in burn itself plus the pieces every backend needs: burn-train (autodiff, datasets, the
+# Learner with its TUI dashboard) for training. Backend selection among the compiled backends
+# is built into burn 0.22's `Device`. burn's default features are off so that kernel fusion stays
 # off on the CubeCL backends (see README: it miscomputes thin matmuls and races under the
 # Learner's threads in 0.21). To experiment with fusion, add "burn/default" here; it is not a
 # cargo feature of this crate on purpose, so that `--all-features` builds stay fusion-free.
@@ -23,7 +23,6 @@ nn = [
     "dep:burn",
     "burn/std",
     "burn/autotune",
-    "burn/dispatch",
     "burn/train",
     "burn/tui",
     "dep:serde",

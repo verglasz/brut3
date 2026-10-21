@@ -45,16 +45,16 @@ pub const IDS: usize = BOARDS * IDS_PER_BOARD;
 /// The embedding table and encoder body shared by the board models: `[batch, IDS]` ids in,
 /// `[batch, 9, d_model]` residual stream out.
 #[derive(Module, Debug)]
-pub struct BoardEncoder<B: Backend> {
+pub struct BoardEncoder {
     /// Content, per-cell, position, status and forced embeddings, at the `*_BASE` offsets.
-    embed: Embedding<B>,
-    body: TransformerEncoder<B>,
+    embed: Embedding,
+    body: TransformerEncoder,
     #[module(skip)]
     d_model: usize,
 }
 
-impl<B: Backend> BoardEncoder<B> {
-    pub fn init(body: &BodyConfig, device: &B::Device) -> Self {
+impl BoardEncoder {
+    pub fn init(body: &BodyConfig, device: &Device) -> Self {
         Self {
             embed: embedding(VOCABULARY, body.d_model, device),
             body: body.init(device),
@@ -64,7 +64,7 @@ impl<B: Backend> BoardEncoder<B> {
 
     /// One gather for every id, then the 13 embeddings of each board summed into its token:
     /// `[n, 117, d] -> [n, 9, 13, d] -> [n, 9, d]`.
-    pub fn tokens(&self, input: BoardTokens<B>) -> Tensor<B, 3> {
+    pub fn tokens(&self, input: BoardTokens) -> Tensor<3> {
         let n = input.dims()[0];
         let d = self.d_model;
         self.embed
@@ -75,12 +75,12 @@ impl<B: Backend> BoardEncoder<B> {
     }
 
     /// The encoder body over any token sequence `[n, tokens, d]`.
-    pub fn body(&self, tokens: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn body(&self, tokens: Tensor<3>) -> Tensor<3> {
         encode_all_to_all(&self.body, tokens)
     }
 
     /// Ids in, residual stream `[n, 9, d]` out.
-    pub fn forward(&self, input: BoardTokens<B>) -> Tensor<B, 3> {
+    pub fn forward(&self, input: BoardTokens) -> Tensor<3> {
         self.body(self.tokens(input))
     }
 }
@@ -109,7 +109,7 @@ impl BoardTransformerConfig {
         }
     }
 
-    pub fn init<B: Backend>(&self, device: &B::Device) -> BoardTransformer<B> {
+    pub fn init(&self, device: &Device) -> BoardTransformer {
         let d = self.body.d_model;
         let head = |out: usize| {
             PerceptronConfig::new(BOARDS * d, self.d_head(), out)
@@ -126,12 +126,12 @@ impl BoardTransformerConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct BoardTransformer<B: Backend> {
+pub struct BoardTransformer {
     #[module(skip)]
     config: BoardTransformerConfig,
-    encoder: BoardEncoder<B>,
-    policy_head: Perceptron<B>,
-    wdl_head: Perceptron<B>,
+    encoder: BoardEncoder,
+    policy_head: Perceptron,
+    wdl_head: Perceptron,
 }
 
 /// [`BoardTransformerV2`]: the same encoder with per-token heads. A class token
@@ -162,7 +162,7 @@ impl BoardTransformerV2Config {
         }
     }
 
-    pub fn init<B: Backend>(&self, device: &B::Device) -> BoardTransformerV2<B> {
+    pub fn init(&self, device: &Device) -> BoardTransformerV2 {
         let d = self.body.d_model;
         BoardTransformerV2 {
             config: self.clone(),
@@ -178,17 +178,17 @@ impl BoardTransformerV2Config {
 }
 
 #[derive(Module, Debug)]
-pub struct BoardTransformerV2<B: Backend> {
+pub struct BoardTransformerV2 {
     #[module(skip)]
     config: BoardTransformerV2Config,
-    encoder: BoardEncoder<B>,
+    encoder: BoardEncoder,
     /// Shared by the tokens: a token with the global readout appended, to its move logits.
-    policy: Perceptron<B>,
-    cls: ClsReadout<B>,
+    policy: Perceptron,
+    cls: ClsReadout,
 }
 
 /// Embedding ids for a batch: `[batch, IDS]`, see [`board_token_ids`].
-pub type BoardTokens<B> = Tensor<B, 2, Int>;
+pub type BoardTokens = Tensor<2, Int>;
 
 /// Embedding ids of one position, board-major: for each board its content id
 /// (`CONTENT_BASE + index in 0..3^9`), nine cell ids (`CELL_BASE + cell * 3 + content`), its
@@ -231,7 +231,7 @@ pub fn board_token_ids(state: &BitState, out: &mut BoardTokenIds) {
 }
 
 /// Encodes `states` as `[batch, IDS]` embedding ids.
-pub fn board_tokens<B: Backend>(states: &[BitState], device: &B::Device) -> BoardTokens<B> {
+pub fn board_tokens(states: &[BitState], device: &Device) -> BoardTokens {
     let n = states.len();
     let mut ids = vec![0i32; n * IDS];
     for (state, out) in states.iter().zip(ids.chunks_exact_mut(IDS)) {
@@ -240,20 +240,20 @@ pub fn board_tokens<B: Backend>(states: &[BitState], device: &B::Device) -> Boar
     Tensor::from_data(TensorData::new(ids, [n, IDS]), device)
 }
 
-impl<B: Backend> BoardTransformer<B> {
+impl BoardTransformer {
     pub fn config(&self) -> BoardTransformerConfig {
         self.config.clone()
     }
 }
 
-impl<B: Backend> Model<B> for BoardTransformer<B> {
-    type Input = BoardTokens<B>;
+impl Model for BoardTransformer {
+    type Input = BoardTokens;
 
-    fn encode(states: &[BitState], device: &B::Device) -> BoardTokens<B> {
+    fn encode(states: &[BitState], device: &Device) -> BoardTokens {
         board_tokens(states, device)
     }
 
-    fn predict(&self, input: BoardTokens<B>) -> Prediction<B> {
+    fn predict(&self, input: BoardTokens) -> Prediction {
         let stream = self.encoder.forward(input).flatten::<2>(1, 2);
         Prediction {
             wdl: self.wdl_head.forward(stream.clone()),
@@ -264,20 +264,20 @@ impl<B: Backend> Model<B> for BoardTransformer<B> {
 
 crate::nn::train::impl_train_steps!(BoardTransformer);
 
-impl<B: Backend> BoardTransformerV2<B> {
+impl BoardTransformerV2 {
     pub fn config(&self) -> BoardTransformerV2Config {
         self.config.clone()
     }
 }
 
-impl<B: Backend> Model<B> for BoardTransformerV2<B> {
-    type Input = BoardTokens<B>;
+impl Model for BoardTransformerV2 {
+    type Input = BoardTokens;
 
-    fn encode(states: &[BitState], device: &B::Device) -> BoardTokens<B> {
+    fn encode(states: &[BitState], device: &Device) -> BoardTokens {
         board_tokens(states, device)
     }
 
-    fn predict(&self, input: BoardTokens<B>) -> Prediction<B> {
+    fn predict(&self, input: BoardTokens) -> Prediction {
         let tokens = self.encoder.tokens(input);
         let n = tokens.dims()[0];
         let stream = self.encoder.body(self.cls.prepend(tokens));
@@ -296,7 +296,6 @@ crate::nn::train::impl_train_steps!(BoardTransformerV2);
 
 #[cfg(test)]
 mod tests {
-    use burn::Dispatch;
 
     use super::*;
     use crate::game::test_positions::x_wins_in_one;
@@ -323,7 +322,7 @@ mod tests {
     fn v2_predicts_shapes_and_legal_policies() {
         let _device = crate::nn::device_lock();
         let device = BackendKind::preferred().device();
-        let model = small_v2().init::<Dispatch>(&device);
+        let model = small_v2().init(&device);
         let states = [BitState::initial(), x_wins_in_one()];
         let p = predict_host(&model, &states, &device);
         assert_eq!(p.wdl.len(), 2);
@@ -391,7 +390,7 @@ mod tests {
     fn predicts_shapes_and_legal_policies() {
         let _device = crate::nn::device_lock();
         let device = BackendKind::preferred().device();
-        let model = small().init::<Dispatch>(&device);
+        let model = small().init(&device);
         let states = [BitState::initial(), x_wins_in_one()];
         let p = predict_host(&model, &states, &device);
         assert_eq!(p.wdl.len(), 2);
@@ -409,7 +408,7 @@ mod tests {
         let _device = crate::nn::device_lock();
         let kinds = BackendKind::for_tests();
         let reference = kinds[kinds.len() - 1].device(); // ndarray when compiled: not CubeCL
-        let model = small().init::<Dispatch>(&reference);
+        let model = small().init(&reference);
         let states: Vec<BitState> = synthetic_dataset(16, 5)
             .samples
             .iter()
@@ -418,19 +417,14 @@ mod tests {
         let want = predict_host(&model, &states, &reference);
         let dir = std::env::temp_dir().join(format!("uttt-board-tf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        model
-            .save_file(dir.join("m"), &crate::nn::any_model::Recorder::new())
-            .unwrap();
+        model.save_file(dir.join("m.bpk")).unwrap();
         for kind in kinds {
             let device = kind.device();
             let loaded = small()
-                .init::<Dispatch>(&device)
-                .load_file(
-                    dir.join("m"),
-                    &crate::nn::any_model::Recorder::new(),
-                    &device,
-                )
-                .unwrap();
+                .init(&device)
+                .try_load_file(dir.join("m.bpk"))
+                .unwrap()
+                .valid();
             let got = predict_host(&loaded, &states, &device);
             for (i, (g, w)) in got.wdl.iter().zip(&want.wdl).enumerate() {
                 for c in 0..3 {
@@ -459,7 +453,7 @@ mod tests {
         let kind = BackendKind::preferred();
         let device = kind.device();
         let data = synthetic_dataset(8000, 4);
-        let untrained = small().init::<Dispatch>(&device);
+        let untrained = small().init(&device);
         let (valid, _) = data.clone().split(0.9, 0);
         let before = evaluate(&untrained, &device, &valid.samples);
         let options = crate::nn::train::TrainOptions {
@@ -467,7 +461,7 @@ mod tests {
             learning_rate: 1e-3,
             ..opts(kind, "board-tf", 10)
         };
-        let (_, report) = train(|d| small().init::<Dispatch>(d), &device, data, &options);
+        let (_, report) = train(|d| small().init(d), &device, data, &options);
         // The synthetic target is linear in the per-cell features, which board tokens only
         // see through their embeddings: the policy is clearly learnable, the value must at
         // least not get worse than the mean predictor.
@@ -493,7 +487,7 @@ mod tests {
         let kind = BackendKind::preferred();
         let device = kind.device();
         let data = synthetic_dataset(8000, 4);
-        let untrained = small_v2().init::<Dispatch>(&device);
+        let untrained = small_v2().init(&device);
         let (valid, _) = data.clone().split(0.9, 0);
         let before = evaluate(&untrained, &device, &valid.samples);
         let options = crate::nn::train::TrainOptions {
@@ -501,7 +495,7 @@ mod tests {
             learning_rate: 1e-3,
             ..opts(kind, "board-tf-v2", 20)
         };
-        let (_, report) = train(|d| small_v2().init::<Dispatch>(d), &device, data, &options);
+        let (_, report) = train(|d| small_v2().init(d), &device, data, &options);
         // The synthetic policy target is linear in the features of *all* boards, which the
         // flattened perceptron of `BoardTransformer` reads directly but a per-board head only
         // sees through the body's attention; this only checks that both heads learn.

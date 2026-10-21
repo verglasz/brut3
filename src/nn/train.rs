@@ -6,23 +6,21 @@ use std::path::PathBuf;
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataset::InMemDataset;
-use burn::module::AutodiffModule;
 use burn::optim::AdamWConfig;
 use burn::prelude::*;
 use burn::tensor::activation::log_softmax;
-use burn::train::metric::{AccuracyInput, AccuracyMetric, Adaptor, LossInput, LossMetric};
+use burn::train::logger::{EvaluationProgressLogger, TrainingProgressLogger};
+use burn::train::metric::{AccuracyMetric, LossMetric, MetricDefinition};
 use burn::train::renderer::{
-    EvaluationName, EvaluationProgress, MetricState, MetricsRenderer, MetricsRendererEvaluation,
-    MetricsRendererTraining, ProgressType, TrainingProgress,
+    EvaluationName, MetricState, MetricsRenderer, MetricsRendererEvaluation,
+    MetricsRendererTraining,
 };
 use burn::train::{
-    ExecutionStrategy, InferenceStep, ItemLazy, Learner, SupervisedTraining, TrainStep,
+    ClassificationOutput, ExecutionStrategy, InferenceStep, Learner, SupervisedTraining, TrainStep,
 };
-use burn::{Dispatch, DispatchDevice};
 use rand::seq::SliceRandom;
 use rand::{SeedableRng, rngs::SmallRng};
 
-use super::any_model::Recorder;
 use super::linear::LinearNet;
 use super::model::{MOVES, Model, Verdict, expected_value, legal_mask, predict_host};
 use crate::agent::{AgentSpec, UtttAgent};
@@ -221,17 +219,17 @@ pub fn generate_parallel(
 }
 
 /// A minibatch on a device, encoded for model `M`.
-pub struct Batch<B: Backend, M: Model<B>> {
+pub struct Batch<M: Model> {
     pub input: M::Input,
     /// `[batch]` verdict class indices.
-    pub verdicts: Tensor<B, 1, Int>,
+    pub verdicts: Tensor<1, Int>,
     /// `[batch, MOVES]` target move probabilities.
-    pub policy: Tensor<B, 2>,
+    pub policy: Tensor<2>,
     /// `[batch, MOVES]` legal moves.
-    pub legal: Tensor<B, 2, Bool>,
+    pub legal: Tensor<2, Bool>,
 }
 
-impl<B: Backend, M: Model<B>> std::fmt::Debug for Batch<B, M> {
+impl<M: Model> std::fmt::Debug for Batch<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Batch")
             .field("input", &self.input)
@@ -242,7 +240,7 @@ impl<B: Backend, M: Model<B>> std::fmt::Debug for Batch<B, M> {
     }
 }
 
-impl<B: Backend, M: Model<B>> Clone for Batch<B, M> {
+impl<M: Model> Clone for Batch<M> {
     fn clone(&self) -> Self {
         Self {
             input: self.input.clone(),
@@ -268,8 +266,8 @@ impl<M> Clone for ModelBatcher<M> {
     }
 }
 
-impl<B: Backend, M: Model<B>> Batcher<B, Sample, Batch<B, M>> for ModelBatcher<M> {
-    fn batch(&self, items: Vec<Sample>, device: &B::Device) -> Batch<B, M> {
+impl<M: Model> Batcher<Sample, Batch<M>> for ModelBatcher<M> {
+    fn batch(&self, items: Vec<Sample>, device: &Device) -> Batch<M> {
         let n = items.len();
         let states: Vec<BitState> = items.iter().map(|s| s.state).collect();
         let verdicts: Vec<i32> = items.iter().map(|s| s.verdict.index() as i32).collect();
@@ -288,89 +286,13 @@ impl<B: Backend, M: Model<B>> Batcher<B, Sample, Batch<B, M>> for ModelBatcher<M
     }
 }
 
-/// Output of one training or validation step.
-pub struct StepOutput<B: Backend> {
-    /// Verdict cross-entropy plus policy cross-entropy.
-    pub loss: Tensor<B, 1>,
-    /// `[batch, 3]` verdict logits.
-    pub wdl: Tensor<B, 2>,
-    /// `[batch]` verdict targets.
-    pub verdicts: Tensor<B, 1, Int>,
-    /// The tensors already read back on the thread that computed them; see
-    /// [`eager_host_read`].
-    host: Option<(TensorData, TensorData, TensorData)>,
-}
-
-/// A [`StepOutput`] re-materialised on the plain (non-autodiff) device for the metrics.
-///
-/// This replaces burn's `ClassificationOutput`, whose sync reads through a multi-tensor
-/// `Transaction`. On the MLIR CPU backend (cubecl-cpu 0.10) that read, and any read of a
-/// still-lazy tensor from a thread other than the one that produced it, panics inside the
-/// memory pool. So the tensors are read on the producing thread there ([`eager_host_read`])
-/// and only host data crosses threads.
-pub struct StepOutputSync {
-    loss: Tensor<Dispatch, 1>,
-    wdl: Tensor<Dispatch, 2>,
-    verdicts: Tensor<Dispatch, 1, Int>,
-}
-
-impl ItemLazy for StepOutput<Dispatch> {
-    type ItemSync = StepOutputSync;
-
-    fn sync(self) -> StepOutputSync {
-        let device = plain_device(&self.loss.device());
-        let (loss, wdl, verdicts) = match self.host {
-            Some(host) => host,
-            None => (
-                self.loss.into_data(),
-                self.wdl.into_data(),
-                self.verdicts.into_data(),
-            ),
-        };
-        StepOutputSync {
-            loss: Tensor::from_data(loss, &device),
-            wdl: Tensor::from_data(wdl, &device),
-            verdicts: Tensor::from_data(verdicts, &device),
-        }
-    }
-}
-
-impl Adaptor<LossInput<Dispatch>> for StepOutputSync {
-    fn adapt(&self) -> LossInput<Dispatch> {
-        LossInput::new(self.loss.clone())
-    }
-}
-
-impl Adaptor<AccuracyInput<Dispatch>> for StepOutputSync {
-    fn adapt(&self) -> AccuracyInput<Dispatch> {
-        AccuracyInput::new(self.wdl.clone(), self.verdicts.clone())
-    }
-}
-
-/// The device itself, or the device wrapped by an autodiff device.
-fn plain_device(device: &DispatchDevice) -> DispatchDevice {
-    match device {
-        DispatchDevice::Autodiff(inner) => (**inner).clone(),
-        other => other.clone(),
-    }
-}
-
-/// Whether tensors must be read back on the thread that computed them (MLIR CPU backend).
-fn eager_host_read(device: &DispatchDevice) -> bool {
-    #[cfg(feature = "cpu-mlir")]
-    if matches!(plain_device(device), DispatchDevice::Cpu(_)) {
-        return true;
-    }
-    let _ = device;
-    false
-}
+/// Output of one training or validation step: the summed loss, the `[batch, 3]` verdict
+/// logits and the `[batch]` verdict targets, which burn's loss and accuracy metrics read.
+pub type StepOutput = ClassificationOutput;
 
 /// Forward pass plus the loss: cross-entropy of the verdict and cross-entropy between the
 /// target move distribution and the legal-masked policy.
-pub fn forward_step<M: Model<Dispatch>>(
-    model: &M,
-    batch: Batch<Dispatch, M>,
-) -> StepOutput<Dispatch> {
+pub fn forward_step<M: Model>(model: &M, batch: Batch<M>) -> StepOutput {
     let prediction = model.predict(batch.input);
     let n = batch.verdicts.dims()[0];
     let wdl_loss = -log_softmax(prediction.wdl.clone(), 1)
@@ -380,42 +302,30 @@ pub fn forward_step<M: Model<Dispatch>>(
         .sum_dim(1)
         .mean();
     let loss = wdl_loss + policy_loss;
-    let host = eager_host_read(&loss.device()).then(|| {
-        (
-            loss.clone().into_data(),
-            prediction.wdl.clone().into_data(),
-            batch.verdicts.clone().into_data(),
-        )
-    });
-    StepOutput {
-        loss,
-        wdl: prediction.wdl,
-        verdicts: batch.verdicts,
-        host,
-    }
+    ClassificationOutput::new(loss, prediction.wdl, batch.verdicts)
 }
 
-/// Implements burn's step traits for a model type on the [`Dispatch`] backend.
+/// Implements burn's step traits for a model type.
 macro_rules! impl_train_steps {
     ($model:ident) => {
-        impl ::burn::train::TrainStep for $model<::burn::Dispatch> {
-            type Input = $crate::nn::train::Batch<::burn::Dispatch, $model<::burn::Dispatch>>;
-            type Output = $crate::nn::train::StepOutput<::burn::Dispatch>;
+        impl ::burn::train::TrainStep for $model {
+            type Input = $crate::nn::train::Batch<$model>;
+            type Output = $crate::nn::train::StepOutput;
 
             fn step(
                 &self,
                 batch: Self::Input,
-            ) -> ::burn::train::TrainOutput<$crate::nn::train::StepOutput<::burn::Dispatch>> {
+            ) -> ::burn::train::TrainOutput<$crate::nn::train::StepOutput> {
                 let item = $crate::nn::train::forward_step(self, batch);
                 ::burn::train::TrainOutput::new(self, item.loss.backward(), item)
             }
         }
 
-        impl ::burn::train::InferenceStep for $model<::burn::Dispatch> {
-            type Input = $crate::nn::train::Batch<::burn::Dispatch, $model<::burn::Dispatch>>;
-            type Output = $crate::nn::train::StepOutput<::burn::Dispatch>;
+        impl ::burn::train::InferenceStep for $model {
+            type Input = $crate::nn::train::Batch<$model>;
+            type Output = $crate::nn::train::StepOutput;
 
-            fn step(&self, batch: Self::Input) -> $crate::nn::train::StepOutput<::burn::Dispatch> {
+            fn step(&self, batch: Self::Input) -> $crate::nn::train::StepOutput {
                 $crate::nn::train::forward_step(self, batch)
             }
         }
@@ -493,53 +403,76 @@ struct QuietRenderer;
 impl MetricsRendererTraining for QuietRenderer {
     fn update_train(&mut self, _state: MetricState) {}
     fn update_valid(&mut self, _state: MetricState) {}
-    fn render_train(&mut self, _item: TrainingProgress, _indicators: Vec<ProgressType>) {}
-    fn render_valid(&mut self, _item: TrainingProgress, _indicators: Vec<ProgressType>) {}
 }
 
 impl MetricsRendererEvaluation for QuietRenderer {
-    fn render_test(&mut self, _item: EvaluationProgress, _indicators: Vec<ProgressType>) {}
     fn update_test(&mut self, _name: EvaluationName, _state: MetricState) {}
+}
+
+impl TrainingProgressLogger for QuietRenderer {
+    fn start(
+        &mut self,
+        _total_epochs: usize,
+        _starting_epoch: usize,
+        _total_items: Option<usize>,
+        _label: Option<&str>,
+    ) {
+    }
+    fn update_epoch(&mut self, _epoch: usize) {}
+    fn start_split(&mut self, _split: &str, _total_items: usize) {}
+    fn update_split(&mut self, _items_processed: usize) {}
+    fn end_split(&mut self) {}
+    fn end(&mut self) {}
+    fn log_event_training(&mut self, _event: String) {}
+}
+
+impl EvaluationProgressLogger for QuietRenderer {
+    fn start_global_progress(&mut self, _total_tests: usize) {}
+    fn start_test(&mut self, _name: &str, _total_items: usize) {}
+    fn update_test_progress(&mut self, _items_processed: usize) {}
+    fn end_test(&mut self) {}
+    fn end_global_progress(&mut self) {}
+    fn log_event_evaluation(&mut self, _event: String) {}
 }
 
 impl MetricsRenderer for QuietRenderer {
     fn manual_close(&mut self) {}
-    fn register_metric(&mut self, _definition: burn::train::metric::MetricDefinition) {}
+    fn register_metric(&mut self, _definition: MetricDefinition) {}
 }
 
 /// Models that can go through [`train`].
 pub trait Trainable:
-    Model<Dispatch>
-    + AutodiffModule<Dispatch, InnerModule = Self>
-    + TrainStep<Input = Batch<Dispatch, Self>, Output = StepOutput<Dispatch>>
-    + InferenceStep<Input = Batch<Dispatch, Self>, Output = StepOutput<Dispatch>>
+    Model
+    + Module
+    + TrainStep<Input = Batch<Self>, Output = StepOutput>
+    + InferenceStep<Input = Batch<Self>, Output = StepOutput>
     + std::fmt::Display
     + 'static
 {
 }
 
 impl<M> Trainable for M where
-    M: Model<Dispatch>
-        + AutodiffModule<Dispatch, InnerModule = M>
-        + TrainStep<Input = Batch<Dispatch, M>, Output = StepOutput<Dispatch>>
-        + InferenceStep<Input = Batch<Dispatch, M>, Output = StepOutput<Dispatch>>
+    M: Model
+        + Module
+        + TrainStep<Input = Batch<M>, Output = StepOutput>
+        + InferenceStep<Input = Batch<M>, Output = StepOutput>
         + std::fmt::Display
         + 'static
 {
 }
 
-/// Trains a model built by `init` on the autodiff form of `device` (a `Dispatch` model cannot
-/// be moved between the two) on `data` with burn's `Learner`, rendering progress to the
-/// terminal, and returns it ready for inference on `device` together with a report.
+/// Trains a model built by `init` on the autodiff form of `device` on `data` with burn's
+/// `Learner`, rendering progress to the terminal, and returns it ready for inference on
+/// `device` together with a report.
 pub fn train<M: Trainable>(
-    init: impl Fn(&DispatchDevice) -> M,
-    device: &DispatchDevice,
+    init: impl Fn(&Device) -> M,
+    device: &Device,
     data: Dataset,
     opts: &TrainOptions,
 ) -> (M, TrainReport) {
     assert!(!data.is_empty(), "cannot train on an empty dataset");
-    let ad_device = DispatchDevice::autodiff(device.clone());
-    Dispatch::seed(&ad_device, opts.seed);
+    let ad_device = device.clone().autodiff();
+    ad_device.seed(opts.seed);
 
     let (train_data, valid_data) = data.split(opts.validation_fraction, opts.seed);
     let train_data = if opts.augment {
@@ -558,60 +491,57 @@ pub fn train<M: Trainable>(
         ..Default::default()
     };
     let batch = opts.batch_size.max(1);
-    let loader_train = DataLoaderBuilder::<Dispatch, Sample, Batch<Dispatch, M>>::new(
-        ModelBatcher::<M>::default(),
-    )
-    .batch_size(batch)
-    .shuffle(opts.seed)
-    .build(InMemDataset::new(train_data.samples));
+    let loader_train = DataLoaderBuilder::<Sample, Batch<M>>::new(ModelBatcher::<M>::default())
+        .batch_size(batch)
+        .shuffle(opts.seed)
+        .set_device(ad_device.clone())
+        .build(InMemDataset::new(train_data.samples));
     let valid_samples = valid_data.samples;
-    let loader_valid = DataLoaderBuilder::<Dispatch, Sample, Batch<Dispatch, M>>::new(
-        ModelBatcher::<M>::default(),
-    )
-    .batch_size(1024)
-    .build(InMemDataset::new(valid_samples.clone()));
+    let loader_valid = DataLoaderBuilder::<Sample, Batch<M>>::new(ModelBatcher::<M>::default())
+        .batch_size(1024)
+        .set_device(device.clone())
+        .build(InMemDataset::new(valid_samples.clone()));
 
     let model = init(&ad_device);
     let optim = AdamWConfig::new()
         .with_weight_decay(opts.weight_decay)
-        .init::<Dispatch, M>();
+        .init();
     let learner = Learner::new(model, optim, opts.learning_rate);
 
-    let mut training = SupervisedTraining::new(&opts.artifact_dir, loader_train, loader_valid)
+    let training = SupervisedTraining::new(&opts.artifact_dir, loader_train, loader_valid)
         .num_epochs(opts.epochs)
-        .metric_train_numeric(LossMetric::<Dispatch>::new())
-        .metric_valid_numeric(LossMetric::<Dispatch>::new())
-        .metric_train_numeric(AccuracyMetric::<Dispatch>::new())
-        .metric_valid_numeric(AccuracyMetric::<Dispatch>::new())
-        .with_training_strategy(ExecutionStrategy::single(ad_device).into());
-    // The checkpointer saves from its own thread, which the MLIR CPU backend cannot serve
-    // (see `StepOutputSync`); it is skipped there.
-    if !eager_host_read(device) {
-        training = training.with_file_checkpointer(Recorder::new());
-    }
-    training = if opts.tui {
+        .metric_train_numeric(LossMetric::new())
+        .metric_valid_numeric(LossMetric::new())
+        .metric_train_numeric(AccuracyMetric::new())
+        .metric_valid_numeric(AccuracyMetric::new())
+        .with_training_strategy(ExecutionStrategy::single(ad_device).into())
+        .with_default_checkpointers();
+    let training = if opts.tui {
         training.summary()
     } else {
-        training.renderer(QuietRenderer)
+        training.renderer(Box::new(QuietRenderer))
     };
-    let checkpoints = !eager_host_read(device);
-    let mut model = training.launch(learner).model;
+    let result = training.launch(learner);
+    if let Some(error) = &result.error {
+        panic!("training failed: {error}");
+    }
+    // The trained weights without autodiff, on `device`.
+    let mut model = result.model.valid();
 
     // The Learner returns the last epoch's model; prefer the epoch with the lowest validation
     // loss, whose checkpoint burn keeps, since large models overfit well before the end.
     let mut best_epoch = opts.epochs;
-    let best = checkpoints
-        .then(|| best_validation_epoch(&opts.artifact_dir, opts.epochs))
-        .flatten();
-    if let Some(best) = best.filter(|&b| b != opts.epochs) {
+    if let Some(best) =
+        best_validation_epoch(&opts.artifact_dir, opts.epochs).filter(|&b| b != opts.epochs)
+    {
         let path = opts
             .artifact_dir
             .join("checkpoint")
-            .join(format!("model-{best}"));
-        if path.with_extension("mpk").exists() {
-            match init(device).load_file(path, &Recorder::new(), device) {
+            .join(format!("model-{best}.bpk"));
+        if path.exists() {
+            match init(device).try_load_file(&path) {
                 Ok(m) => {
-                    model = m;
+                    model = m.valid();
                     best_epoch = best;
                 }
                 Err(e) => eprintln!("cannot load best checkpoint (epoch {best}): {e}"),
@@ -656,11 +586,7 @@ fn best_validation_epoch(artifact_dir: &std::path::Path, epochs: usize) -> Optio
 }
 
 /// Evaluates `model` over `samples`; zeros if there are none.
-pub fn evaluate<M: Model<Dispatch>>(
-    model: &M,
-    device: &DispatchDevice,
-    samples: &[Sample],
-) -> Evaluation {
+pub fn evaluate<M: Model>(model: &M, device: &Device, samples: &[Sample]) -> Evaluation {
     if samples.is_empty() {
         return Evaluation::default();
     }
@@ -892,7 +818,7 @@ pub(crate) mod tests {
                 ..opts(kind, "linear-synthetic", 20)
             };
             let (_, report) = train(
-                |d| LinearNetConfig::default().init::<Dispatch>(d),
+                |d| LinearNetConfig::default().init(d),
                 &device,
                 data.clone(),
                 &opts,
@@ -923,7 +849,7 @@ pub(crate) mod tests {
             ..opts(kind, "linear-selfplay", 8)
         };
         let (model, report) = train(
-            |d| LinearNetConfig::default().init::<Dispatch>(d),
+            |d| LinearNetConfig::default().init(d),
             &device,
             data,
             &options,

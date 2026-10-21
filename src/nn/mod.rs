@@ -1,9 +1,9 @@
 //! Policy/value networks and everything around them: position encoding, the models, training
 //! on self-play data, an agent that plays with them, and runtime backend selection.
 //!
-//! All tensors use burn's [`Dispatch`](burn::Dispatch) backend, whose device enum picks the
-//! concrete backend (ndarray, wgpu, CUDA, MLIR CPU) at runtime among those compiled in, and
-//! which doubles as its own autodiff backend for training. One model type serves everywhere.
+//! Tensors carry no backend type: burn's [`Device`](burn::prelude::Device) picks the concrete
+//! backend (ndarray, wgpu, CUDA, MLIR CPU) at runtime among those compiled in, and its autodiff
+//! form is used for training. One model type serves everywhere.
 //!
 //! Every model implements [`Model`]: it encodes raw [`BitState`](crate::game::BitState)s into
 //! its own input tensors and predicts win/draw/loss logits plus move logits ([`Prediction`]).

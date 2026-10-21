@@ -3,7 +3,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use burn::DispatchDevice;
+use burn::prelude::Device;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BackendKind {
@@ -55,19 +55,27 @@ impl BackendKind {
 
     /// Default device of this backend. Panics if the backend is not compiled in; check
     /// [`BackendKind::is_compiled`] first (parsing already does).
-    pub fn device(self) -> DispatchDevice {
+    pub fn device(self) -> Device {
         match self {
             #[cfg(feature = "cuda")]
-            Self::Cuda => DispatchDevice::Cuda(Default::default()),
+            Self::Cuda => Device::cuda(0),
             #[cfg(feature = "wgpu")]
-            Self::Wgpu => DispatchDevice::Wgpu(Default::default()),
+            Self::Wgpu => Device::wgpu(burn::prelude::DeviceKind::default()),
             #[cfg(feature = "cpu-mlir")]
-            Self::CpuMlir => DispatchDevice::Cpu(Default::default()),
+            Self::CpuMlir => Device::cpu(),
+            // Deprecated upstream in favour of `flex`; kept as the dependable pure-Rust backend.
             #[cfg(feature = "ndarray")]
-            Self::NdArray => DispatchDevice::NdArray(Default::default()),
+            #[allow(deprecated)]
+            Self::NdArray => Device::ndarray(),
             #[allow(unreachable_patterns)]
             other => panic!("backend {} is not compiled in", other.name()),
         }
+    }
+
+    /// The compiled-in kind whose default device `device` is (autodiff or not), if any.
+    pub fn of(device: &Device) -> Option<BackendKind> {
+        let plain = device.clone().without_autodiff();
+        Self::compiled().into_iter().find(|k| k.device() == plain)
     }
 }
 

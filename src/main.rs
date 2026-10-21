@@ -163,7 +163,7 @@ struct TrainArgs {
     weight_decay: f32,
     #[arg(long, default_value_t = 0)]
     seed: u64,
-    /// Where to save the weights (the `.mpk` extension is added).
+    /// Where to save the weights (the `.bpk` extension is added).
     #[arg(long, default_value = "models/value")]
     out: std::path::PathBuf,
     /// Where the Learner writes logs and checkpoints.
@@ -299,7 +299,7 @@ fn run_loop(args: &LoopArgs) -> Result<(), String> {
     println!(
         "{} generations done; best model at {}; history in {}",
         reports.len(),
-        args.dir.join("best.mpk").display(),
+        args.dir.join("best.bpk").display(),
         args.dir.join("history.jsonl").display()
     );
     Ok(())
@@ -405,7 +405,7 @@ fn train(args: &TrainArgs) -> Result<(), String> {
     }
     model.save(&args.out)?;
     println!(
-        "saved weights to {}.mpk (spec in .json)",
+        "saved weights to {}.bpk (spec in .json)",
         args.out.display()
     );
     Ok(())

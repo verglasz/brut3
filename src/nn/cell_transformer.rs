@@ -41,16 +41,16 @@ pub const IDS: usize = CELLS * IDS_PER_CELL;
 /// The embedding table and encoder body shared by the cell models: `[batch, IDS]` ids in,
 /// `[batch, 81, d_model]` residual stream out.
 #[derive(Module, Debug)]
-pub struct CellEncoder<B: Backend> {
+pub struct CellEncoder {
     /// Content, position, status, forced and legal embeddings, at the `*_BASE` offsets.
-    embed: Embedding<B>,
-    body: TransformerEncoder<B>,
+    embed: Embedding,
+    body: TransformerEncoder,
     #[module(skip)]
     d_model: usize,
 }
 
-impl<B: Backend> CellEncoder<B> {
-    pub fn init(body: &BodyConfig, device: &B::Device) -> Self {
+impl CellEncoder {
+    pub fn init(body: &BodyConfig, device: &Device) -> Self {
         Self {
             embed: embedding(VOCABULARY, body.d_model, device),
             body: body.init(device),
@@ -60,7 +60,7 @@ impl<B: Backend> CellEncoder<B> {
 
     /// One gather for every id, then the 5 embeddings of each cell summed into its token:
     /// `[n, 405, d] -> [n, 81, 5, d] -> [n, 81, d]`.
-    pub fn tokens(&self, input: CellTokens<B>) -> Tensor<B, 3> {
+    pub fn tokens(&self, input: CellTokens) -> Tensor<3> {
         let n = input.dims()[0];
         let d = self.d_model;
         self.embed
@@ -71,12 +71,12 @@ impl<B: Backend> CellEncoder<B> {
     }
 
     /// The encoder body over any token sequence `[n, tokens, d]`.
-    pub fn body(&self, tokens: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn body(&self, tokens: Tensor<3>) -> Tensor<3> {
         encode_all_to_all(&self.body, tokens)
     }
 
     /// Ids in, residual stream `[n, 81, d]` out.
-    pub fn forward(&self, input: CellTokens<B>) -> Tensor<B, 3> {
+    pub fn forward(&self, input: CellTokens) -> Tensor<3> {
         self.body(self.tokens(input))
     }
 }
@@ -105,7 +105,7 @@ impl CellTransformerConfig {
         }
     }
 
-    pub fn init<B: Backend>(&self, device: &B::Device) -> CellTransformer<B> {
+    pub fn init(&self, device: &Device) -> CellTransformer {
         let d = self.body.d_model;
         let head = |out: usize| {
             PerceptronConfig::new(CELLS * d, self.d_head(), out)
@@ -122,12 +122,12 @@ impl CellTransformerConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct CellTransformer<B: Backend> {
+pub struct CellTransformer {
     #[module(skip)]
     config: CellTransformerConfig,
-    encoder: CellEncoder<B>,
-    policy_head: Perceptron<B>,
-    wdl_head: Perceptron<B>,
+    encoder: CellEncoder,
+    policy_head: Perceptron,
+    wdl_head: Perceptron,
 }
 
 /// [`CellTransformerV2`]: the same encoder with per-token heads. A class token
@@ -158,7 +158,7 @@ impl CellTransformerV2Config {
         }
     }
 
-    pub fn init<B: Backend>(&self, device: &B::Device) -> CellTransformerV2<B> {
+    pub fn init(&self, device: &Device) -> CellTransformerV2 {
         let d = self.body.d_model;
         CellTransformerV2 {
             config: self.clone(),
@@ -174,17 +174,17 @@ impl CellTransformerV2Config {
 }
 
 #[derive(Module, Debug)]
-pub struct CellTransformerV2<B: Backend> {
+pub struct CellTransformerV2 {
     #[module(skip)]
     config: CellTransformerV2Config,
-    encoder: CellEncoder<B>,
+    encoder: CellEncoder,
     /// Shared by the tokens: a token with the global readout appended, to its move logits.
-    policy: Perceptron<B>,
-    cls: ClsReadout<B>,
+    policy: Perceptron,
+    cls: ClsReadout,
 }
 
 /// Embedding ids for a batch: `[batch, IDS]`, see [`cell_token_ids`].
-pub type CellTokens<B> = Tensor<B, 2, Int>;
+pub type CellTokens = Tensor<2, Int>;
 
 /// Embedding ids of one position, cell-major by `Move::index`: for each cell its content
 /// (`0` empty, `1` mine, `2` theirs), position, its board's status (`0` open, `1` won by me,
@@ -230,7 +230,7 @@ pub fn cell_token_ids(state: &BitState, out: &mut CellTokenIds) {
 }
 
 /// Encodes `states` as `[batch, IDS]` embedding ids.
-pub fn cell_tokens<B: Backend>(states: &[BitState], device: &B::Device) -> CellTokens<B> {
+pub fn cell_tokens(states: &[BitState], device: &Device) -> CellTokens {
     let n = states.len();
     let mut ids = vec![0i32; n * IDS];
     for (state, out) in states.iter().zip(ids.chunks_exact_mut(IDS)) {
@@ -239,20 +239,20 @@ pub fn cell_tokens<B: Backend>(states: &[BitState], device: &B::Device) -> CellT
     Tensor::from_data(TensorData::new(ids, [n, IDS]), device)
 }
 
-impl<B: Backend> CellTransformer<B> {
+impl CellTransformer {
     pub fn config(&self) -> CellTransformerConfig {
         self.config.clone()
     }
 }
 
-impl<B: Backend> Model<B> for CellTransformer<B> {
-    type Input = CellTokens<B>;
+impl Model for CellTransformer {
+    type Input = CellTokens;
 
-    fn encode(states: &[BitState], device: &B::Device) -> CellTokens<B> {
+    fn encode(states: &[BitState], device: &Device) -> CellTokens {
         cell_tokens(states, device)
     }
 
-    fn predict(&self, input: CellTokens<B>) -> Prediction<B> {
+    fn predict(&self, input: CellTokens) -> Prediction {
         let stream = self.encoder.forward(input).flatten::<2>(1, 2);
         Prediction {
             wdl: self.wdl_head.forward(stream.clone()),
@@ -263,20 +263,20 @@ impl<B: Backend> Model<B> for CellTransformer<B> {
 
 crate::nn::train::impl_train_steps!(CellTransformer);
 
-impl<B: Backend> CellTransformerV2<B> {
+impl CellTransformerV2 {
     pub fn config(&self) -> CellTransformerV2Config {
         self.config.clone()
     }
 }
 
-impl<B: Backend> Model<B> for CellTransformerV2<B> {
-    type Input = CellTokens<B>;
+impl Model for CellTransformerV2 {
+    type Input = CellTokens;
 
-    fn encode(states: &[BitState], device: &B::Device) -> CellTokens<B> {
+    fn encode(states: &[BitState], device: &Device) -> CellTokens {
         cell_tokens(states, device)
     }
 
-    fn predict(&self, input: CellTokens<B>) -> Prediction<B> {
+    fn predict(&self, input: CellTokens) -> Prediction {
         let tokens = self.encoder.tokens(input);
         let n = tokens.dims()[0];
         let stream = self.encoder.body(self.cls.prepend(tokens));
@@ -295,7 +295,6 @@ crate::nn::train::impl_train_steps!(CellTransformerV2);
 
 #[cfg(test)]
 mod tests {
-    use burn::Dispatch;
 
     use super::*;
     use crate::game::sq;
@@ -322,7 +321,7 @@ mod tests {
     fn v2_predicts_shapes_and_legal_policies() {
         let _device = crate::nn::device_lock();
         let device = BackendKind::preferred().device();
-        let model = small_v2().init::<Dispatch>(&device);
+        let model = small_v2().init(&device);
         let states = [BitState::initial(), x_wins_in_one()];
         let p = predict_host(&model, &states, &device);
         assert_eq!(p.wdl.len(), 2);
@@ -379,7 +378,7 @@ mod tests {
     fn predicts_shapes_and_legal_policies() {
         let _device = crate::nn::device_lock();
         let device = BackendKind::preferred().device();
-        let model = small().init::<Dispatch>(&device);
+        let model = small().init(&device);
         let states = [BitState::initial(), x_wins_in_one()];
         let p = predict_host(&model, &states, &device);
         assert_eq!(p.wdl.len(), 2);
@@ -397,7 +396,7 @@ mod tests {
         let _device = crate::nn::device_lock();
         let kinds = BackendKind::for_tests();
         let reference = kinds[kinds.len() - 1].device(); // ndarray when compiled: not CubeCL
-        let model = small().init::<Dispatch>(&reference);
+        let model = small().init(&reference);
         let states: Vec<BitState> = synthetic_dataset(16, 5)
             .samples
             .iter()
@@ -406,19 +405,14 @@ mod tests {
         let want = predict_host(&model, &states, &reference);
         let dir = std::env::temp_dir().join(format!("uttt-cell-tf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        model
-            .save_file(dir.join("m"), &crate::nn::any_model::Recorder::new())
-            .unwrap();
+        model.save_file(dir.join("m.bpk")).unwrap();
         for kind in kinds {
             let device = kind.device();
             let loaded = small()
-                .init::<Dispatch>(&device)
-                .load_file(
-                    dir.join("m"),
-                    &crate::nn::any_model::Recorder::new(),
-                    &device,
-                )
-                .unwrap();
+                .init(&device)
+                .try_load_file(dir.join("m.bpk"))
+                .unwrap()
+                .valid();
             let got = predict_host(&loaded, &states, &device);
             for (i, (g, w)) in got.wdl.iter().zip(&want.wdl).enumerate() {
                 for c in 0..3 {
@@ -447,7 +441,7 @@ mod tests {
         let kind = BackendKind::preferred();
         let device = kind.device();
         let data = synthetic_dataset(8000, 4);
-        let untrained = small().init::<Dispatch>(&device);
+        let untrained = small().init(&device);
         let (valid, _) = data.clone().split(0.9, 0);
         let before = evaluate(&untrained, &device, &valid.samples);
         let options = crate::nn::train::TrainOptions {
@@ -455,7 +449,7 @@ mod tests {
             learning_rate: 1e-3,
             ..opts(kind, "cell-tf", 10)
         };
-        let (_, report) = train(|d| small().init::<Dispatch>(d), &device, data, &options);
+        let (_, report) = train(|d| small().init(d), &device, data, &options);
         assert!(
             report.validation.verdict_accuracy > report.baseline.verdict_accuracy + 0.05
                 && report.validation.verdict_accuracy > before.verdict_accuracy,
@@ -474,7 +468,7 @@ mod tests {
         let kind = BackendKind::preferred();
         let device = kind.device();
         let data = synthetic_dataset(8000, 4);
-        let untrained = small_v2().init::<Dispatch>(&device);
+        let untrained = small_v2().init(&device);
         let (valid, _) = data.clone().split(0.9, 0);
         let before = evaluate(&untrained, &device, &valid.samples);
         let options = crate::nn::train::TrainOptions {
@@ -482,7 +476,7 @@ mod tests {
             learning_rate: 1e-3,
             ..opts(kind, "cell-tf-v2", 20)
         };
-        let (_, report) = train(|d| small_v2().init::<Dispatch>(d), &device, data, &options);
+        let (_, report) = train(|d| small_v2().init(d), &device, data, &options);
         assert!(
             report.validation.verdict_accuracy > report.baseline.verdict_accuracy + 0.05
                 && report.validation.verdict_accuracy > before.verdict_accuracy,

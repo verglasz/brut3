@@ -57,8 +57,8 @@ burn is backend-agnostic, so the same model and training code runs on:
 | CubeCL CPU | `cpu-mlir` (opt-in) | MLIR-based CPU backend; downloads a prebuilt LLVM on first build. |
 
 Default features are everything that builds with no extra system requirements. All tensors go
-through burn's `Dispatch` backend, whose device enum selects among the compiled-in backends at
-runtime (`--backend cuda`, `nn models/value wgpu`, ...), so one binary can exercise all of them;
+through burn's runtime `Device`, which selects among the compiled-in backends at runtime
+(`--backend cuda`, `nn models/value wgpu`, ...), so one binary can exercise all of them;
 `backends` lists what a binary has. `cargo build --no-default-features` skips burn entirely for
 fast iteration on the engine. Development builds use `--all-features`.
 
@@ -79,11 +79,11 @@ Known upstream issues worked around:
   self-play at 44k instead of 58k simulations/s. Re-tested the same day after self-play was
   pipelined and the GPU had become the bottleneck (~85% busy): fusion still ran at 69k against
   84k simulations/s. So fusion stays off for speed, not only for correctness.
-- `nn/train.rs`: on the MLIR CPU backend (cubecl-cpu 0.10), reading a still-lazy tensor from a
-  thread other than the one that produced it panics in the memory pool. The Learner's metric
-  and checkpoint threads do exactly that, so on that backend the step outputs are read back on
-  the training thread before they are handed over, and file checkpointing is skipped. Treat
-  cpu-mlir as experimental; `ndarray` is the dependable CPU backend.
+- On burn 0.21 the MLIR CPU backend (cubecl-cpu 0.10) panicked when the Learner's metric and
+  checkpoint threads read tensors produced on the training thread, and `nn/train.rs` carried a
+  workaround (eager host reads, no checkpoints there). The port to burn 0.22 dropped it, and
+  cpu-mlir has not been re-tested since; treat it as experimental. `ndarray` is deprecated
+  upstream in favour of `flex` but remains the dependable CPU backend here.
 - The per-backend tests honour `UTTT_SKIP_BACKENDS=wgpu,...` for machines where a compiled
   backend cannot initialise (for example an NVIDIA driver update pending a reboot).
 
@@ -176,7 +176,7 @@ The search is generic over the agent that evaluates leaves:
   checkpoints, a TUI dashboard or plain logs, and an `experiment.log` under `--artifact-dir`.
   `NetAgent` plays the policy head's best move and serves `Mcts` as a batched leaf evaluator
   with priors, which makes `mcts-nn` the AlphaZero-style search. `BackendKind` names the
-  compiled backends and gives their `Dispatch` device.
+  compiled backends and gives their `Device`.
 - Two transformer models share `heads` (pre-norm encoder body with all-to-all attention, and
   two-layer perceptron heads reading the flattened final residual stream). `BoardTransformer`
   uses nine tokens, one per small board: an embedding of the board's full cell configuration
@@ -248,5 +248,5 @@ src/
   mcts.rs           Mcts, MctsConfig, SearchResult
   main.rs           launches the REPL
 examples/bench.rs   throughput benchmark
-Cargo.toml          burn 0.21 (Dispatch + autodiff) behind backend features, clap, rand
+Cargo.toml          burn 0.22 (runtime `Device` + autodiff) behind backend features, clap, rand
 ```

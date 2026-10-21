@@ -59,22 +59,22 @@ pub fn expected_value(probabilities: &[f32; 3]) -> f32 {
 }
 
 /// A network's raw outputs for a batch of positions.
-pub struct Prediction<B: Backend> {
+pub struct Prediction {
     /// `[batch, 3]` win/draw/loss logits, side to move's view.
-    pub wdl: Tensor<B, 2>,
+    pub wdl: Tensor<2>,
     /// `[batch, MOVES]` move logits, indexed by `Move::index`.
-    pub policy: Tensor<B, 2>,
+    pub policy: Tensor<2>,
 }
 
-impl<B: Backend> Prediction<B> {
+impl Prediction {
     /// Log-probabilities over moves with illegal ones (where `legal` is false) suppressed,
     /// for the training loss. Inference reads the raw logits back instead
     /// ([`predict_logits`]).
-    pub fn policy_log_probabilities(&self, legal: Tensor<B, 2, Bool>) -> Tensor<B, 2> {
+    pub fn policy_log_probabilities(&self, legal: Tensor<2, Bool>) -> Tensor<2> {
         log_softmax(self.masked_policy(legal), 1)
     }
 
-    fn masked_policy(&self, legal: Tensor<B, 2, Bool>) -> Tensor<B, 2> {
+    fn masked_policy(&self, legal: Tensor<2, Bool>) -> Tensor<2> {
         self.policy
             .clone()
             .mask_fill(legal.bool_not(), ILLEGAL_LOGIT)
@@ -85,17 +85,17 @@ impl<B: Backend> Prediction<B> {
 ///
 /// Each model encodes positions into its own input tensors, so models with different views
 /// of the board (flat features, board tokens, cell tokens) share one training pipeline.
-pub trait Model<B: Backend>: Module<B> {
+pub trait Model: Module {
     type Input: Clone + Send + std::fmt::Debug + 'static;
 
     /// Encodes positions into the model's input, from each position's side to move's view.
-    fn encode(states: &[BitState], device: &B::Device) -> Self::Input;
+    fn encode(states: &[BitState], device: &Device) -> Self::Input;
 
-    fn predict(&self, input: Self::Input) -> Prediction<B>;
+    fn predict(&self, input: Self::Input) -> Prediction;
 }
 
 /// `[batch, MOVES]` mask of legal moves.
-pub fn legal_mask<B: Backend>(states: &[BitState], device: &B::Device) -> Tensor<B, 2, Bool> {
+pub fn legal_mask(states: &[BitState], device: &Device) -> Tensor<2, Bool> {
     let mut mask = vec![false; states.len() * MOVES];
     for (i, state) in states.iter().enumerate() {
         for mv in state.legal_moves() {
@@ -138,11 +138,7 @@ impl HostPrediction {
 /// rows of [`LOGITS`] floats, each the three verdict logits followed by the move logits
 /// indexed by `Move::index`. Masking and softmax are left to the host, where they are a few
 /// dozen flops per position: see [`host_wdl`] and [`host_policy_into`].
-pub fn predict_logits<B: Backend, M: Model<B>>(
-    model: &M,
-    states: &[BitState],
-    device: &B::Device,
-) -> Vec<f32> {
+pub fn predict_logits<M: Model>(model: &M, states: &[BitState], device: &Device) -> Vec<f32> {
     if states.is_empty() {
         return Vec::new();
     }
@@ -167,11 +163,11 @@ fn padded_len(n: usize) -> usize {
 /// The `[n, LOGITS]` tensor behind [`predict_logits`], still on the device: queue it with
 /// this, do other work, then read it with [`logits_to_host`]. `states` must not be empty.
 /// The batch is padded to [`padded_len`] positions on the way and the padding sliced off.
-pub fn predict_logits_tensor<B: Backend, M: Model<B>>(
+pub fn predict_logits_tensor<M: Model>(
     model: &M,
     states: &[BitState],
-    device: &B::Device,
-) -> Tensor<B, 2> {
+    device: &Device,
+) -> Tensor<2> {
     let n = states.len();
     let padded = padded_len(n);
     let prediction = if padded == n {
@@ -191,8 +187,11 @@ pub fn predict_logits_tensor<B: Backend, M: Model<B>>(
 }
 
 /// Reads a [`predict_logits_tensor`] result back, row-major.
-pub fn logits_to_host<B: Backend>(logits: Tensor<B, 2>) -> Vec<f32> {
-    logits.into_data().to_vec::<f32>().expect("f32 logits")
+pub fn logits_to_host(logits: Tensor<2>) -> Vec<f32> {
+    logits
+        .into_data()
+        .try_into_vec::<f32>()
+        .expect("f32 logits")
 }
 
 /// Win/draw/loss probabilities from one row of logits.
@@ -229,11 +228,7 @@ pub fn host_policy_into(row: &[f32], legal: &impl MoveSet, out: &mut [f32; MOVES
 }
 
 /// Runs `model` on `states` and reads the probabilities back.
-pub fn predict_host<B: Backend, M: Model<B>>(
-    model: &M,
-    states: &[BitState],
-    device: &B::Device,
-) -> HostPrediction {
+pub fn predict_host<M: Model>(model: &M, states: &[BitState], device: &Device) -> HostPrediction {
     let logits = predict_logits(model, states, device);
     let mut dense = [0.0f32; MOVES];
     let mut prediction = HostPrediction::default();
@@ -297,10 +292,10 @@ mod tests {
         let _device = crate::nn::device_lock();
         let device = crate::nn::BackendKind::preferred().device();
         let states = [BitState::initial(), x_wins_in_one()];
-        let mask: Vec<bool> = legal_mask::<burn::Dispatch>(&states, &device)
+        let mask: Vec<bool> = legal_mask(&states, &device)
             .int()
             .into_data()
-            .to_vec::<i32>()
+            .try_into_vec::<i32>()
             .unwrap()
             .into_iter()
             .map(|v| v != 0)

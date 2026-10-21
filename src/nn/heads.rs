@@ -12,7 +12,7 @@ use burn::prelude::*;
 
 /// An embedding table of `n` rows of width `d`, initialised like the token embeddings of a
 /// small transformer (normal, std 0.02).
-pub fn embedding<B: Backend>(n: usize, d: usize, device: &B::Device) -> Embedding<B> {
+pub fn embedding(n: usize, d: usize, device: &Device) -> Embedding {
     EmbeddingConfig::new(n, d)
         .with_initializer(Initializer::Normal {
             mean: 0.0,
@@ -32,7 +32,7 @@ pub struct PerceptronConfig {
 }
 
 impl PerceptronConfig {
-    pub fn init<B: Backend>(&self, device: &B::Device) -> Perceptron<B> {
+    pub fn init(&self, device: &Device) -> Perceptron {
         Perceptron {
             hidden: LinearConfig::new(self.d_input, self.d_hidden).init(device),
             activation: Gelu::new(),
@@ -43,16 +43,16 @@ impl PerceptronConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct Perceptron<B: Backend> {
-    hidden: Linear<B>,
+pub struct Perceptron {
+    hidden: Linear,
     activation: Gelu,
     dropout: Dropout,
-    output: Linear<B>,
+    output: Linear,
 }
 
-impl<B: Backend> Perceptron<B> {
+impl Perceptron {
     /// `[..., d_input] -> [..., d_output]`, applied to the last dimension.
-    pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
+    pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
         let h = self
             .dropout
             .forward(self.activation.forward(self.hidden.forward(x)));
@@ -85,7 +85,7 @@ impl BodyConfig {
         }
     }
 
-    pub fn init<B: Backend>(&self, device: &B::Device) -> TransformerEncoder<B> {
+    pub fn init(&self, device: &Device) -> TransformerEncoder {
         TransformerEncoderConfig::new(self.d_model, self.d_ff(), self.n_heads, self.n_layers)
             .with_dropout(self.dropout)
             .with_norm_first(true)
@@ -108,7 +108,7 @@ pub struct ClsReadoutConfig {
 }
 
 impl ClsReadoutConfig {
-    pub fn init<B: Backend>(&self, device: &B::Device) -> ClsReadout<B> {
+    pub fn init(&self, device: &Device) -> ClsReadout {
         ClsReadout {
             cls: Initializer::Normal {
                 mean: 0.0,
@@ -124,16 +124,16 @@ impl ClsReadoutConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct ClsReadout<B: Backend> {
+pub struct ClsReadout {
     /// The class token, `[1, 1, d_model]`.
-    cls: Param<Tensor<B, 3>>,
-    norm: LayerNorm<B>,
-    output: Perceptron<B>,
+    cls: Param<Tensor<3>>,
+    norm: LayerNorm,
+    output: Perceptron,
 }
 
-impl<B: Backend> ClsReadout<B> {
+impl ClsReadout {
     /// `[batch, tokens, d_model] -> [batch, tokens + 1, d_model]`, the class token first.
-    pub fn prepend(&self, tokens: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn prepend(&self, tokens: Tensor<3>) -> Tensor<3> {
         let [n, _, d] = tokens.dims();
         Tensor::cat(vec![self.cls.val().expand([n, 1, d]), tokens], 1)
     }
@@ -141,7 +141,7 @@ impl<B: Backend> ClsReadout<B> {
     /// Splits the encoded stream `[batch, tokens + 1, d_model]` into the normalised class
     /// token `[batch, d_model]` (the global readout) and the normalised token stream
     /// `[batch, tokens, d_model]`.
-    pub fn split(&self, stream: Tensor<B, 3>) -> (Tensor<B, 2>, Tensor<B, 3>) {
+    pub fn split(&self, stream: Tensor<3>) -> (Tensor<2>, Tensor<3>) {
         let [n, t1, d] = stream.dims();
         let stream = self.norm.forward(stream);
         let cls = stream.clone().slice([0..n, 0..1]).reshape([n, d]);
@@ -149,13 +149,13 @@ impl<B: Backend> ClsReadout<B> {
     }
 
     /// The class output `[batch, d_output]` from the readout given by [`ClsReadout::split`].
-    pub fn output(&self, cls: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn output(&self, cls: Tensor<2>) -> Tensor<2> {
         self.output.forward(cls)
     }
 
     /// Every token with the global readout appended: `[batch, tokens, 2 * d_model]`, the input
     /// of a per-token head that should see the whole position.
-    pub fn with_global(cls: Tensor<B, 2>, tokens: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn with_global(cls: Tensor<2>, tokens: Tensor<3>) -> Tensor<3> {
         let [n, t, d] = tokens.dims();
         Tensor::cat(vec![tokens, cls.reshape([n, 1, d]).expand([n, t, d])], 2)
     }
@@ -163,9 +163,6 @@ impl<B: Backend> ClsReadout<B> {
 
 /// Runs the encoder over `tokens` (`[batch, tokens, d_model]`) with every token attending to
 /// every other: no padding or attention masks, the whole board is always visible.
-pub fn encode_all_to_all<B: Backend>(
-    encoder: &TransformerEncoder<B>,
-    tokens: Tensor<B, 3>,
-) -> Tensor<B, 3> {
+pub fn encode_all_to_all(encoder: &TransformerEncoder, tokens: Tensor<3>) -> Tensor<3> {
     encoder.forward(TransformerEncoderInput::new(tokens))
 }

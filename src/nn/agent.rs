@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
+use burn::prelude::Device;
 use burn::prelude::Tensor;
-use burn::{Dispatch, DispatchDevice};
 
 use super::any_model::AnyModel;
 use super::backend::BackendKind;
@@ -15,11 +15,11 @@ use crate::game::{BitState, GameState, Move};
 
 pub struct NetAgent {
     model: AnyModel,
-    device: DispatchDevice,
+    device: Device,
     backend: BackendKind,
     /// A forward pass queued by `begin_batch` and not yet read back: the logits tensor and how
     /// many positions it covers.
-    in_flight: Option<(Tensor<Dispatch, 2>, usize)>,
+    in_flight: Option<(Tensor<2>, usize)>,
 }
 
 impl NetAgent {

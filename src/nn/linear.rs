@@ -20,7 +20,7 @@ impl Default for LinearNetConfig {
 }
 
 impl LinearNetConfig {
-    pub fn init<B: Backend>(&self, device: &B::Device) -> LinearNet<B> {
+    pub fn init(&self, device: &Device) -> LinearNet {
         // Same scheme as burn's Linear: Kaiming uniform with gain 1/sqrt(3).
         let init = Initializer::KaimingUniform {
             gain: 1.0 / 3f64.sqrt(),
@@ -49,23 +49,23 @@ impl LinearNetConfig {
 /// returns wrong values on the CubeCL backends for a single output column, and the tests in
 /// this file check every compiled backend against a host computation to catch anything similar.
 #[derive(Module, Debug)]
-pub struct LinearNet<B: Backend> {
+pub struct LinearNet {
     /// `[FEATURES, 3]`
-    wdl_weight: Param<Tensor<B, 2>>,
+    wdl_weight: Param<Tensor<2>>,
     /// `[3]`
-    wdl_bias: Param<Tensor<B, 1>>,
+    wdl_bias: Param<Tensor<1>>,
     /// `[FEATURES, MOVES]`
-    policy_weight: Param<Tensor<B, 2>>,
+    policy_weight: Param<Tensor<2>>,
     /// `[MOVES]`
-    policy_bias: Param<Tensor<B, 1>>,
+    policy_bias: Param<Tensor<1>>,
 }
 
-impl<B: Backend> LinearNet<B> {
+impl LinearNet {
     /// Host-side copies of the parameters: `(wdl_weight, wdl_bias, policy_weight, policy_bias)`,
     /// weights row-major `[FEATURES, out]`.
     pub fn parameters(&self) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
-        let host = |t: Tensor<B, 2>| t.into_data().to_vec::<f32>().expect("f32");
-        let host1 = |t: Tensor<B, 1>| t.into_data().to_vec::<f32>().expect("f32");
+        let host = |t: Tensor<2>| t.into_data().try_into_vec::<f32>().expect("f32");
+        let host1 = |t: Tensor<1>| t.into_data().try_into_vec::<f32>().expect("f32");
         (
             host(self.wdl_weight.val()),
             host1(self.wdl_bias.val()),
@@ -75,16 +75,16 @@ impl<B: Backend> LinearNet<B> {
     }
 }
 
-impl<B: Backend> Model<B> for LinearNet<B> {
+impl Model for LinearNet {
     /// `[batch, FEATURES]`
-    type Input = Tensor<B, 2>;
+    type Input = Tensor<2>;
 
-    fn encode(states: &[BitState], device: &B::Device) -> Tensor<B, 2> {
+    fn encode(states: &[BitState], device: &Device) -> Tensor<2> {
         let data = encode_batch(states);
         Tensor::from_data(TensorData::new(data, [states.len(), FEATURES]), device)
     }
 
-    fn predict(&self, features: Tensor<B, 2>) -> Prediction<B> {
+    fn predict(&self, features: Tensor<2>) -> Prediction {
         Prediction {
             wdl: features.clone().matmul(self.wdl_weight.val()) + self.wdl_bias.val().unsqueeze(),
             policy: features.matmul(self.policy_weight.val()) + self.policy_bias.val().unsqueeze(),
@@ -94,7 +94,6 @@ impl<B: Backend> Model<B> for LinearNet<B> {
 
 #[cfg(test)]
 mod tests {
-    use burn::Dispatch;
     use rand::{Rng, SeedableRng, rngs::SmallRng};
 
     use super::*;
@@ -163,7 +162,7 @@ mod tests {
         }
         for kind in BackendKind::for_tests() {
             let device = kind.device();
-            let net = LinearNetConfig::default().init::<Dispatch>(&device);
+            let net = LinearNetConfig::default().init(&device);
             let (w1, b1, w2, b2) = net.parameters();
             let want_wdl = host_head(&x, &w1, &b1, 3, None);
             let want_policy = host_head(&x, &w2, &b2, MOVES, Some(&legal));

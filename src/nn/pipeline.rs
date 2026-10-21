@@ -5,11 +5,11 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use burn::DispatchDevice;
 use burn::module::Module;
+use burn::prelude::Device;
 use serde_json::json;
 
-use super::any_model::{AnyModel, ModelSpec, Recorder};
+use super::any_model::{AnyModel, ModelSpec};
 use super::backend::BackendKind;
 use super::train::{Dataset, Sample, TrainOptions, TrainReport, generate_parallel, train};
 use crate::agent::AgentSpec;
@@ -21,7 +21,7 @@ use crate::selfplay::{MatchExploration, SelfPlayConfig, SelfPlayStats};
 pub fn train_model(
     spec: &ModelSpec,
     start_from: Option<&Path>,
-    device: &DispatchDevice,
+    device: &Device,
     data: Dataset,
     opts: &TrainOptions,
 ) -> Result<(AnyModel, TrainReport), String> {
@@ -36,8 +36,8 @@ pub fn train_model(
             ));
         }
     }
-    fn load<M: Module<burn::Dispatch>>(m: M, d: &DispatchDevice, path: &Path) -> Result<M, String> {
-        m.load_file(path.to_path_buf(), &Recorder::new(), d)
+    fn load<M: Module>(m: M, path: &Path) -> Result<M, String> {
+        m.try_load_file(ModelSpec::weights_path(path))
             .map_err(|e| format!("cannot load weights from {}: {e}", path.display()))
     }
     macro_rules! run {
@@ -46,7 +46,7 @@ pub fn train_model(
                 |d| {
                     let m = $init(d);
                     match start_from {
-                        Some(path) => load(m, d, path).expect("weights were loaded above"),
+                        Some(path) => load(m, path).expect("weights were loaded above"),
                         None => m,
                     }
                 },
@@ -204,9 +204,9 @@ fn generation_path(dir: &Path, generation: usize) -> PathBuf {
     dir.join(format!("gen-{generation}"))
 }
 
-/// Copies a saved model (`.mpk` and `.json`) from one path stem to another.
+/// Copies a saved model (`.bpk` and `.json`) from one path stem to another.
 fn copy_model(from: &Path, to: &Path) -> Result<(), String> {
-    for ext in ["mpk", "json"] {
+    for ext in ["bpk", "json"] {
         std::fs::copy(from.with_extension(ext), to.with_extension(ext)).map_err(|e| {
             format!(
                 "cannot copy {} to {}: {e}",
@@ -236,7 +236,7 @@ pub fn run_loop(
     let best = best_path(&cfg.dir);
 
     let mut first = 0;
-    if cfg.resume && best.with_extension("mpk").exists() {
+    if cfg.resume && best.with_extension("bpk").exists() {
         let existing = AnyModel::load(&best, &device)?;
         if existing.spec() != cfg.spec {
             return Err(format!(
@@ -467,8 +467,8 @@ mod tests {
         let reports = run_loop(&cfg, |l| lines.push(l)).unwrap();
         assert_eq!(reports.len(), 2);
         assert!(reports[1].buffer_games <= 8 && reports[1].buffer_games >= reports[0].buffer_games);
-        assert!(dir.join("best.mpk").exists() && dir.join("best.json").exists());
-        assert!(dir.join("gen-1.mpk").exists() && dir.join("gen-2.mpk").exists());
+        assert!(dir.join("best.bpk").exists() && dir.join("best.json").exists());
+        assert!(dir.join("gen-1.bpk").exists() && dir.join("gen-2.bpk").exists());
         assert_eq!(recorded_generations(&dir), 2);
         assert!(reports.iter().all(|r| r.baseline_score.is_some()));
         assert!(lines.iter().any(|l| l.contains("candidate vs best")));
