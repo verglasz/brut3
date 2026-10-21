@@ -16,7 +16,7 @@
 
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
-use crate::agent::{Evaluation, UtttAgent};
+use crate::agent::{Evaluation, Evaluations, UtttAgent};
 use crate::game::{GameState, Move, MoveSet, Outcome};
 
 #[derive(Clone, Debug)]
@@ -198,7 +198,6 @@ pub struct SearchTree<S: GameState> {
     completed: u32,
     budget: u32,
     noise: Option<(RootNoise, SmallRng)>,
-    prior_buf: [f32; 81],
 }
 
 impl<S: GameState> SearchTree<S> {
@@ -212,7 +211,6 @@ impl<S: GameState> SearchTree<S> {
             completed: 0,
             budget: simulations,
             noise: None,
-            prior_buf: [0.0; 81],
         }
     }
 
@@ -268,19 +266,22 @@ impl<S: GameState> SearchTree<S> {
         self.claimed.len()
     }
 
-    /// Expands the leaves of the last [`SearchTree::claim`] with `evaluations` (same order)
-    /// and backs their values up.
-    pub fn resolve(&mut self, evaluations: &[Evaluation]) {
-        assert_eq!(
-            evaluations.len(),
-            self.claimed.len(),
+    /// Expands the leaves of the last [`SearchTree::claim`] with their evaluations, which are
+    /// `evaluations[offset..offset + claimed]` in claim order, and backs their values up.
+    pub fn resolve(&mut self, evaluations: &Evaluations, offset: usize) {
+        assert!(
+            offset + self.claimed.len() <= evaluations.len(),
             "one evaluation per claimed leaf"
         );
         let claimed = std::mem::take(&mut self.claimed);
-        for (&idx, eval) in claimed.iter().zip(evaluations) {
+        for (i, &idx) in claimed.iter().enumerate() {
             self.remove_virtual_loss(idx);
             self.nodes[idx as usize].pending = false;
-            let value = self.expand(idx, eval);
+            let value = self.expand(
+                idx,
+                evaluations.value(offset + i),
+                evaluations.priors(offset + i),
+            );
             self.backup(idx, value);
             self.completed += 1;
         }
@@ -374,32 +375,24 @@ impl<S: GameState> SearchTree<S> {
         }
     }
 
-    /// Creates the children of `idx` from `eval`'s priors; returns the clamped value.
-    fn expand(&mut self, idx: u32, eval: &Evaluation) -> f32 {
+    /// Creates the children of `idx` from the prior row (indexed by `Move::index`; only legal
+    /// moves' entries are read, and an unusable row means uniform); returns the clamped value.
+    fn expand(&mut self, idx: u32, value: f32, priors: Option<&[f32; Move::COUNT]>) -> f32 {
         let state = self.nodes[idx as usize].state.clone();
         let moves = state.legal_moves();
         debug_assert!(!moves.is_empty(), "non-terminal state without legal moves");
 
-        // Keep only legal moves' priors; fall back to uniform if nothing usable was given.
-        let mut total = 0.0f32;
-        if !eval.priors.is_empty() {
-            self.prior_buf.fill(0.0);
-            for (mv, p) in &eval.priors {
-                if moves.contains(*mv) {
-                    self.prior_buf[mv.index()] += p.max(0.0);
-                    total += p.max(0.0);
-                }
-            }
-        }
+        let total: f32 = priors
+            .map(|p| moves.iter().map(|mv| p[mv.index()].max(0.0)).sum())
+            .unwrap_or(0.0);
         let uniform = total <= 1e-12;
         let n = moves.len();
 
         let first_child = self.nodes.len() as u32;
         for mv in moves {
-            let prior = if uniform {
-                1.0 / n as f32
-            } else {
-                self.prior_buf[mv.index()] / total
+            let prior = match priors {
+                Some(p) if !uniform => p[mv.index()].max(0.0) / total,
+                _ => 1.0 / n as f32,
             };
             let mut child_state = state.clone();
             child_state.apply(mv);
@@ -414,7 +407,7 @@ impl<S: GameState> SearchTree<S> {
         if idx == 0 {
             self.apply_root_noise();
         }
-        eval.value.clamp(-1.0, 1.0)
+        value.clamp(-1.0, 1.0)
     }
 
     fn apply_root_noise(&mut self) {
@@ -500,7 +493,7 @@ pub struct Mcts<A: UtttAgent> {
     cfg: MctsConfig,
     rng: SmallRng,
     states: Vec<A::State>,
-    evals: Vec<Evaluation>,
+    evals: Evaluations,
     /// The last search, kept for inspection.
     tree: Option<SearchTree<A::State>>,
 }
@@ -513,7 +506,7 @@ impl<A: UtttAgent> Mcts<A> {
             cfg,
             rng,
             states: Vec::new(),
-            evals: Vec::new(),
+            evals: Evaluations::default(),
             tree: None,
         }
     }
@@ -547,7 +540,7 @@ impl<A: UtttAgent> Mcts<A> {
             if tree.claim(self.cfg.batch_size, &mut self.states) > 0 {
                 self.evals.clear();
                 self.agent.evaluate_batch(&self.states, &mut self.evals);
-                tree.resolve(&self.evals);
+                tree.resolve(&self.evals, 0);
             }
         }
         let result = tree.result();
@@ -675,7 +668,7 @@ mod tests {
             self.inner.choose_move(state)
         }
 
-        fn evaluate_batch(&mut self, states: &[BitState], out: &mut Vec<Evaluation>) {
+        fn evaluate_batch(&mut self, states: &[BitState], out: &mut Evaluations) {
             self.max_batch = self.max_batch.max(states.len());
             self.calls += 1;
             self.inner.evaluate_batch(states, out);
@@ -732,7 +725,7 @@ mod tests {
         let mut agent = RandomAgent::<BitState>::new(4);
         let mut tree = SearchTree::new(x_wins_in_one(), 50, 1.4, 1.0);
         let mut states = Vec::new();
-        let mut evals = Vec::new();
+        let mut evals = Evaluations::default();
         let mut rounds = 0;
         while !tree.is_done() {
             states.clear();
@@ -742,7 +735,7 @@ mod tests {
             if claimed > 0 {
                 evals.clear();
                 agent.evaluate_batch(&states, &mut evals);
-                tree.resolve(&evals);
+                tree.resolve(&evals, 0);
             }
             tree.assert_consistent();
             rounds += 1;
@@ -760,7 +753,7 @@ mod tests {
     fn root_noise_perturbs_priors_but_keeps_them_a_distribution() {
         let mut agent = RandomAgent::<BitState>::new(1);
         let mut states = Vec::new();
-        let mut evals = Vec::new();
+        let mut evals = Evaluations::default();
         let noise = RootNoise {
             alpha: 0.3,
             fraction: 0.25,
@@ -769,7 +762,7 @@ mod tests {
         let mut tree = SearchTree::new(BitState::initial(), 1, 1.4, 1.0).with_root_noise(noise);
         tree.claim(1, &mut states);
         agent.evaluate_batch(&states, &mut evals);
-        tree.resolve(&evals);
+        tree.resolve(&evals, 0);
         let priors: Vec<f32> = tree.root_children().iter().map(|c| c.1).collect();
         assert_eq!(priors.len(), 81);
         assert!((priors.iter().sum::<f32>() - 1.0).abs() < 1e-4);

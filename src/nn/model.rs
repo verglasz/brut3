@@ -7,7 +7,7 @@ use burn::tensor::activation::{log_softmax, softmax};
 use crate::game::{BitState, GameState, Move, MoveSet, Outcome, Player};
 
 /// Number of distinct moves, one per square of the big board (`Move::index`).
-pub const MOVES: usize = 81;
+pub const MOVES: usize = Move::COUNT;
 
 /// Logit added to illegal moves before the softmax: effectively zero probability.
 const ILLEGAL_LOGIT: f32 = -1e4;

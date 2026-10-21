@@ -120,7 +120,7 @@ fn main() {
 
 #[cfg(feature = "nn")]
 fn network_benchmarks() {
-    use ultimate_ttt_burn::agent::UtttAgent;
+    use ultimate_ttt_burn::agent::{Evaluations, UtttAgent};
     use ultimate_ttt_burn::nn::{BackendKind, ModelSpec, NetAgent};
 
     let kind = BackendKind::preferred();
@@ -149,7 +149,7 @@ fn network_benchmarks() {
     ] {
         let spec = ModelSpec::parse(&words).unwrap();
         let mut agent = NetAgent::new(spec.init(&kind.device()), kind);
-        let mut out = Vec::new();
+        let mut out = Evaluations::default();
         for batch in [16usize, 256, 2048] {
             // Warm up this shape first: kernel compilation and autotune happen on first use.
             out.clear();

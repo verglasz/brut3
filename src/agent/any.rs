@@ -7,7 +7,7 @@ use std::fmt;
 #[cfg(feature = "nn")]
 use std::path::PathBuf;
 
-use super::{Evaluation, GreedyAgent, MinimaxAgent, RandomAgent, UtttAgent};
+use super::{Evaluation, Evaluations, GreedyAgent, MinimaxAgent, RandomAgent, UtttAgent};
 use crate::game::{BitState, Move};
 use crate::mcts::{Mcts, MctsConfig};
 #[cfg(feature = "nn")]
@@ -266,7 +266,7 @@ impl UtttAgent for AnyAgent {
         }
     }
 
-    fn evaluate_batch(&mut self, states: &[BitState], out: &mut Vec<Evaluation>) {
+    fn evaluate_batch(&mut self, states: &[BitState], out: &mut Evaluations) {
         match self {
             AnyAgent::Random(a) => a.evaluate_batch(states, out),
             AnyAgent::Greedy(a) => a.evaluate_batch(states, out),

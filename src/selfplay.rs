@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
-use crate::agent::{Evaluation, UtttAgent};
+use crate::agent::{Evaluations, UtttAgent};
 use crate::game::{BitState, GameState, Move, Outcome};
 use crate::mcts::{RootNoise, SearchTree};
 
@@ -123,7 +123,7 @@ pub fn self_play<A: UtttAgent<State = BitState>>(
     let mut started = active.len();
     let mut states: Vec<BitState> = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut evals: Vec<Evaluation> = Vec::new();
+    let mut evals = Evaluations::default();
 
     while !active.is_empty() {
         // One round: every tree claims its leaves, one batched evaluation, every tree resolves.
@@ -142,7 +142,7 @@ pub fn self_play<A: UtttAgent<State = BitState>>(
             stats.leaves += states.len() as u64;
             for (game, &(from, to)) in active.iter_mut().zip(&spans) {
                 if to > from {
-                    game.tree.resolve(&evals[from..to]);
+                    game.tree.resolve(&evals, from);
                 }
             }
         }

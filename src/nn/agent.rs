@@ -7,7 +7,7 @@ use burn::DispatchDevice;
 use super::any_model::AnyModel;
 use super::backend::BackendKind;
 use super::model::{HostPrediction, expected_value};
-use crate::agent::{Evaluation, UtttAgent};
+use crate::agent::{Evaluation, Evaluations, UtttAgent};
 use crate::game::{BitState, GameState, Move};
 
 pub struct NetAgent {
@@ -88,14 +88,19 @@ impl UtttAgent for NetAgent {
         Self::evaluation(state, &p.wdl[0], p.policy.swap_remove(0))
     }
 
-    fn evaluate_batch(&mut self, states: &[BitState], out: &mut Vec<Evaluation>) {
+    fn evaluate_batch(&mut self, states: &[BitState], out: &mut Evaluations) {
         let p = self.predict(states);
-        out.extend(
-            states
-                .iter()
-                .zip(p.wdl.iter().zip(p.policy))
-                .map(|(s, (wdl, policy))| Self::evaluation(s, wdl, policy)),
-        );
+        for (state, (wdl, policy)) in states.iter().zip(p.wdl.iter().zip(&p.policy)) {
+            match state.outcome() {
+                Some(outcome) => out.push_value(outcome.value_for(state.to_move())),
+                None => {
+                    let row = out.push_row(expected_value(wdl));
+                    for (mv, p) in policy {
+                        row[mv.index()] = *p;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -132,14 +137,16 @@ mod tests {
         let mut won = x_wins_in_one();
         won.apply(X_WINNING_MOVE);
         assert_eq!(agent.evaluate(&won).value, -1.0);
-        let mut out = Vec::new();
+        let mut out = Evaluations::default();
         agent.evaluate_batch(&[BitState::initial(), won, x_wins_in_one()], &mut out);
         assert_eq!(out.len(), 3);
-        assert_eq!(out[1].value, -1.0);
-        assert!(out[1].priors.is_empty());
-        assert_eq!(out[0].priors.len(), 81);
-        assert_eq!(out[2].priors.len(), 7);
-        assert!(out.iter().all(|e| (-1.0..=1.0).contains(&e.value)));
+        assert_eq!(out.value(1), -1.0);
+        let nonzero = |i: usize| out.priors(i).unwrap().iter().filter(|&&p| p > 0.0).count();
+        assert_eq!(nonzero(0), 81);
+        assert_eq!(nonzero(1), 0, "terminal states get no priors");
+        assert_eq!(nonzero(2), 7);
+        assert!((out.priors(2).unwrap().iter().sum::<f32>() - 1.0).abs() < 1e-4);
+        assert!((0..3).all(|i| (-1.0..=1.0).contains(&out.value(i))));
     }
 
     #[test]

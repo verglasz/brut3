@@ -145,6 +145,9 @@ pub struct Move {
 }
 
 impl Move {
+    /// Number of distinct moves: one per square of the big board.
+    pub const COUNT: usize = 81;
+
     pub const fn new(board: Square, square: Square) -> Self {
         Self { board, square }
     }
@@ -154,9 +157,9 @@ impl Move {
         self.board.index() * 9 + self.square.index()
     }
 
-    /// Inverse of [`Move::index`]. Panics if `index >= 81`.
+    /// Inverse of [`Move::index`]. Panics if `index >= Move::COUNT`.
     pub const fn from_index(index: usize) -> Self {
-        assert!(index < 81, "move index out of range");
+        assert!(index < Self::COUNT, "move index out of range");
         Self::new(Square::from_index(index / 9), Square::from_index(index % 9))
     }
 }

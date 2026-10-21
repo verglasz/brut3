@@ -32,6 +32,84 @@ impl Evaluation {
     }
 }
 
+/// Evaluations of a batch of positions, laid out for the search rather than for reading: one
+/// value per position and, once any position has priors, one dense row of [`Move::COUNT`]
+/// floats per position indexed by [`Move::index`]. The search only reads the entries of legal
+/// moves, so a row only needs those filled; a position without priors in a batch that has
+/// them gets an all-zero row, which the search treats as uniform.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Evaluations {
+    values: Vec<f32>,
+    /// Empty while no position has priors, otherwise `values.len() * Move::COUNT`.
+    priors: Vec<f32>,
+}
+
+impl Evaluations {
+    pub fn clear(&mut self) {
+        self.values.clear();
+        self.priors.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn has_priors(&self) -> bool {
+        !self.priors.is_empty()
+    }
+
+    /// Appends a position with no priors.
+    pub fn push_value(&mut self, value: f32) {
+        self.values.push(value);
+        if self.has_priors() {
+            self.priors.resize(self.values.len() * Move::COUNT, 0.0);
+        }
+    }
+
+    /// Appends a position and returns its zeroed prior row to fill in.
+    pub fn push_row(&mut self, value: f32) -> &mut [f32; Move::COUNT] {
+        self.values.push(value);
+        self.priors.resize(self.values.len() * Move::COUNT, 0.0);
+        let start = (self.values.len() - 1) * Move::COUNT;
+        (&mut self.priors[start..start + Move::COUNT])
+            .try_into()
+            .expect("row of Move::COUNT entries")
+    }
+
+    /// Appends a single evaluation, scattering its priors into a row.
+    pub fn push(&mut self, eval: &Evaluation) {
+        if eval.priors.is_empty() {
+            self.push_value(eval.value);
+        } else {
+            let row = self.push_row(eval.value);
+            for (mv, p) in &eval.priors {
+                row[mv.index()] += p;
+            }
+        }
+    }
+
+    pub fn value(&self, i: usize) -> f32 {
+        self.values[i]
+    }
+
+    /// Prior row of position `i`, or `None` if the batch carries no priors at all.
+    pub fn priors(&self, i: usize) -> Option<&[f32; Move::COUNT]> {
+        if !self.has_priors() {
+            return None;
+        }
+        let start = i * Move::COUNT;
+        Some(
+            (&self.priors[start..start + Move::COUNT])
+                .try_into()
+                .expect("row of Move::COUNT entries"),
+        )
+    }
+}
+
 /// An Ultimate Tic Tac Toe agent.
 ///
 /// The state representation is the agent's choice ([`UtttAgent::State`]); callers convert
@@ -70,11 +148,10 @@ pub trait UtttAgent {
 
     /// Evaluates many positions at once, appending to `out`. The default calls
     /// [`UtttAgent::evaluate`] for each; agents backed by a network override it to batch.
-    fn evaluate_batch(&mut self, states: &[Self::State], out: &mut Vec<Evaluation>) {
-        out.reserve(states.len());
+    fn evaluate_batch(&mut self, states: &[Self::State], out: &mut Evaluations) {
         for s in states {
             let e = self.evaluate(s);
-            out.push(e);
+            out.push(&e);
         }
     }
 }
@@ -107,8 +184,32 @@ mod tests {
         let e = agent.evaluate(&BitState::initial());
         assert!(e.priors.is_empty());
         assert!([-1.0, 0.0, 1.0].contains(&e.value));
-        let mut out = Vec::new();
+        let mut out = Evaluations::default();
         agent.evaluate_batch(&[BitState::initial(); 3], &mut out);
         assert_eq!(out.len(), 3);
+        assert!(!out.has_priors());
+        assert!(out.priors(0).is_none());
+    }
+
+    #[test]
+    fn evaluations_mix_rows_and_values() {
+        let mut out = Evaluations::default();
+        out.push_value(0.5);
+        let row = out.push_row(-0.25);
+        row[Move::from_index(3).index()] = 1.0;
+        out.push(&Evaluation {
+            value: 0.0,
+            priors: vec![(Move::from_index(80), 0.5), (Move::from_index(80), 0.5)],
+        });
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            (out.value(0), out.value(1), out.value(2)),
+            (0.5, -0.25, 0.0)
+        );
+        assert!(out.priors(0).unwrap().iter().all(|&p| p == 0.0));
+        assert_eq!(out.priors(1).unwrap()[3], 1.0);
+        assert_eq!(out.priors(2).unwrap()[80], 1.0);
+        out.clear();
+        assert!(out.is_empty() && !out.has_priors());
     }
 }
