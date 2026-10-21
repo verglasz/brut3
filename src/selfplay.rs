@@ -279,6 +279,17 @@ pub struct Side<'a, A> {
     pub search: MctsConfig,
 }
 
+/// Exploration applied to both sides of a [`lockstep_match`] so that its games differ. Two
+/// deterministic searches otherwise play the same game every time, one as X and one as O.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MatchExploration {
+    /// Plies per game sampled in proportion to visit counts (temperature 1) before each side
+    /// falls back to its own `temperature` (argmax at `0`).
+    pub temperature_moves: usize,
+    /// Dirichlet `(alpha, fraction)` noise on the root priors of every search, as in self-play.
+    pub root_noise: Option<(f32, f32)>,
+}
+
 /// How a match went, from `a`'s side.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MatchTally {
@@ -297,6 +308,7 @@ struct MatchGame {
     /// The search of the side to move.
     tree: SearchTree<BitState>,
     a_plays: Player,
+    plies: usize,
     /// Finished games stay in place (a batch in flight refers to games by index) and are
     /// skipped.
     finished: bool,
@@ -360,13 +372,26 @@ impl SideBatch {
     }
 }
 
-fn search_tree(state: BitState, search: &MctsConfig) -> SearchTree<BitState> {
-    SearchTree::new(
+fn search_tree(
+    state: BitState,
+    search: &MctsConfig,
+    root_noise: Option<(f32, f32)>,
+    rng: &mut SmallRng,
+) -> SearchTree<BitState> {
+    let tree = SearchTree::new(
         state,
         search.simulations,
         search.c_puct,
         search.virtual_loss,
-    )
+    );
+    match root_noise {
+        Some((alpha, fraction)) => tree.with_root_noise(RootNoise {
+            alpha,
+            fraction,
+            seed: rng.random(),
+        }),
+        None => tree,
+    }
 }
 
 /// Games of `side_a` whose search is done play their move; the side to move changes, so the
@@ -375,6 +400,7 @@ fn advance_match(
     games: &mut [MatchGame],
     side_a: bool,
     searches: (&MctsConfig, &MctsConfig),
+    exploration: &MatchExploration,
     rng: &mut SmallRng,
     tally: &mut MatchTally,
     on_game: &mut impl FnMut(usize),
@@ -384,12 +410,18 @@ fn advance_match(
         if game.finished || game.a_to_move() != side_a || !game.tree.is_done() {
             continue;
         }
+        let temperature = if game.plies < exploration.temperature_moves {
+            1.0
+        } else {
+            search.temperature
+        };
         let mv = game
             .tree
             .result()
-            .sample_move(search.temperature, rng)
+            .sample_move(temperature, rng)
             .expect("non-terminal position has moves");
         game.state.apply(mv);
+        game.plies += 1;
         tally.moves += 1;
         match game.state.outcome() {
             Some(outcome) => {
@@ -415,7 +447,7 @@ fn advance_match(
                 } else {
                     searches.1
                 };
-                game.tree = search_tree(game.state, next);
+                game.tree = search_tree(game.state, next, exploration.root_noise, rng);
             }
         }
     }
@@ -424,33 +456,35 @@ fn advance_match(
 /// Plays `games` games between two searches, all at once: `a` takes X in even-numbered games
 /// and O in odd-numbered ones. Every round, the leaves claimed by all trees of one side go to
 /// that side's evaluator in one call, and as in [`self_play`] the two sides take turns so one
-/// side's tree work overlaps the other's evaluation. Moves follow each side's `temperature`
-/// (argmax at `0`). `on_game` is called after each finished game with the number so far.
+/// side's tree work overlaps the other's evaluation. Moves follow `exploration` for the
+/// opening plies and each side's `temperature` after that (argmax at `0`). `on_game` is
+/// called after each finished game with the number so far.
 pub fn lockstep_match<A: UtttAgent<State = BitState>, B: UtttAgent<State = BitState>>(
     a: Side<'_, A>,
     b: Side<'_, B>,
     games: usize,
+    exploration: &MatchExploration,
     mut on_game: impl FnMut(usize),
 ) -> MatchTally {
     let mut tally = MatchTally::default();
     let mut rng_a = SmallRng::seed_from_u64(a.search.seed);
     let mut rng_b = SmallRng::seed_from_u64(b.search.seed);
-    let mut active: Vec<MatchGame> = (0..games)
-        .map(|g| {
-            let a_plays = if g % 2 == 0 { Player::X } else { Player::O };
-            let opener = if a_plays == Player::X {
-                &a.search
-            } else {
-                &b.search
-            };
-            MatchGame {
-                state: BitState::initial(),
-                tree: search_tree(BitState::initial(), opener),
-                a_plays,
-                finished: false,
-            }
-        })
-        .collect();
+    let mut active: Vec<MatchGame> = Vec::with_capacity(games);
+    for g in 0..games {
+        let a_plays = if g % 2 == 0 { Player::X } else { Player::O };
+        let (opener, rng) = if a_plays == Player::X {
+            (&a.search, &mut rng_a)
+        } else {
+            (&b.search, &mut rng_b)
+        };
+        active.push(MatchGame {
+            state: BitState::initial(),
+            tree: search_tree(BitState::initial(), opener, exploration.root_noise, rng),
+            a_plays,
+            plies: 0,
+            finished: false,
+        });
+    }
     let (mut batch_a, mut batch_b) = (SideBatch::default(), SideBatch::default());
     let searches = (&a.search, &b.search);
 
@@ -467,6 +501,7 @@ pub fn lockstep_match<A: UtttAgent<State = BitState>, B: UtttAgent<State = BitSt
                 &mut active,
                 true,
                 searches,
+                exploration,
                 &mut rng_a,
                 &mut tally,
                 &mut on_game,
@@ -479,6 +514,7 @@ pub fn lockstep_match<A: UtttAgent<State = BitState>, B: UtttAgent<State = BitSt
                 &mut active,
                 false,
                 searches,
+                exploration,
                 &mut rng_b,
                 &mut tally,
                 &mut on_game,
@@ -597,6 +633,7 @@ mod tests {
                 search: search(1, 4),
             },
             6,
+            &MatchExploration::default(),
             |n| seen = n,
         );
         assert_eq!(seen, 6);
@@ -605,5 +642,54 @@ mod tests {
         assert_eq!(tally.a_wins, tally.a_wins_as_x + tally.a_wins_as_o);
         assert!(tally.moves >= 6 * 17);
         assert!(tally.a_wins >= 4, "{tally:?}");
+    }
+
+    /// Two deterministic searches play one game per colour; exploration makes the games differ.
+    #[test]
+    fn match_exploration_diversifies_the_games() {
+        // Rollout-free evaluator: value 0, no priors, so the search is deterministic.
+        struct Flat;
+        impl UtttAgent for Flat {
+            type State = BitState;
+            fn choose_move(&mut self, state: &BitState) -> Move {
+                state.legal_moves().iter().next().unwrap()
+            }
+            fn evaluate(&mut self, _state: &BitState) -> crate::agent::Evaluation {
+                crate::agent::Evaluation::value_only(0.0)
+            }
+        }
+        let search = MctsConfig {
+            simulations: 12,
+            batch_size: 4,
+            ..Default::default()
+        };
+        let moves = |exploration: &MatchExploration| {
+            let tally = lockstep_match(
+                Side {
+                    evaluator: &mut Flat,
+                    search: search.clone(),
+                },
+                Side {
+                    evaluator: &mut Flat,
+                    search: search.clone(),
+                },
+                4,
+                exploration,
+                |_| {},
+            );
+            tally.moves
+        };
+        let plain = moves(&MatchExploration::default());
+        // Without exploration games 0 and 2 (and 1 and 3) are identical, so the move count is
+        // twice that of two games.
+        assert_eq!(plain % 2, 0);
+        let noisy = moves(&MatchExploration {
+            temperature_moves: 4,
+            root_noise: Some((0.3, 0.25)),
+        });
+        assert!(noisy >= 4 * 17);
+        // Not a strict guarantee, but with 4 sampled plies and root noise four 12-simulation
+        // games collapsing to two identical pairs is vanishingly unlikely.
+        assert_ne!(noisy, plain);
     }
 }

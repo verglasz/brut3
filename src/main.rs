@@ -96,6 +96,13 @@ struct LoopArgs {
     eval_games: usize,
     #[arg(long, default_value_t = 200)]
     eval_simulations: u32,
+    /// Matches: plies per game sampled by visit count before argmax, so that the games of a
+    /// match differ (two deterministic searches otherwise replay one game per colour).
+    #[arg(long, default_value_t = 6)]
+    eval_temperature_moves: usize,
+    /// Matches: Dirichlet alpha of the root noise (0 disables it).
+    #[arg(long, default_value_t = 0.0)]
+    eval_dirichlet_alpha: f32,
     /// Candidate score (wins + draws/2 over games) needed to replace the best model.
     #[arg(long, default_value_t = 0.55)]
     promote_threshold: f32,
@@ -236,7 +243,7 @@ fn play(spec: &[String]) -> Result<(), String> {
 #[cfg(feature = "nn")]
 fn run_loop(args: &LoopArgs) -> Result<(), String> {
     use ultimate_ttt_burn::nn::{BackendKind, LoopConfig, ModelSpec, TrainOptions, run_loop};
-    use ultimate_ttt_burn::selfplay::SelfPlayConfig;
+    use ultimate_ttt_burn::selfplay::{MatchExploration, SelfPlayConfig};
 
     let backend = match &args.backend {
         Some(name) => name.parse::<BackendKind>()?,
@@ -280,6 +287,11 @@ fn run_loop(args: &LoopArgs) -> Result<(), String> {
         eval_games: args.eval_games,
         eval_simulations: args.eval_simulations,
         eval_batch: args.tree_batch,
+        eval_exploration: MatchExploration {
+            temperature_moves: args.eval_temperature_moves,
+            root_noise: (args.eval_dirichlet_alpha > 0.0)
+                .then_some((args.eval_dirichlet_alpha, 0.25)),
+        },
         promote_threshold: args.promote_threshold,
         baseline,
     };

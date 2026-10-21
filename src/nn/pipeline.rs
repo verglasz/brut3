@@ -13,8 +13,8 @@ use super::any_model::{AnyModel, ModelSpec, Recorder};
 use super::backend::BackendKind;
 use super::train::{Dataset, Sample, TrainOptions, TrainReport, generate_parallel, train};
 use crate::agent::AgentSpec;
-use crate::benchmark::{MatchResult, play_match};
-use crate::selfplay::{SelfPlayConfig, SelfPlayStats};
+use crate::benchmark::{MatchResult, play_match_with};
+use crate::selfplay::{MatchExploration, SelfPlayConfig, SelfPlayStats};
 
 /// Trains a model of kind `spec` on `data`: fresh weights, or continuing from the weights at
 /// `start_from` (saved by [`AnyModel::save`]).
@@ -131,6 +131,8 @@ pub struct LoopConfig {
     pub eval_games: usize,
     pub eval_simulations: u32,
     pub eval_batch: usize,
+    /// Opening randomness of the promotion and baseline matches, so that their games differ.
+    pub eval_exploration: MatchExploration,
     /// The candidate replaces the best model when its match score reaches this.
     pub promote_threshold: f32,
     /// Optional fixed opponent the best model is also measured against each generation.
@@ -320,10 +322,11 @@ pub fn run_loop(
             batch_size: cfg.eval_batch,
             seed: generation as u64,
         };
-        let eval = play_match(
+        let eval = play_match_with(
             &searcher(&candidate_path),
             &searcher(&best),
             cfg.eval_games,
+            &cfg.eval_exploration,
             |_| {},
         )?;
         let promoted = eval.score_a() >= cfg.promote_threshold;
@@ -345,7 +348,13 @@ pub fn run_loop(
 
         let baseline_score = match &cfg.baseline {
             Some(baseline) => {
-                let m = play_match(&searcher(&best), baseline, cfg.eval_games, |_| {})?;
+                let m = play_match_with(
+                    &searcher(&best),
+                    baseline,
+                    cfg.eval_games,
+                    &cfg.eval_exploration,
+                    |_| {},
+                )?;
                 log(format!(
                     "  best vs {baseline}: {}-{}-{} (score {:.3})",
                     m.a_wins,
@@ -445,6 +454,10 @@ mod tests {
             eval_games: 2,
             eval_simulations: 8,
             eval_batch: 4,
+            eval_exploration: MatchExploration {
+                temperature_moves: 2,
+                root_noise: Some((0.3, 0.25)),
+            },
             promote_threshold: 0.5,
             baseline: Some(AgentSpec::Random { seed: 1 }),
         };

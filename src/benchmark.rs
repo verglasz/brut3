@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::agent::{AgentSpec, UtttAgent};
 use crate::game::{BitState, GameState, Outcome, Player};
-use crate::selfplay::{Side, lockstep_match};
+use crate::selfplay::{MatchExploration, Side, lockstep_match};
 
 /// Outcome of a series of games between two agents, alternating colours.
 #[derive(Clone, Debug, PartialEq)]
@@ -66,6 +66,18 @@ pub fn play_match(
     a: &AgentSpec,
     b: &AgentSpec,
     games: usize,
+    on_game: impl FnMut(usize),
+) -> Result<MatchResult, String> {
+    play_match_with(a, b, games, &MatchExploration::default(), on_game)
+}
+
+/// [`play_match`] with opening exploration for the lockstep case, so that two deterministic
+/// searches do not replay the same game. Ignored when either agent is not a search.
+pub fn play_match_with(
+    a: &AgentSpec,
+    b: &AgentSpec,
+    games: usize,
+    exploration: &MatchExploration,
     mut on_game: impl FnMut(usize),
 ) -> Result<MatchResult, String> {
     let start = Instant::now();
@@ -94,6 +106,7 @@ pub fn play_match(
                 search: search_b,
             },
             games,
+            exploration,
             on_game,
         );
         result.a_wins = tally.a_wins;
