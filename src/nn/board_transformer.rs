@@ -10,8 +10,8 @@
 //! tokens go through pre-norm encoder layers with all-to-all attention, and two perceptron
 //! heads read the flattened final residual stream to produce the move and outcome logits.
 
+use burn::nn::Embedding;
 use burn::nn::transformer::TransformerEncoder;
-use burn::nn::{Embedding, Linear, LinearConfig};
 use burn::prelude::*;
 
 use super::heads::{
@@ -136,11 +136,15 @@ pub struct BoardTransformer<B: Backend> {
 
 /// [`BoardTransformerV2`]: the same encoder with per-token heads. A class token
 /// ([`ClsReadout`]) goes through the encoder with the nine board tokens and is read out as
-/// the value; the policy is one linear map, shared by the board tokens, from a token to the
-/// logits of its nine cells. Both read the stream through one final layer norm.
+/// the value; the policy is one perceptron, shared by the board tokens, from a token and the
+/// class token's readout to the logits of the token's nine cells. Both read the stream
+/// through one final layer norm.
 #[derive(Config, Debug, PartialEq)]
 pub struct BoardTransformerV2Config {
     pub body: BodyConfig,
+    /// Hidden width of the policy and value perceptrons; `0` means `d_model`.
+    #[config(default = 0)]
+    pub d_head: usize,
 }
 
 impl Default for BoardTransformerV2Config {
@@ -150,12 +154,25 @@ impl Default for BoardTransformerV2Config {
 }
 
 impl BoardTransformerV2Config {
+    fn d_head(&self) -> usize {
+        if self.d_head == 0 {
+            self.body.d_model
+        } else {
+            self.d_head
+        }
+    }
+
     pub fn init<B: Backend>(&self, device: &B::Device) -> BoardTransformerV2<B> {
+        let d = self.body.d_model;
         BoardTransformerV2 {
             config: self.clone(),
             encoder: BoardEncoder::init(&self.body, device),
-            policy: LinearConfig::new(self.body.d_model, CELLS).init(device),
-            cls: ClsReadoutConfig::new(self.body.d_model, Verdict::ALL.len()).init(device),
+            policy: PerceptronConfig::new(2 * d, self.d_head(), CELLS)
+                .with_dropout(self.body.dropout)
+                .init(device),
+            cls: ClsReadoutConfig::new(d, Verdict::ALL.len(), self.d_head())
+                .with_dropout(self.body.dropout)
+                .init(device),
         }
     }
 }
@@ -165,7 +182,8 @@ pub struct BoardTransformerV2<B: Backend> {
     #[module(skip)]
     config: BoardTransformerV2Config,
     encoder: BoardEncoder<B>,
-    policy: Linear<B>,
+    /// Shared by the tokens: a token with the global readout appended, to its move logits.
+    policy: Perceptron<B>,
     cls: ClsReadout<B>,
 }
 
@@ -263,9 +281,13 @@ impl<B: Backend> Model<B> for BoardTransformerV2<B> {
         let tokens = self.encoder.tokens(input);
         let n = tokens.dims()[0];
         let stream = self.encoder.body(self.cls.prepend(tokens));
-        let (wdl, boards) = self.cls.split(stream);
+        let (global, boards) = self.cls.split(stream);
+        let wdl = self.cls.output(global.clone());
         // Board-major `[n, 9, 9]` is `Move::index` order (`board * 9 + square`).
-        let policy = self.policy.forward(boards).reshape([n, MOVES]);
+        let policy = self
+            .policy
+            .forward(ClsReadout::with_global(global, boards))
+            .reshape([n, MOVES]);
         Prediction { wdl, policy }
     }
 }

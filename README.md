@@ -185,11 +185,12 @@ The search is generic over the agent that evaluates leaves:
   cell tokens: content, position, the cell's board status, forced flag and legality
   embeddings. Both are selected with `--model board-transformer [d_model] [layers] [heads]` or
   `--model cell-transformer ...`. `board-v2` and `cell-v2` keep the same encoders but replace
-  the perceptron heads, which hold most of the cell model's parameters, with per-token heads:
-  the policy is one shared linear map per token (a board token to its nine cells' logits, a
-  cell token to its own), and the value comes from a class token (`ClsReadout`) that goes
-  through the encoder with the board or cell tokens and is read off the end through a final
-  layer norm and a linear map to the three verdict logits.
+  the perceptron heads, which hold most of the cell model's parameters, with per-token heads.
+  A class token (`ClsReadout`) goes through the encoder with the board or cell tokens and is
+  read off the end through a final layer norm: a perceptron on it gives the three verdict
+  logits, and the policy is one perceptron shared by the tokens, from a token concatenated
+  with that global readout to the token's move logits (a board token's nine cells, a cell
+  token's own move).
 - `benchmark` plays round-robin matches between any agents (colours alternate) and prints
   pairwise results and standings, for comparing trained models with each other and with the
   search and heuristic baselines.

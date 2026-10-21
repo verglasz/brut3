@@ -9,8 +9,8 @@
 //! perceptron heads read the flattened final residual stream to produce the move and outcome
 //! logits.
 
+use burn::nn::Embedding;
 use burn::nn::transformer::TransformerEncoder;
-use burn::nn::{Embedding, Linear, LinearConfig};
 use burn::prelude::*;
 
 use super::heads::{
@@ -132,11 +132,15 @@ pub struct CellTransformer<B: Backend> {
 
 /// [`CellTransformerV2`]: the same encoder with per-token heads. A class token
 /// ([`ClsReadout`]) goes through the encoder with the 81 cell tokens and is read out as the
-/// value; each cell token is one move, so the policy is one linear map, shared by the cell
-/// tokens, from a token to its logit. Both read the stream through one final layer norm.
+/// value; each cell token is one move, so the policy is one perceptron, shared by the cell
+/// tokens, from a token and the class token's readout to the token's logit. Both read the
+/// stream through one final layer norm.
 #[derive(Config, Debug, PartialEq)]
 pub struct CellTransformerV2Config {
     pub body: BodyConfig,
+    /// Hidden width of the policy and value perceptrons; `0` means `d_model`.
+    #[config(default = 0)]
+    pub d_head: usize,
 }
 
 impl Default for CellTransformerV2Config {
@@ -146,12 +150,25 @@ impl Default for CellTransformerV2Config {
 }
 
 impl CellTransformerV2Config {
+    fn d_head(&self) -> usize {
+        if self.d_head == 0 {
+            self.body.d_model
+        } else {
+            self.d_head
+        }
+    }
+
     pub fn init<B: Backend>(&self, device: &B::Device) -> CellTransformerV2<B> {
+        let d = self.body.d_model;
         CellTransformerV2 {
             config: self.clone(),
             encoder: CellEncoder::init(&self.body, device),
-            policy: LinearConfig::new(self.body.d_model, 1).init(device),
-            cls: ClsReadoutConfig::new(self.body.d_model, Verdict::ALL.len()).init(device),
+            policy: PerceptronConfig::new(2 * d, self.d_head(), 1)
+                .with_dropout(self.body.dropout)
+                .init(device),
+            cls: ClsReadoutConfig::new(d, Verdict::ALL.len(), self.d_head())
+                .with_dropout(self.body.dropout)
+                .init(device),
         }
     }
 }
@@ -161,7 +178,8 @@ pub struct CellTransformerV2<B: Backend> {
     #[module(skip)]
     config: CellTransformerV2Config,
     encoder: CellEncoder<B>,
-    policy: Linear<B>,
+    /// Shared by the tokens: a token with the global readout appended, to its move logits.
+    policy: Perceptron<B>,
     cls: ClsReadout<B>,
 }
 
@@ -262,9 +280,13 @@ impl<B: Backend> Model<B> for CellTransformerV2<B> {
         let tokens = self.encoder.tokens(input);
         let n = tokens.dims()[0];
         let stream = self.encoder.body(self.cls.prepend(tokens));
-        let (wdl, cells) = self.cls.split(stream);
+        let (global, cells) = self.cls.split(stream);
+        let wdl = self.cls.output(global.clone());
         // Cell tokens are in `Move::index` order, one logit each.
-        let policy = self.policy.forward(cells).reshape([n, MOVES]);
+        let policy = self
+            .policy
+            .forward(ClsReadout::with_global(global, cells))
+            .reshape([n, MOVES]);
         Prediction { wdl, policy }
     }
 }

@@ -51,8 +51,8 @@ pub struct Perceptron<B: Backend> {
 }
 
 impl<B: Backend> Perceptron<B> {
-    /// `[batch, d_input] -> [batch, d_output]`
-    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+    /// `[..., d_input] -> [..., d_output]`, applied to the last dimension.
+    pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
         let h = self
             .dropout
             .forward(self.activation.forward(self.hidden.forward(x)));
@@ -95,12 +95,16 @@ impl BodyConfig {
 
 /// A class token for the per-token models: a learned token prepended to the encoder input, so
 /// that it mixes with every position in every layer, and read off the end of the stream
-/// through a final layer norm and a linear map to `d_output`. The same final norm is applied
+/// through a final layer norm and a perceptron to `d_output`. The same final norm is applied
 /// to the other tokens for the per-token heads, as in GPT-2's `ln_f`.
 #[derive(Config, Debug, PartialEq)]
 pub struct ClsReadoutConfig {
     pub d_model: usize,
     pub d_output: usize,
+    /// Hidden width of the output perceptron.
+    pub d_hidden: usize,
+    #[config(default = 0.0)]
+    pub dropout: f64,
 }
 
 impl ClsReadoutConfig {
@@ -112,7 +116,9 @@ impl ClsReadoutConfig {
             }
             .init([1, 1, self.d_model], device),
             norm: LayerNormConfig::new(self.d_model).init(device),
-            output: LinearConfig::new(self.d_model, self.d_output).init(device),
+            output: PerceptronConfig::new(self.d_model, self.d_hidden, self.d_output)
+                .with_dropout(self.dropout)
+                .init(device),
         }
     }
 }
@@ -122,7 +128,7 @@ pub struct ClsReadout<B: Backend> {
     /// The class token, `[1, 1, d_model]`.
     cls: Param<Tensor<B, 3>>,
     norm: LayerNorm<B>,
-    output: Linear<B>,
+    output: Perceptron<B>,
 }
 
 impl<B: Backend> ClsReadout<B> {
@@ -132,13 +138,26 @@ impl<B: Backend> ClsReadout<B> {
         Tensor::cat(vec![self.cls.val().expand([n, 1, d]), tokens], 1)
     }
 
-    /// Splits the encoded stream `[batch, tokens + 1, d_model]` into the class output
-    /// `[batch, d_output]` and the normalised token stream `[batch, tokens, d_model]`.
+    /// Splits the encoded stream `[batch, tokens + 1, d_model]` into the normalised class
+    /// token `[batch, d_model]` (the global readout) and the normalised token stream
+    /// `[batch, tokens, d_model]`.
     pub fn split(&self, stream: Tensor<B, 3>) -> (Tensor<B, 2>, Tensor<B, 3>) {
         let [n, t1, d] = stream.dims();
         let stream = self.norm.forward(stream);
         let cls = stream.clone().slice([0..n, 0..1]).reshape([n, d]);
-        (self.output.forward(cls), stream.slice([0..n, 1..t1]))
+        (cls, stream.slice([0..n, 1..t1]))
+    }
+
+    /// The class output `[batch, d_output]` from the readout given by [`ClsReadout::split`].
+    pub fn output(&self, cls: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.output.forward(cls)
+    }
+
+    /// Every token with the global readout appended: `[batch, tokens, 2 * d_model]`, the input
+    /// of a per-token head that should see the whole position.
+    pub fn with_global(cls: Tensor<B, 2>, tokens: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [n, t, d] = tokens.dims();
+        Tensor::cat(vec![tokens, cls.reshape([n, 1, d]).expand([n, t, d])], 2)
     }
 }
 
