@@ -64,6 +64,10 @@ struct LoopArgs {
     /// Continue from `<dir>/best` and the recorded history.
     #[arg(long)]
     resume: bool,
+    /// Start a fresh run from this saved model (path stem of its `.bpk`/`.json`) instead of
+    /// random weights; its shape must match `--model`.
+    #[arg(long, conflicts_with = "resume")]
+    init: Option<std::path::PathBuf>,
     #[arg(long, default_value_t = 10)]
     generations: usize,
     /// Self-play games of the first generation.
@@ -336,6 +340,7 @@ fn run_loop(args: &LoopArgs) -> Result<(), String> {
         backend,
         dir: args.dir.clone(),
         resume: args.resume,
+        init: args.init.clone(),
         generations: args.generations,
         games: args.games,
         selfplay: SelfPlayConfig {

@@ -128,6 +128,9 @@ pub struct LoopConfig {
     pub dir: PathBuf,
     /// Continue from `dir/best` and the existing history instead of fresh weights.
     pub resume: bool,
+    /// Saved model (path stem) to start a fresh run from instead of random weights; it must
+    /// have the shape of `spec`.
+    pub init: Option<PathBuf>,
     pub generations: usize,
     /// Self-play games of the first generation.
     pub games: usize,
@@ -330,6 +333,24 @@ pub fn run_loop(
             "resuming from {} after {first} generations",
             best.display()
         ));
+    } else if let Some(init) = &cfg.init {
+        let model = AnyModel::load(init, &device)?;
+        if model.spec() != cfg.spec {
+            return Err(format!(
+                "{} holds a {} model, not {}",
+                init.display(),
+                model.spec(),
+                cfg.spec
+            ));
+        }
+        log(format!(
+            "generation 0: {} ({} parameters) from {} as the first best model",
+            cfg.spec,
+            model.num_params(),
+            init.display()
+        ));
+        model.save(&best)?;
+        let _ = std::fs::remove_file(cfg.dir.join("history.jsonl"));
     } else {
         let model = cfg.spec.init(&device);
         log(format!(
@@ -587,6 +608,7 @@ mod tests {
             backend: BackendKind::preferred(),
             dir: PathBuf::new(),
             resume: false,
+            init: None,
             generations: 1,
             games: 100,
             games_growth: 2.0,
@@ -650,6 +672,7 @@ mod tests {
             backend: BackendKind::preferred(),
             dir: dir.clone(),
             resume: false,
+            init: None,
             generations: 2,
             games: 6,
             games_growth: 1.0,
