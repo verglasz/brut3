@@ -107,9 +107,16 @@ struct LoopArgs {
     #[arg(long, default_value_t = 0.55)]
     promote_threshold: f32,
     /// Fixed opponent to measure the best model against each generation, e.g. `mcts 200`;
-    /// `none` to skip.
+    /// repeat the flag for several, `none` to skip.
     #[arg(long, default_value = "mcts 200")]
-    baseline: String,
+    baseline: Vec<String>,
+    /// Games of each baseline match (colours alternate).
+    #[arg(long, default_value_t = 10)]
+    baseline_games: usize,
+    /// Stop once this much wall-clock time is spent, checked between generations (the next
+    /// generation is estimated from the mean so far); `--generations` is the other limit.
+    #[arg(long)]
+    max_minutes: Option<f64>,
     #[arg(long, default_value_t = 0)]
     seed: u64,
 }
@@ -250,13 +257,16 @@ fn run_loop(args: &LoopArgs) -> Result<(), String> {
         None => BackendKind::preferred(),
     };
     let model_words: Vec<&str> = args.model.split_whitespace().collect();
-    let baseline = match args.baseline.trim() {
-        "" | "none" => None,
-        words => {
-            let words: Vec<&str> = words.split_whitespace().collect();
-            Some(AgentSpec::parse(&words)?)
+    let mut baselines = Vec::new();
+    for spec in &args.baseline {
+        match spec.trim() {
+            "" | "none" => {}
+            words => {
+                let words: Vec<&str> = words.split_whitespace().collect();
+                baselines.push(AgentSpec::parse(&words)?);
+            }
         }
-    };
+    }
     let cfg = LoopConfig {
         spec: ModelSpec::parse(&model_words)?,
         backend,
@@ -293,7 +303,11 @@ fn run_loop(args: &LoopArgs) -> Result<(), String> {
                 .then_some((args.eval_dirichlet_alpha, 0.25)),
         },
         promote_threshold: args.promote_threshold,
-        baseline,
+        baselines,
+        baseline_games: args.baseline_games,
+        time_budget: args
+            .max_minutes
+            .map(|m| std::time::Duration::from_secs_f64(m * 60.0)),
     };
     let reports = run_loop(&cfg, |line| println!("{line}"))?;
     println!(

@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use burn::module::Module;
 use burn::prelude::Device;
@@ -137,8 +137,13 @@ pub struct LoopConfig {
     pub eval_exploration: MatchExploration,
     /// The candidate replaces the best model when its match score reaches this.
     pub promote_threshold: f32,
-    /// Optional fixed opponent the best model is also measured against each generation.
-    pub baseline: Option<AgentSpec>,
+    /// Fixed opponents the best model is also measured against each generation.
+    pub baselines: Vec<AgentSpec>,
+    /// Games of each baseline match.
+    pub baseline_games: usize,
+    /// Stop after the generation that is expected to exhaust this much wall-clock time (the
+    /// next generation is estimated from the mean so far).
+    pub time_budget: Option<Duration>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -151,8 +156,8 @@ pub struct GenerationReport {
     /// Candidate against the previous best.
     pub eval: MatchResult,
     pub promoted: bool,
-    /// Best model (after promotion) against the baseline, if one was given.
-    pub baseline_score: Option<f32>,
+    /// Best model (after promotion) against each baseline, in `LoopConfig::baselines` order.
+    pub baseline_scores: Vec<(AgentSpec, f32)>,
     pub seconds: f32,
 }
 
@@ -190,7 +195,11 @@ impl GenerationReport {
                 "losses": self.eval.b_wins,
             },
             "promoted": self.promoted,
-            "baseline_score": self.baseline_score,
+            "baselines": self
+                .baseline_scores
+                .iter()
+                .map(|(spec, score)| (spec.to_string(), json!(score)))
+                .collect::<serde_json::Map<_, _>>(),
             "seconds": self.seconds,
         })
     }
@@ -264,6 +273,7 @@ pub fn run_loop(
 
     let mut buffer = ReplayBuffer::new(cfg.buffer_games);
     let mut reports = Vec::new();
+    let loop_started = Instant::now();
     for generation in first + 1..=first + cfg.generations {
         let started = Instant::now();
         log(format!(
@@ -348,26 +358,24 @@ pub fn run_loop(
             copy_model(&candidate_path, &best)?;
         }
 
-        let baseline_score = match &cfg.baseline {
-            Some(baseline) => {
-                let m = play_match_with(
-                    &searcher(&best),
-                    baseline,
-                    cfg.eval_games,
-                    &cfg.eval_exploration,
-                    |_| {},
-                )?;
-                log(format!(
-                    "  best vs {baseline}: {}-{}-{} (score {:.3})",
-                    m.a_wins,
-                    m.draws,
-                    m.b_wins,
-                    m.score_a()
-                ));
-                Some(m.score_a())
-            }
-            None => None,
-        };
+        let mut baseline_scores = Vec::with_capacity(cfg.baselines.len());
+        for baseline in &cfg.baselines {
+            let m = play_match_with(
+                &searcher(&best),
+                baseline,
+                cfg.baseline_games,
+                &cfg.eval_exploration,
+                |_| {},
+            )?;
+            log(format!(
+                "  best vs {baseline}: {}-{}-{} (score {:.3})",
+                m.a_wins,
+                m.draws,
+                m.b_wins,
+                m.score_a()
+            ));
+            baseline_scores.push((baseline.clone(), m.score_a()));
+        }
 
         let report = GenerationReport {
             generation,
@@ -377,7 +385,7 @@ pub fn run_loop(
             train: train_report,
             eval,
             promoted,
-            baseline_score,
+            baseline_scores,
             seconds: started.elapsed().as_secs_f32(),
         };
         append_history(&cfg.dir, &report)?;
@@ -386,6 +394,22 @@ pub fn run_loop(
             report.seconds
         ));
         reports.push(report);
+
+        if let Some(budget) = cfg.time_budget {
+            let elapsed = loop_started.elapsed();
+            let mean = elapsed / reports.len() as u32;
+            if elapsed + mean > budget {
+                log(format!(
+                    "time budget of {:.0} min reached after {} generations ({:.0} min); the \
+                     next one would take about {:.0} min",
+                    budget.as_secs_f64() / 60.0,
+                    reports.len(),
+                    elapsed.as_secs_f64() / 60.0,
+                    mean.as_secs_f64() / 60.0
+                ));
+                break;
+            }
+        }
     }
     Ok(reports)
 }
@@ -461,7 +485,9 @@ mod tests {
                 root_noise: Some((0.3, 0.25)),
             },
             promote_threshold: 0.5,
-            baseline: Some(AgentSpec::Random { seed: 1 }),
+            baselines: vec![AgentSpec::Random { seed: 1 }],
+            baseline_games: 2,
+            time_budget: None,
         };
         let mut lines = Vec::new();
         let reports = run_loop(&cfg, |l| lines.push(l)).unwrap();
@@ -470,7 +496,7 @@ mod tests {
         assert!(dir.join("best.bpk").exists() && dir.join("best.json").exists());
         assert!(dir.join("gen-1.bpk").exists() && dir.join("gen-2.bpk").exists());
         assert_eq!(recorded_generations(&dir), 2);
-        assert!(reports.iter().all(|r| r.baseline_score.is_some()));
+        assert!(reports.iter().all(|r| r.baseline_scores.len() == 1));
         assert!(lines.iter().any(|l| l.contains("candidate vs best")));
 
         // Resuming continues the numbering and reuses the best model.

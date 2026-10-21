@@ -117,7 +117,8 @@ cargo run --release --all-features -- train --backend cuda --model "board-transf
 
 # The whole loop: 10 generations of 1000 self-play games each, promotion matches of 20 games
 cargo run --release --all-features -- loop --backend cuda --model "board-transformer 64 2 4" --dir models/loop \
-  --generations 10 --games 1000 --simulations 200 --eval-games 20 --baseline "mcts 200"
+  --generations 10 --games 1000 --simulations 200 --eval-games 20 \
+  --baseline random --baseline greedy --baseline "mcts 200" --baseline-games 10
 cargo run --release --all-features -- loop --dir models/loop --resume --generations 10
 
 # For scripts and CI: plain log lines instead of the dashboard
@@ -200,8 +201,10 @@ The search is generic over the agent that evaluates leaves:
   `--games` games with the best model as search evaluator, pushes them into a replay buffer of
   the last `--buffer-games` games, trains a candidate from the best weights on the buffer,
   plays a promotion match of candidate against best with `mcts-nn` and promotes it at
-  `--promote-threshold`, optionally measures the best against a fixed `--baseline`, and
-  appends a JSON line to `<dir>/history.jsonl`. `--resume` continues from `<dir>/best`.
+  `--promote-threshold`, measures the best against each fixed `--baseline` over
+  `--baseline-games`, and a JSON line to `<dir>/history.jsonl`. `--resume` continues from `<dir>/best`;
+  `--max-minutes` stops the loop between generations once a wall-clock budget is spent.
+  `scripts/train-board-v2.sh` is a ready two-hour run on `board-v2`.
 
 ## Status
 
