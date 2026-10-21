@@ -74,6 +74,15 @@ pub struct Dataset {
 }
 
 impl Dataset {
+    /// Number of distinct game ids.
+    pub fn games(&self) -> usize {
+        self.samples
+            .iter()
+            .map(|s| s.game)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
+
     pub fn len(&self) -> usize {
         self.samples.len()
     }

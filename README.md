@@ -205,8 +205,12 @@ The search is generic over the agent that evaluates leaves:
   starts at `--lr` and decays by `--lr-decay` per generation down to `--lr-min`, plays a
   promotion match of candidate against best with `mcts-nn` and promotes it at
   `--promote-threshold`, measures the best against each fixed `--baseline` over
-  `--baseline-games`, and a JSON line to `<dir>/history.jsonl`. `--resume` continues from `<dir>/best`;
-  `--max-minutes` stops the loop between generations once a wall-clock budget is spent.
+  `--baseline-games`, and appends a JSON line to `<dir>/history.jsonl`. Each generation's
+  games are saved to `<dir>/games/gen-<n>.games` (a compact binary, `nn::games`), and
+  `--initial-games` seeds the buffer from such files, e.g. games saved by `train --data-out`
+  from another agent. `--resume` continues from `<dir>/best` and refills the buffer from the
+  saved games; `--max-minutes` stops the loop between generations once a wall-clock budget is
+  spent.
   `scripts/train-board-v2.sh` is a ready two-hour run on `board-v2`.
 
 ## Status

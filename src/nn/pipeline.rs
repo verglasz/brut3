@@ -11,6 +11,7 @@ use serde_json::json;
 
 use super::any_model::{AnyModel, ModelSpec};
 use super::backend::BackendKind;
+use super::games;
 use super::train::{Dataset, Sample, TrainOptions, TrainReport, generate_parallel, train};
 use crate::agent::AgentSpec;
 use crate::benchmark::{MatchResult, play_match_with};
@@ -154,6 +155,9 @@ pub struct LoopConfig {
     pub eval_exploration: MatchExploration,
     /// The candidate replaces the best model when its match score reaches this.
     pub promote_threshold: f32,
+    /// Games files (see [`games`]) pushed into the replay buffer before the first generation,
+    /// e.g. games played by another agent to learn from first.
+    pub initial_games: Vec<PathBuf>,
     /// Fixed opponents the best model is also measured against each generation.
     pub baselines: Vec<AgentSpec>,
     /// Games of each baseline match.
@@ -247,6 +251,29 @@ fn generation_path(dir: &Path, generation: usize) -> PathBuf {
     dir.join(format!("gen-{generation}"))
 }
 
+/// Where a generation's self-play games are saved.
+fn games_path(dir: &Path, generation: usize) -> PathBuf {
+    dir.join("games").join(format!("gen-{generation}.games"))
+}
+
+/// Adds one generation's games to the buffer, resizing it first when it is measured in
+/// generations.
+fn push_generation(
+    cfg: &LoopConfig,
+    buffer: &mut ReplayBuffer,
+    recent_games: &mut VecDeque<usize>,
+    data: Dataset,
+) {
+    if cfg.buffer_generations > 0 {
+        recent_games.push_back(data.games());
+        while recent_games.len() > cfg.buffer_generations {
+            recent_games.pop_front();
+        }
+        buffer.set_capacity(recent_games.iter().sum());
+    }
+    buffer.push(data);
+}
+
 /// Copies a saved model (`.bpk` and `.json`) from one path stem to another.
 fn copy_model(from: &Path, to: &Path) -> Result<(), String> {
     for ext in ["bpk", "json"] {
@@ -319,6 +346,49 @@ pub fn run_loop(
     let mut buffer = ReplayBuffer::new(cfg.buffer_games);
     // Games per generation so far, for a buffer measured in generations.
     let mut recent_games: VecDeque<usize> = VecDeque::new();
+    if !cfg.initial_games.is_empty() {
+        let data = games::load_many(&cfg.initial_games)?;
+        log(format!(
+            "seeding the buffer with {} games ({} positions) from {} file(s)",
+            data.games(),
+            data.len(),
+            cfg.initial_games.len()
+        ));
+        push_generation(cfg, &mut buffer, &mut recent_games, data);
+    }
+    if first > 0 {
+        // Refill the buffer from the saved games of the generations it would hold.
+        let mut reload = Vec::new();
+        let mut total = 0;
+        for generation in (1..=first).rev() {
+            let path = games_path(&cfg.dir, generation);
+            if !path.exists() {
+                break;
+            }
+            let data = games::load(&path)?;
+            total += data.games();
+            reload.push(data);
+            let enough = if cfg.buffer_generations > 0 {
+                reload.len() >= cfg.buffer_generations
+            } else {
+                total >= cfg.buffer_games
+            };
+            if enough {
+                break;
+            }
+        }
+        let reloaded = reload.len();
+        for data in reload.into_iter().rev() {
+            push_generation(cfg, &mut buffer, &mut recent_games, data);
+        }
+        if reloaded > 0 {
+            log(format!(
+                "reloaded {} games ({} positions) of the last {reloaded} generations into the buffer",
+                buffer.games(),
+                buffer.positions()
+            ));
+        }
+    }
     let mut reports = Vec::new();
     let loop_started = Instant::now();
     for generation in first + 1..=first + cfg.generations {
@@ -337,21 +407,17 @@ pub fn run_loop(
             ..cfg.selfplay.clone()
         };
         let (data, stats) = generate_parallel(&evaluator, games, &selfplay, |_| {})?;
+        let games_file = games_path(&cfg.dir, generation);
+        games::save(&games_file, &data)?;
         log(format!(
-            "  {} positions from {} games, {:.0} simulations/s, mean batch {:.1}",
+            "  {} positions from {} games, {:.0} simulations/s, mean batch {:.1}, saved to {}",
             data.len(),
             stats.games,
             stats.simulations_per_second(),
-            stats.mean_batch()
+            stats.mean_batch(),
+            games_file.display()
         ));
-        if cfg.buffer_generations > 0 {
-            recent_games.push_back(games);
-            while recent_games.len() > cfg.buffer_generations {
-                recent_games.pop_front();
-            }
-            buffer.set_capacity(recent_games.iter().sum());
-        }
-        buffer.push(data);
+        push_generation(cfg, &mut buffer, &mut recent_games, data);
 
         log(format!(
             "  training {} on {} positions from {} buffered games at lr {learning_rate:.2e}",
@@ -517,6 +583,7 @@ mod tests {
             eval_batch: 1,
             eval_exploration: MatchExploration::default(),
             promote_threshold: 0.5,
+            initial_games: vec![],
             baselines: vec![],
             baseline_games: 1,
             time_budget: None,
@@ -587,6 +654,7 @@ mod tests {
                 root_noise: Some((0.3, 0.25)),
             },
             promote_threshold: 0.5,
+            initial_games: vec![],
             baselines: vec![AgentSpec::Random { seed: 1 }],
             baseline_games: 2,
             time_budget: None,

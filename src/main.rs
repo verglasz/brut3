@@ -123,6 +123,10 @@ struct LoopArgs {
     /// Candidate score (wins + draws/2 over games) needed to replace the best model.
     #[arg(long, default_value_t = 0.55)]
     promote_threshold: f32,
+    /// Games files to put into the replay buffer before the first generation (e.g. saved by
+    /// `train --data-out` from another agent's games), so that training starts from them.
+    #[arg(long, num_args = 1..)]
+    initial_games: Vec<std::path::PathBuf>,
     /// Fixed opponent to measure the best model against each generation, e.g. `mcts 200`;
     /// repeat the flag for several, `none` to skip.
     #[arg(long, default_value = "mcts 200")]
@@ -145,9 +149,16 @@ struct TrainArgs {
     #[arg(long)]
     backend: Option<String>,
     /// Agent that plays the self-play games, as a spec like `mcts 50` or `greedy`. Ignored
-    /// when `--selfplay-evaluator` is given.
+    /// when `--selfplay-evaluator` or `--data` is given.
     #[arg(long, default_value = "mcts 50")]
     data_agent: String,
+    /// Train on these saved games files instead of generating games.
+    #[arg(long, num_args = 1..)]
+    data: Vec<std::path::PathBuf>,
+    /// Save the games trained on to this file (loadable with `--data` or `loop
+    /// --initial-games`).
+    #[arg(long)]
+    data_out: Option<std::path::PathBuf>,
     /// Generate the games by lockstep self-play: MCTS with this agent as the leaf evaluator
     /// (e.g. `nn models/board cuda`, or `random` for playouts), `--concurrent` games at once.
     #[arg(long)]
@@ -329,6 +340,7 @@ fn run_loop(args: &LoopArgs) -> Result<(), String> {
                 .then_some((args.eval_dirichlet_alpha, 0.25)),
         },
         promote_threshold: args.promote_threshold,
+        initial_games: args.initial_games.clone(),
         baselines,
         baseline_games: args.baseline_games,
         time_budget: args
@@ -368,6 +380,15 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         }
     };
     let data = match &args.selfplay_evaluator {
+        _ if !args.data.is_empty() => {
+            let data = ultimate_ttt_burn::nn::games::load_many(&args.data)?;
+            println!(
+                "loaded {} games from {} file(s)",
+                data.games(),
+                args.data.len()
+            );
+            data
+        }
         Some(evaluator) => {
             use ultimate_ttt_burn::nn::generate_parallel;
             use ultimate_ttt_burn::selfplay::SelfPlayConfig;
@@ -406,6 +427,10 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         data.len(),
         start.elapsed().as_secs_f32(),
     );
+    if let Some(out) = &args.data_out {
+        ultimate_ttt_burn::nn::games::save(out, &data)?;
+        println!("  saved to {}", out.display());
+    }
     let device = backend.device();
     println!(
         "training {model_spec} ({} parameters) on {backend} for {} epochs",
