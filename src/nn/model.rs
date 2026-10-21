@@ -146,11 +146,23 @@ pub fn predict_logits<B: Backend, M: Model<B>>(
     if states.is_empty() {
         return Vec::new();
     }
+    logits_to_host(predict_logits_tensor(model, states, device))
+}
+
+/// The `[n, LOGITS]` tensor behind [`predict_logits`], still on the device: queue it with
+/// this, do other work, then read it with [`logits_to_host`]. `states` must not be empty.
+pub fn predict_logits_tensor<B: Backend, M: Model<B>>(
+    model: &M,
+    states: &[BitState],
+    device: &B::Device,
+) -> Tensor<B, 2> {
     let prediction = model.predict(M::encode(states, device));
     Tensor::cat(vec![prediction.wdl, prediction.policy], 1)
-        .into_data()
-        .to_vec::<f32>()
-        .expect("f32 logits")
+}
+
+/// Reads a [`predict_logits_tensor`] result back, row-major.
+pub fn logits_to_host<B: Backend>(logits: Tensor<B, 2>) -> Vec<f32> {
+    logits.into_data().to_vec::<f32>().expect("f32 logits")
 }
 
 /// Win/draw/loss probabilities from one row of logits.

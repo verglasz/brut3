@@ -278,6 +278,32 @@ impl UtttAgent for AnyAgent {
             AnyAgent::MctsNn(a) => a.evaluate_batch(states, out),
         }
     }
+
+    fn begin_batch(&mut self, states: &[BitState]) {
+        match self {
+            AnyAgent::Random(a) => a.begin_batch(states),
+            AnyAgent::Greedy(a) => a.begin_batch(states),
+            AnyAgent::Minimax(a) => a.begin_batch(states),
+            AnyAgent::Mcts(a) => a.begin_batch(states),
+            #[cfg(feature = "nn")]
+            AnyAgent::Nn(a) => a.begin_batch(states),
+            #[cfg(feature = "nn")]
+            AnyAgent::MctsNn(a) => a.begin_batch(states),
+        }
+    }
+
+    fn finish_batch(&mut self, states: &[BitState], out: &mut Evaluations) {
+        match self {
+            AnyAgent::Random(a) => a.finish_batch(states, out),
+            AnyAgent::Greedy(a) => a.finish_batch(states, out),
+            AnyAgent::Minimax(a) => a.finish_batch(states, out),
+            AnyAgent::Mcts(a) => a.finish_batch(states, out),
+            #[cfg(feature = "nn")]
+            AnyAgent::Nn(a) => a.finish_batch(states, out),
+            #[cfg(feature = "nn")]
+            AnyAgent::MctsNn(a) => a.finish_batch(states, out),
+        }
+    }
 }
 
 #[cfg(test)]

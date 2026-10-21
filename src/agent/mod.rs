@@ -154,6 +154,21 @@ pub trait UtttAgent {
             out.push(&e);
         }
     }
+
+    /// Starts evaluating `states` without waiting for the result, so the caller can do other
+    /// work until [`UtttAgent::finish_batch`], which must follow with the same `states`
+    /// before any other evaluation. Agents backed by a device queue the forward pass here and
+    /// read it back in `finish_batch`; the default does nothing and lets `finish_batch`
+    /// evaluate synchronously.
+    fn begin_batch(&mut self, states: &[Self::State]) {
+        let _ = states;
+    }
+
+    /// Completes the evaluation started by [`UtttAgent::begin_batch`] for the same `states`,
+    /// appending to `out` like [`UtttAgent::evaluate_batch`].
+    fn finish_batch(&mut self, states: &[Self::State], out: &mut Evaluations) {
+        self.evaluate_batch(states, out);
+    }
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ use super::board_transformer::{BoardTransformer, BoardTransformerConfig};
 use super::cell_transformer::{CellTransformer, CellTransformerConfig};
 use super::heads::BodyConfig;
 use super::linear::{LinearNet, LinearNetConfig};
-use super::model::{HostPrediction, predict_host, predict_logits};
+use super::model::{HostPrediction, predict_host, predict_logits, predict_logits_tensor};
 use crate::game::BitState;
 
 /// Weights are stored as named MessagePack; the recorder appends its own `.mpk` extension.
@@ -154,6 +154,15 @@ impl AnyModel {
     /// [`super::model::predict_logits`].
     pub fn predict_logits(&self, states: &[BitState], device: &DispatchDevice) -> Vec<f32> {
         with_model!(self, |m| predict_logits(m, states, device))
+    }
+
+    /// The logits still on the device; see [`super::model::predict_logits_tensor`].
+    pub fn predict_logits_tensor(
+        &self,
+        states: &[BitState],
+        device: &DispatchDevice,
+    ) -> burn::prelude::Tensor<Dispatch, 2> {
+        with_model!(self, |m| predict_logits_tensor(m, states, device))
     }
 
     /// Writes `<path>.mpk` (weights) and `<path>.json` (spec).

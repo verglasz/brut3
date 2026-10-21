@@ -2,11 +2,14 @@
 
 use std::path::Path;
 
-use burn::DispatchDevice;
+use burn::prelude::Tensor;
+use burn::{Dispatch, DispatchDevice};
 
 use super::any_model::AnyModel;
 use super::backend::BackendKind;
-use super::model::{HostPrediction, LOGITS, expected_value, host_policy_into, host_wdl};
+use super::model::{
+    HostPrediction, LOGITS, expected_value, host_policy_into, host_wdl, logits_to_host,
+};
 use crate::agent::{Evaluation, Evaluations, UtttAgent};
 use crate::game::{BitState, GameState, Move};
 
@@ -14,6 +17,9 @@ pub struct NetAgent {
     model: AnyModel,
     device: DispatchDevice,
     backend: BackendKind,
+    /// A forward pass queued by `begin_batch` and not yet read back: the logits tensor and how
+    /// many positions it covers.
+    in_flight: Option<(Tensor<Dispatch, 2>, usize)>,
 }
 
 impl NetAgent {
@@ -22,6 +28,7 @@ impl NetAgent {
             model,
             device: backend.device(),
             backend,
+            in_flight: None,
         }
     }
 
@@ -33,6 +40,7 @@ impl NetAgent {
             model,
             device,
             backend,
+            in_flight: None,
         })
     }
 
@@ -47,6 +55,22 @@ impl NetAgent {
     /// Network outputs for `states`, one forward pass.
     pub fn predict(&self, states: &[BitState]) -> HostPrediction {
         self.model.predict_host(states, &self.device)
+    }
+
+    /// Appends the evaluations of `states` from their rows of `logits`: exact values for
+    /// terminal states, the network's value and legal-masked policy otherwise, with masking
+    /// and softmax done here on the host straight into the batch's prior rows.
+    fn fill(states: &[BitState], logits: &[f32], out: &mut Evaluations) {
+        debug_assert_eq!(logits.len(), states.len() * LOGITS);
+        for (state, row) in states.iter().zip(logits.chunks_exact(LOGITS)) {
+            match state.outcome() {
+                Some(outcome) => out.push_value(outcome.value_for(state.to_move())),
+                None => {
+                    let priors = out.push_row(expected_value(&host_wdl(row)));
+                    host_policy_into(row, &state.legal_moves(), priors);
+                }
+            }
+        }
     }
 
     /// Exact value for terminal states, the network's otherwise.
@@ -88,17 +112,34 @@ impl UtttAgent for NetAgent {
         Self::evaluation(state, &p.wdl[0], p.policy.swap_remove(0))
     }
 
-    /// One forward pass and one readback for the whole batch; masking and softmax happen on
-    /// the host, straight into the batch's prior rows.
+    /// One forward pass and one readback for the whole batch.
     fn evaluate_batch(&mut self, states: &[BitState], out: &mut Evaluations) {
         let logits = self.model.predict_logits(states, &self.device);
-        for (state, row) in states.iter().zip(logits.chunks_exact(LOGITS)) {
-            match state.outcome() {
-                Some(outcome) => out.push_value(outcome.value_for(state.to_move())),
-                None => {
-                    let priors = out.push_row(expected_value(&host_wdl(row)));
-                    host_policy_into(row, &state.legal_moves(), priors);
-                }
+        Self::fill(states, &logits, out);
+    }
+
+    /// Queues the forward pass; the device runs it while the caller works.
+    fn begin_batch(&mut self, states: &[BitState]) {
+        assert!(self.in_flight.is_none(), "finish the previous batch first");
+        if !states.is_empty() {
+            let logits = self.model.predict_logits_tensor(states, &self.device);
+            self.in_flight = Some((logits, states.len()));
+        }
+    }
+
+    /// Reads the queued forward pass back.
+    fn finish_batch(&mut self, states: &[BitState], out: &mut Evaluations) {
+        match self.in_flight.take() {
+            Some((logits, n)) => {
+                assert_eq!(
+                    n,
+                    states.len(),
+                    "finish_batch with the states of begin_batch"
+                );
+                Self::fill(states, &logits_to_host(logits), out);
+            }
+            None => {
+                assert!(states.is_empty(), "finish_batch without begin_batch");
             }
         }
     }
@@ -147,6 +188,22 @@ mod tests {
         assert_eq!(nonzero(2), 7);
         assert!((out.priors(2).unwrap().iter().sum::<f32>() - 1.0).abs() < 1e-4);
         assert!((0..3).all(|i| (-1.0..=1.0).contains(&out.value(i))));
+    }
+
+    #[test]
+    fn begin_and_finish_match_the_synchronous_batch() {
+        let _device = crate::nn::device_lock();
+        let mut agent = untrained();
+        let states = [BitState::initial(), x_wins_in_one()];
+        let mut sync = Evaluations::default();
+        agent.evaluate_batch(&states, &mut sync);
+        let mut split = Evaluations::default();
+        agent.begin_batch(&states);
+        agent.finish_batch(&states, &mut split);
+        assert_eq!(sync, split);
+        agent.begin_batch(&[]);
+        agent.finish_batch(&[], &mut split);
+        assert_eq!(split.len(), 2);
     }
 
     #[test]

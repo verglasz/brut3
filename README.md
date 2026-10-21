@@ -110,7 +110,7 @@ cargo run --release --all-features -- play mcts-nn models/value cuda 400 16
 # Self-play data from the current network: 64 games searched at once, 200 simulations per move,
 # Dirichlet root noise, temperature sampling for the first 16 plies
 cargo run --release --all-features -- train --backend cuda --model "board-transformer 64 2 4" \
-  --selfplay-evaluator "nn models/board cuda" --games 5000 --simulations 200 --concurrent 64 --tree-batch 8 --out models/board2
+  --selfplay-evaluator "nn models/board cuda" --games 5000 --simulations 200 --concurrent 256 --tree-batch 8 --out models/board2
 
 # The whole loop: 10 generations of 1000 self-play games each, promotion matches of 20 games
 cargo run --release --all-features -- loop --backend cuda --model "board-transformer 64 2 4" --dir models/loop \
@@ -154,10 +154,12 @@ The search is generic over the agent that evaluates leaves:
   behaves as plain UCT with rollouts; with network priors it is the AlphaZero search.
   `mcts::Mcts<A: UtttAgent>` drives one tree with its own agent and implements `UtttAgent`
   itself, so searches compose and its visit distribution can feed training.
-- `selfplay` runs many games in lockstep: every round, the leaves claimed by all trees go to
-  the evaluator in one `evaluate_batch` call, so a network sees `concurrent x tree_batch`
-  positions per forward pass instead of one tree's batch. Moves are sampled by visit count for
-  the first plies of each game and by argmax afterwards.
+- `selfplay` runs many games in lockstep: every round, the leaves claimed by all trees of a
+  group go to the evaluator in one call, so a network sees `concurrent / 2 x tree_batch`
+  positions per forward pass instead of one tree's batch. The games in flight form two groups
+  that take turns (`begin_batch` / `finish_batch` on the agent): one group's selection and
+  backup on the CPU overlap the other group's forward pass on the device. Moves are sampled by
+  visit count for the first plies of each game and by argmax afterwards.
 - `nn` holds the network side. Every model implements `Model`: it encodes raw `BitState`s into
   its own input tensors and predicts a `Prediction` with two heads, three win/draw/loss logits
   from the side to move's view (search uses `p_win - p_loss` as the value) and 81 move logits

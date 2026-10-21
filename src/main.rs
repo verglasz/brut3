@@ -66,7 +66,7 @@ struct LoopArgs {
     games: usize,
     #[arg(long, default_value_t = 200)]
     simulations: u32,
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 256)]
     concurrent: usize,
     #[arg(long, default_value_t = 8)]
     tree_batch: usize,
@@ -124,8 +124,9 @@ struct TrainArgs {
     /// Self-play: simulations per move.
     #[arg(long, default_value_t = 200)]
     simulations: u32,
-    /// Self-play: games searched at once (the evaluator batch is concurrent x tree-batch).
-    #[arg(long, default_value_t = 64)]
+    /// Self-play: games in flight, in two groups that alternate between tree work and
+    /// evaluation (the evaluator batch is concurrent / 2 x tree-batch).
+    #[arg(long, default_value_t = 256)]
     concurrent: usize,
     /// Self-play: leaves claimed per tree per round.
     #[arg(long, default_value_t = 8)]

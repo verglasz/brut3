@@ -2,9 +2,11 @@
 //! by all of their trees go to the evaluator in a single batch.
 //!
 //! This is how a network evaluator gets large batches without pushing the per-tree batch (and
-//! its virtual-loss distortion) up: `concurrent` games times `tree_batch` leaves per round.
-//! Exploration follows AlphaZero: Dirichlet noise on the root priors and moves sampled in
-//! proportion to visit counts for the first plies of each game.
+//! its virtual-loss distortion) up: `concurrent / 2` games times `tree_batch` leaves per
+//! round. The games in flight form two groups that take turns, so one group's tree work on the
+//! CPU overlaps the other group's evaluation on the device. Exploration follows AlphaZero:
+//! Dirichlet noise on the root priors and moves sampled in proportion to visit counts for the
+//! first plies of each game.
 
 use std::time::Instant;
 
@@ -20,7 +22,8 @@ pub struct SelfPlayConfig {
     pub simulations: u32,
     /// Leaves each tree claims per round (virtual loss applies within a tree).
     pub tree_batch: usize,
-    /// Games in flight; the evaluator sees up to `concurrent * tree_batch` leaves per call.
+    /// Games in flight, in two alternating groups; the evaluator sees up to
+    /// `concurrent / 2 * tree_batch` leaves per call.
     pub concurrent: usize,
     pub c_puct: f32,
     pub virtual_loss: f32,
@@ -38,7 +41,7 @@ impl Default for SelfPlayConfig {
         Self {
             simulations: 200,
             tree_batch: 8,
-            concurrent: 64,
+            concurrent: 256,
             c_puct: 1.4,
             virtual_loss: 1.0,
             temperature_moves: 16,
@@ -86,6 +89,141 @@ struct Active {
     plies: usize,
 }
 
+fn new_tree(cfg: &SelfPlayConfig, state: BitState, rng: &mut SmallRng) -> SearchTree<BitState> {
+    let tree = SearchTree::new(state, cfg.simulations, cfg.c_puct, cfg.virtual_loss);
+    match cfg.root_noise {
+        Some((alpha, fraction)) => tree.with_root_noise(RootNoise {
+            alpha,
+            fraction,
+            seed: rng.random(),
+        }),
+        None => tree,
+    }
+}
+
+fn start_game(cfg: &SelfPlayConfig, rng: &mut SmallRng) -> Active {
+    Active {
+        state: BitState::initial(),
+        positions: Vec::new(),
+        tree: new_tree(cfg, BitState::initial(), rng),
+        plies: 0,
+    }
+}
+
+/// Half of the games in flight. The two groups take turns, so that while the evaluator works
+/// on one group's leaves the other group's trees select their next leaves and back up their
+/// last results: with a device-backed evaluator the CPU and the device overlap instead of
+/// waiting on each other.
+#[derive(Default)]
+struct Group {
+    active: Vec<Active>,
+    /// Leaves claimed this round, and each game's span in them.
+    states: Vec<BitState>,
+    spans: Vec<(usize, usize)>,
+    evals: Evaluations,
+    /// `states` has been handed to `begin_batch` and awaits `finish_batch`.
+    in_flight: bool,
+}
+
+impl Group {
+    /// Every tree claims its leaves for this round.
+    fn claim(&mut self, cfg: &SelfPlayConfig) {
+        self.states.clear();
+        self.spans.clear();
+        for game in &mut self.active {
+            let from = self.states.len();
+            game.tree.claim(cfg.tree_batch, &mut self.states);
+            self.spans.push((from, self.states.len()));
+        }
+    }
+
+    /// Hands the claimed leaves to the evaluator without waiting for the result.
+    fn begin<A: UtttAgent<State = BitState>>(
+        &mut self,
+        evaluator: &mut A,
+        stats: &mut SelfPlayStats,
+    ) {
+        if self.states.is_empty() {
+            return;
+        }
+        evaluator.begin_batch(&self.states);
+        self.in_flight = true;
+        stats.evaluator_calls += 1;
+        stats.leaves += self.states.len() as u64;
+    }
+
+    /// Collects the evaluations and resolves every tree's leaves.
+    fn finish<A: UtttAgent<State = BitState>>(&mut self, evaluator: &mut A) {
+        if !self.in_flight {
+            return;
+        }
+        self.in_flight = false;
+        self.evals.clear();
+        evaluator.finish_batch(&self.states, &mut self.evals);
+        debug_assert_eq!(self.evals.len(), self.states.len());
+        for (game, &(from, to)) in self.active.iter_mut().zip(&self.spans) {
+            if to > from {
+                game.tree.resolve(&self.evals, from);
+            }
+        }
+    }
+}
+
+/// Trees that have spent their budget play a move; finished games are recorded and replaced
+/// while there are games left to start.
+#[allow(clippy::too_many_arguments)]
+fn advance(
+    group: &mut Group,
+    cfg: &SelfPlayConfig,
+    games: usize,
+    started: &mut usize,
+    rng: &mut SmallRng,
+    stats: &mut SelfPlayStats,
+    records: &mut Vec<GameRecord>,
+    on_game: &mut impl FnMut(usize),
+) {
+    for i in (0..group.active.len()).rev() {
+        if !group.active[i].tree.is_done() {
+            continue;
+        }
+        let game = &mut group.active[i];
+        let result = game.tree.result();
+        stats.simulations += game.tree.completed() as u64;
+        let temperature = if game.plies < cfg.temperature_moves {
+            cfg.temperature
+        } else {
+            0.0
+        };
+        let mv = result
+            .sample_move(temperature, rng)
+            .expect("non-terminal position has moves");
+        game.positions.push((game.state, result.policy()));
+        game.state.apply(mv);
+        game.plies += 1;
+        match game.state.outcome() {
+            Some(outcome) => {
+                stats.games += 1;
+                stats.positions += game.positions.len();
+                records.push(GameRecord {
+                    positions: std::mem::take(&mut game.positions),
+                    outcome,
+                });
+                on_game(stats.games);
+                if *started < games {
+                    group.active[i] = start_game(cfg, rng);
+                    *started += 1;
+                } else {
+                    group.active.swap_remove(i);
+                }
+            }
+            None => {
+                let state = game.state;
+                game.tree = new_tree(cfg, state, rng);
+            }
+        }
+    }
+}
+
 /// Plays `games` games of search-with-`evaluator` against itself and returns their records.
 /// `on_game` is called after each finished game with the number finished so far.
 pub fn self_play<A: UtttAgent<State = BitState>>(
@@ -99,95 +237,34 @@ pub fn self_play<A: UtttAgent<State = BitState>>(
     let mut stats = SelfPlayStats::default();
     let mut records = Vec::with_capacity(games);
 
-    let new_tree = |state: BitState, rng: &mut SmallRng| {
-        let tree = SearchTree::new(state, cfg.simulations, cfg.c_puct, cfg.virtual_loss);
-        match cfg.root_noise {
-            Some((alpha, fraction)) => tree.with_root_noise(RootNoise {
-                alpha,
-                fraction,
-                seed: rng.random(),
-            }),
-            None => tree,
-        }
-    };
-    let start_game = |rng: &mut SmallRng| Active {
-        state: BitState::initial(),
-        positions: Vec::new(),
-        tree: new_tree(BitState::initial(), rng),
-        plies: 0,
-    };
+    let in_flight = cfg.concurrent.max(1).min(games);
+    let mut groups = [Group::default(), Group::default()];
+    for i in 0..in_flight {
+        groups[i % 2].active.push(start_game(cfg, &mut rng));
+    }
+    let mut started = in_flight;
 
-    let mut active: Vec<Active> = (0..cfg.concurrent.max(1).min(games))
-        .map(|_| start_game(&mut rng))
-        .collect();
-    let mut started = active.len();
-    let mut states: Vec<BitState> = Vec::new();
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut evals = Evaluations::default();
-
-    while !active.is_empty() {
-        // One round: every tree claims its leaves, one batched evaluation, every tree resolves.
-        states.clear();
-        spans.clear();
-        for game in &mut active {
-            let from = states.len();
-            game.tree.claim(cfg.tree_batch, &mut states);
-            spans.push((from, states.len()));
-        }
-        if !states.is_empty() {
-            evals.clear();
-            evaluator.evaluate_batch(&states, &mut evals);
-            debug_assert_eq!(evals.len(), states.len());
-            stats.evaluator_calls += 1;
-            stats.leaves += states.len() as u64;
-            for (game, &(from, to)) in active.iter_mut().zip(&spans) {
-                if to > from {
-                    game.tree.resolve(&evals, from);
-                }
-            }
-        }
-
-        // Trees that have spent their budget play a move; finished games are replaced.
-        for i in (0..active.len()).rev() {
-            if !active[i].tree.is_done() {
-                continue;
-            }
-            let game = &mut active[i];
-            let result = game.tree.result();
-            stats.simulations += game.tree.completed() as u64;
-            let temperature = if game.plies < cfg.temperature_moves {
-                cfg.temperature
-            } else {
-                0.0
-            };
-            let mv = result
-                .sample_move(temperature, &mut rng)
-                .expect("non-terminal position has moves");
-            game.positions.push((game.state, result.policy()));
-            game.state.apply(mv);
-            game.plies += 1;
-            match game.state.outcome() {
-                Some(outcome) => {
-                    stats.games += 1;
-                    stats.positions += game.positions.len();
-                    records.push(GameRecord {
-                        positions: std::mem::take(&mut game.positions),
-                        outcome,
-                    });
-                    on_game(stats.games);
-                    if started < games {
-                        active[i] = start_game(&mut rng);
-                        started += 1;
-                    } else {
-                        active.swap_remove(i);
-                    }
-                }
-                None => {
-                    let state = game.state;
-                    game.tree = new_tree(state, &mut rng);
-                }
-            }
-        }
+    // Interleaving: while `current`'s evaluation is in flight, `other` claims; once `current`
+    // is finished, `other` goes in flight and `current` resolves and plays its moves.
+    let mut current = 0;
+    groups[current].claim(cfg);
+    groups[current].begin(evaluator, &mut stats);
+    while !(groups[0].active.is_empty() && groups[1].active.is_empty()) {
+        let other = 1 - current;
+        groups[other].claim(cfg);
+        groups[current].finish(evaluator);
+        groups[other].begin(evaluator, &mut stats);
+        advance(
+            &mut groups[current],
+            cfg,
+            games,
+            &mut started,
+            &mut rng,
+            &mut stats,
+            &mut records,
+            &mut on_game,
+        );
+        current = other;
     }
     stats.seconds = start.elapsed().as_secs_f32();
     (records, stats)
