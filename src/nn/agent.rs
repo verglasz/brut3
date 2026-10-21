@@ -6,7 +6,7 @@ use burn::DispatchDevice;
 
 use super::any_model::AnyModel;
 use super::backend::BackendKind;
-use super::model::{HostPrediction, expected_value};
+use super::model::{HostPrediction, LOGITS, expected_value, host_policy_into, host_wdl};
 use crate::agent::{Evaluation, Evaluations, UtttAgent};
 use crate::game::{BitState, GameState, Move};
 
@@ -88,16 +88,16 @@ impl UtttAgent for NetAgent {
         Self::evaluation(state, &p.wdl[0], p.policy.swap_remove(0))
     }
 
+    /// One forward pass and one readback for the whole batch; masking and softmax happen on
+    /// the host, straight into the batch's prior rows.
     fn evaluate_batch(&mut self, states: &[BitState], out: &mut Evaluations) {
-        let p = self.predict(states);
-        for (state, (wdl, policy)) in states.iter().zip(p.wdl.iter().zip(&p.policy)) {
+        let logits = self.model.predict_logits(states, &self.device);
+        for (state, row) in states.iter().zip(logits.chunks_exact(LOGITS)) {
             match state.outcome() {
                 Some(outcome) => out.push_value(outcome.value_for(state.to_move())),
                 None => {
-                    let row = out.push_row(expected_value(wdl));
-                    for (mv, p) in policy {
-                        row[mv.index()] = *p;
-                    }
+                    let priors = out.push_row(expected_value(&host_wdl(row)));
+                    host_policy_into(row, &state.legal_moves(), priors);
                 }
             }
         }

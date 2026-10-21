@@ -2,12 +2,15 @@
 //! win/draw/loss [`Verdict`].
 
 use burn::prelude::*;
-use burn::tensor::activation::{log_softmax, softmax};
+use burn::tensor::activation::log_softmax;
 
 use crate::game::{BitState, GameState, Move, MoveSet, Outcome, Player};
 
 /// Number of distinct moves, one per square of the big board (`Move::index`).
 pub const MOVES: usize = Move::COUNT;
+
+/// Width of one row of raw network outputs: the three verdict logits, then the move logits.
+pub const LOGITS: usize = 3 + MOVES;
 
 /// Logit added to illegal moves before the softmax: effectively zero probability.
 const ILLEGAL_LOGIT: f32 = -1e4;
@@ -64,18 +67,11 @@ pub struct Prediction<B: Backend> {
 }
 
 impl<B: Backend> Prediction<B> {
-    pub fn wdl_probabilities(&self) -> Tensor<B, 2> {
-        softmax(self.wdl.clone(), 1)
-    }
-
-    /// Log-probabilities over moves with illegal ones (where `legal` is false) suppressed.
+    /// Log-probabilities over moves with illegal ones (where `legal` is false) suppressed,
+    /// for the training loss. Inference reads the raw logits back instead
+    /// ([`predict_logits`]).
     pub fn policy_log_probabilities(&self, legal: Tensor<B, 2, Bool>) -> Tensor<B, 2> {
         log_softmax(self.masked_policy(legal), 1)
-    }
-
-    /// Probabilities over moves with illegal ones suppressed.
-    pub fn policy_probabilities(&self, legal: Tensor<B, 2, Bool>) -> Tensor<B, 2> {
-        softmax(self.masked_policy(legal), 1)
     }
 
     fn masked_policy(&self, legal: Tensor<B, 2, Bool>) -> Tensor<B, 2> {
@@ -138,40 +134,76 @@ impl HostPrediction {
     }
 }
 
+/// Runs `model` on `states` and reads the raw logits back in one transfer: `states.len()`
+/// rows of [`LOGITS`] floats, each the three verdict logits followed by the move logits
+/// indexed by `Move::index`. Masking and softmax are left to the host, where they are a few
+/// dozen flops per position: see [`host_wdl`] and [`host_policy_into`].
+pub fn predict_logits<B: Backend, M: Model<B>>(
+    model: &M,
+    states: &[BitState],
+    device: &B::Device,
+) -> Vec<f32> {
+    if states.is_empty() {
+        return Vec::new();
+    }
+    let prediction = model.predict(M::encode(states, device));
+    Tensor::cat(vec![prediction.wdl, prediction.policy], 1)
+        .into_data()
+        .to_vec::<f32>()
+        .expect("f32 logits")
+}
+
+/// Win/draw/loss probabilities from one row of logits.
+pub fn host_wdl(row: &[f32]) -> [f32; 3] {
+    let max = row[0].max(row[1]).max(row[2]);
+    let e = [
+        (row[0] - max).exp(),
+        (row[1] - max).exp(),
+        (row[2] - max).exp(),
+    ];
+    let total = e[0] + e[1] + e[2];
+    [e[0] / total, e[1] / total, e[2] / total]
+}
+
+/// Softmax of one row's move logits restricted to `legal`, written to `out[mv.index()]` for
+/// each legal move; other entries are left untouched. With no legal moves nothing is written.
+pub fn host_policy_into(row: &[f32], legal: &impl MoveSet, out: &mut [f32; MOVES]) {
+    let logits = &row[3..3 + MOVES];
+    let mut max = f32::NEG_INFINITY;
+    for mv in legal.iter() {
+        max = max.max(logits[mv.index()]);
+    }
+    let mut total = 0.0f32;
+    for mv in legal.iter() {
+        let e = (logits[mv.index()] - max).exp();
+        out[mv.index()] = e;
+        total += e;
+    }
+    if total > 0.0 {
+        for mv in legal.iter() {
+            out[mv.index()] /= total;
+        }
+    }
+}
+
 /// Runs `model` on `states` and reads the probabilities back.
 pub fn predict_host<B: Backend, M: Model<B>>(
     model: &M,
     states: &[BitState],
     device: &B::Device,
 ) -> HostPrediction {
-    if states.is_empty() {
-        return HostPrediction::default();
+    let logits = predict_logits(model, states, device);
+    let mut dense = [0.0f32; MOVES];
+    let mut prediction = HostPrediction::default();
+    for (state, row) in states.iter().zip(logits.chunks_exact(LOGITS)) {
+        prediction.wdl.push(host_wdl(row));
+        let legal = state.legal_moves();
+        host_policy_into(row, &legal, &mut dense);
+        prediction
+            .policy
+            .push(legal.iter().map(|mv| (mv, dense[mv.index()])).collect());
     }
-    let prediction = model.predict(M::encode(states, device));
-    let wdl = prediction
-        .wdl_probabilities()
-        .into_data()
-        .to_vec::<f32>()
-        .expect("f32 probabilities");
-    let policy = prediction
-        .policy_probabilities(legal_mask(states, device))
-        .into_data()
-        .to_vec::<f32>()
-        .expect("f32 probabilities");
-    HostPrediction {
-        wdl: wdl.chunks(3).map(|p| [p[0], p[1], p[2]]).collect(),
-        policy: states
-            .iter()
-            .zip(policy.chunks(MOVES))
-            .map(|(state, row)| {
-                state
-                    .legal_moves()
-                    .iter()
-                    .map(|mv| (mv, row[mv.index()]))
-                    .collect()
-            })
-            .collect(),
-    }
+    prediction
 }
 
 #[cfg(test)]
