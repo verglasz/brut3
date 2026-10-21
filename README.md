@@ -207,8 +207,8 @@ The search is generic over the agent that evaluates leaves:
   `--promote-threshold`, measures the best against each fixed `--baseline` over
   `--baseline-games`, and appends a JSON line to `<dir>/history.jsonl`. Each generation's
   games are saved to `<dir>/games/gen-<n>.games` (a compact binary, `nn::games`), and
-  `--initial-games` seeds the buffer from such files, e.g. games saved by `train --data-out`
-  from another agent. `--resume` continues from `<dir>/best` and refills the buffer from the
+  `--initial-games` seeds the buffer from such files, e.g. games played by random-playout
+  MCTS with `selfplay --evaluator random --games 4000 --out models/mcts-200.games`. `--resume` continues from `<dir>/best` and refills the buffer from the
   saved games; `--max-minutes` stops the loop between generations once a wall-clock budget is
   spent.
   `scripts/train-board-v2.sh` is a ready two-hour run on `board-v2`.

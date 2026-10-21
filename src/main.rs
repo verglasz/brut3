@@ -26,6 +26,11 @@ enum Command {
     /// Generate self-play games and train the value network on them.
     #[cfg(feature = "nn")]
     Train(TrainArgs),
+    /// Play lockstep self-play games with a search agent and save them, without training:
+    /// e.g. `selfplay --evaluator random --games 4000 --out models/mcts-200.games`, for
+    /// `loop --initial-games` or `train --data`.
+    #[cfg(feature = "nn")]
+    Selfplay(SelfplayArgs),
     /// Self-play training loop: generate games with the best model, train a candidate on a
     /// replay buffer, promote it if it beats the best; repeat.
     #[cfg(feature = "nn")]
@@ -144,6 +149,35 @@ struct LoopArgs {
 
 #[cfg(feature = "nn")]
 #[derive(clap::Args)]
+struct SelfplayArgs {
+    /// Leaf evaluator of the search: `random` for playouts, or `nn <weights> [backend]`.
+    #[arg(long, default_value = "random")]
+    evaluator: String,
+    #[arg(long, default_value_t = 1000)]
+    games: usize,
+    /// Simulations per move.
+    #[arg(long, default_value_t = 200)]
+    simulations: u32,
+    /// Games in flight (the evaluator batch is concurrent / 2 x tree-batch).
+    #[arg(long, default_value_t = 256)]
+    concurrent: usize,
+    #[arg(long, default_value_t = 8)]
+    tree_batch: usize,
+    /// Plies sampled by visit count before playing the most visited move.
+    #[arg(long, default_value_t = 16)]
+    temperature_moves: usize,
+    /// Dirichlet alpha of the root noise (0 disables it).
+    #[arg(long, default_value_t = 0.3)]
+    dirichlet_alpha: f32,
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+    /// Games file to write.
+    #[arg(long)]
+    out: std::path::PathBuf,
+}
+
+#[cfg(feature = "nn")]
+#[derive(clap::Args)]
 struct TrainArgs {
     /// Backend to train on (default: fastest compiled in). See `backends`.
     #[arg(long)]
@@ -218,6 +252,8 @@ fn main() -> ExitCode {
         Command::Play { spec } => play(&spec),
         #[cfg(feature = "nn")]
         Command::Train(args) => train(&args),
+        #[cfg(feature = "nn")]
+        Command::Selfplay(args) => selfplay(&args),
         #[cfg(feature = "nn")]
         Command::Loop(args) => run_loop(&args),
         Command::Benchmark { games, specs } => benchmark(games, &specs),
@@ -353,6 +389,48 @@ fn run_loop(args: &LoopArgs) -> Result<(), String> {
         reports.len(),
         args.dir.join("best.bpk").display(),
         args.dir.join("history.jsonl").display()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "nn")]
+fn selfplay(args: &SelfplayArgs) -> Result<(), String> {
+    use std::io::Write;
+    use std::time::Instant;
+    use ultimate_ttt_burn::nn::{games, generate_parallel};
+    use ultimate_ttt_burn::selfplay::SelfPlayConfig;
+
+    let words: Vec<&str> = args.evaluator.split_whitespace().collect();
+    let evaluator = AgentSpec::parse(&words)?;
+    let cfg = SelfPlayConfig {
+        simulations: args.simulations,
+        tree_batch: args.tree_batch,
+        concurrent: args.concurrent,
+        temperature_moves: args.temperature_moves,
+        root_noise: (args.dirichlet_alpha > 0.0).then_some((args.dirichlet_alpha, 0.25)),
+        seed: args.seed,
+        ..Default::default()
+    };
+    println!(
+        "self-play: {} games, {} simulations/move, {} concurrent x {} leaves, evaluator {evaluator}",
+        args.games, cfg.simulations, cfg.concurrent, cfg.tree_batch
+    );
+    let start = Instant::now();
+    let progress = |n: usize| {
+        if n.is_multiple_of(100) || n == args.games {
+            print!("\r  {n}/{} games", args.games);
+            let _ = io::stdout().flush();
+        }
+    };
+    let (data, stats) = generate_parallel(&evaluator, args.games, &cfg, progress)?;
+    games::save(&args.out, &data)?;
+    let [wins, draws, losses] = data.verdict_counts();
+    println!(
+        "\n  {} positions ({wins} win / {draws} draw / {losses} loss) in {:.0}s, {:.0} simulations/s; saved to {}",
+        data.len(),
+        start.elapsed().as_secs_f32(),
+        stats.simulations_per_second(),
+        args.out.display()
     );
     Ok(())
 }
