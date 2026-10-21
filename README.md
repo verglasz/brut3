@@ -76,8 +76,9 @@ Known upstream issues worked around:
   head now has three outputs, and step outputs are read back per tensor rather than through a
   multi-tensor transaction), but one `loop` generation on an RTX 2080 (200 games, 200
   simulations, board transformer 64/2/4) took 97-105 s against 70 s without fusion, with
-  self-play at 44k instead of 58k simulations/s. So fusion stays off for speed, not only for
-  correctness.
+  self-play at 44k instead of 58k simulations/s. Re-tested the same day after self-play was
+  pipelined and the GPU had become the bottleneck (~85% busy): fusion still ran at 69k against
+  84k simulations/s. So fusion stays off for speed, not only for correctness.
 - `nn/train.rs`: on the MLIR CPU backend (cubecl-cpu 0.10), reading a still-lazy tensor from a
   thread other than the one that produced it panics in the memory pool. The Learner's metric
   and checkpoint threads do exactly that, so on that backend the step outputs are read back on
