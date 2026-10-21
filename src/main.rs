@@ -80,7 +80,7 @@ struct LoopArgs {
     /// Training epochs per generation, continuing from the best weights.
     #[arg(long, default_value_t = 2)]
     epochs: usize,
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 1024)]
     batch_size: usize,
     #[arg(long, default_value_t = 1e-3)]
     lr: f64,
@@ -146,7 +146,7 @@ struct TrainArgs {
     games: usize,
     #[arg(long, default_value_t = 10)]
     epochs: usize,
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 1024)]
     batch_size: usize,
     /// Learning rate.
     #[arg(long, default_value_t = 1e-3)]

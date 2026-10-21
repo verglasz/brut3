@@ -447,7 +447,7 @@ impl Default for TrainOptions {
     fn default() -> Self {
         Self {
             epochs: 10,
-            batch_size: 256,
+            batch_size: 1024,
             learning_rate: 1e-3,
             weight_decay: 1e-4,
             validation_fraction: 0.1,
