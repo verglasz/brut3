@@ -11,10 +11,13 @@
 //! heads read the flattened final residual stream to produce the move and outcome logits.
 
 use burn::nn::transformer::TransformerEncoder;
-use burn::nn::{Embedding, EmbeddingConfig};
+use burn::nn::{Embedding, Linear, LinearConfig};
 use burn::prelude::*;
 
-use super::heads::{BodyConfig, Perceptron, PerceptronConfig, encode_all_to_all};
+use super::heads::{
+    AttentionReadout, AttentionReadoutConfig, BodyConfig, Perceptron, PerceptronConfig, embedding,
+    encode_all_to_all,
+};
 use super::model::{MOVES, Model, Prediction, Verdict};
 use crate::game::{BitState, BoardStatus, GameState, Square};
 
@@ -39,6 +42,42 @@ const IDS_PER_BOARD: usize = 1 + CELLS + 3;
 /// Ids per position.
 pub const IDS: usize = BOARDS * IDS_PER_BOARD;
 
+/// The embedding table and encoder body shared by the board models: `[batch, IDS]` ids in,
+/// `[batch, 9, d_model]` residual stream out.
+#[derive(Module, Debug)]
+pub struct BoardEncoder<B: Backend> {
+    /// Content, per-cell, position, status and forced embeddings, at the `*_BASE` offsets.
+    embed: Embedding<B>,
+    body: TransformerEncoder<B>,
+    #[module(skip)]
+    d_model: usize,
+}
+
+impl<B: Backend> BoardEncoder<B> {
+    pub fn init(body: &BodyConfig, device: &B::Device) -> Self {
+        Self {
+            embed: embedding(VOCABULARY, body.d_model, device),
+            body: body.init(device),
+            d_model: body.d_model,
+        }
+    }
+
+    /// One gather for every id, then the 13 embeddings of each board summed into its token
+    /// (`[n, 117, d] -> [n, 9, 13, d] -> [n, 9, d]`), then the encoder.
+    pub fn forward(&self, input: BoardTokens<B>) -> Tensor<B, 3> {
+        let n = input.dims()[0];
+        let d = self.d_model;
+        let tokens = self
+            .embed
+            .forward(input)
+            .reshape([n, BOARDS, IDS_PER_BOARD, d])
+            .sum_dim(2)
+            .reshape([n, BOARDS, d]);
+        encode_all_to_all(&self.body, tokens)
+    }
+}
+
+/// [`BoardTransformer`]: the encoder read by two perceptrons over the flattened stream.
 #[derive(Config, Debug, PartialEq)]
 pub struct BoardTransformerConfig {
     pub body: BodyConfig,
@@ -64,14 +103,6 @@ impl BoardTransformerConfig {
 
     pub fn init<B: Backend>(&self, device: &B::Device) -> BoardTransformer<B> {
         let d = self.body.d_model;
-        let embedding = |n: usize| {
-            EmbeddingConfig::new(n, d)
-                .with_initializer(burn::nn::Initializer::Normal {
-                    mean: 0.0,
-                    std: 0.02,
-                })
-                .init(device)
-        };
         let head = |out: usize| {
             PerceptronConfig::new(BOARDS * d, self.d_head(), out)
                 .with_dropout(self.body.dropout)
@@ -79,8 +110,7 @@ impl BoardTransformerConfig {
         };
         BoardTransformer {
             config: self.clone(),
-            embed: embedding(VOCABULARY),
-            body: self.body.init(device),
+            encoder: BoardEncoder::init(&self.body, device),
             policy_head: head(MOVES),
             wdl_head: head(Verdict::ALL.len()),
         }
@@ -91,11 +121,50 @@ impl BoardTransformerConfig {
 pub struct BoardTransformer<B: Backend> {
     #[module(skip)]
     config: BoardTransformerConfig,
-    /// Content, per-cell, position, status and forced embeddings, at the `*_BASE` offsets.
-    embed: Embedding<B>,
-    body: TransformerEncoder<B>,
+    encoder: BoardEncoder<B>,
     policy_head: Perceptron<B>,
     wdl_head: Perceptron<B>,
+}
+
+/// [`BoardTransformerV2`]: the same encoder with per-token heads. The policy is one linear
+/// map, shared by the nine board tokens, from a token to the logits of its nine cells; the
+/// value is an [`AttentionReadout`] whose single query attends over all nine tokens.
+#[derive(Config, Debug, PartialEq)]
+pub struct BoardTransformerV2Config {
+    pub body: BodyConfig,
+}
+
+impl Default for BoardTransformerV2Config {
+    fn default() -> Self {
+        Self::new(BodyConfig::new())
+    }
+}
+
+impl BoardTransformerV2Config {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> BoardTransformerV2<B> {
+        BoardTransformerV2 {
+            config: self.clone(),
+            encoder: BoardEncoder::init(&self.body, device),
+            policy: LinearConfig::new(self.body.d_model, CELLS).init(device),
+            wdl: AttentionReadoutConfig::new(
+                self.body.d_model,
+                self.body.n_heads,
+                self.body.d_ff(),
+                Verdict::ALL.len(),
+            )
+            .with_dropout(self.body.dropout)
+            .init(device),
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct BoardTransformerV2<B: Backend> {
+    #[module(skip)]
+    config: BoardTransformerV2Config,
+    encoder: BoardEncoder<B>,
+    policy: Linear<B>,
+    wdl: AttentionReadout<B>,
 }
 
 /// Embedding ids for a batch: `[batch, IDS]`, see [`board_token_ids`].
@@ -141,6 +210,16 @@ pub fn board_token_ids(state: &BitState, out: &mut BoardTokenIds) {
     }
 }
 
+/// Encodes `states` as `[batch, IDS]` embedding ids.
+pub fn board_tokens<B: Backend>(states: &[BitState], device: &B::Device) -> BoardTokens<B> {
+    let n = states.len();
+    let mut ids = vec![0i32; n * IDS];
+    for (state, out) in states.iter().zip(ids.chunks_exact_mut(IDS)) {
+        board_token_ids(state, out.try_into().expect("IDS ids per position"));
+    }
+    Tensor::from_data(TensorData::new(ids, [n, IDS]), device)
+}
+
 impl<B: Backend> BoardTransformer<B> {
     pub fn config(&self) -> BoardTransformerConfig {
         self.config.clone()
@@ -151,26 +230,11 @@ impl<B: Backend> Model<B> for BoardTransformer<B> {
     type Input = BoardTokens<B>;
 
     fn encode(states: &[BitState], device: &B::Device) -> BoardTokens<B> {
-        let n = states.len();
-        let mut ids = vec![0i32; n * IDS];
-        for (state, out) in states.iter().zip(ids.chunks_exact_mut(IDS)) {
-            board_token_ids(state, out.try_into().expect("IDS ids per position"));
-        }
-        Tensor::from_data(TensorData::new(ids, [n, IDS]), device)
+        board_tokens(states, device)
     }
 
     fn predict(&self, input: BoardTokens<B>) -> Prediction<B> {
-        let n = input.dims()[0];
-        let d = self.config.body.d_model;
-        // One gather for every id, then the 13 embeddings of each board summed into its token:
-        // [n, 117, d] -> [n, 9, 13, d] -> [n, 9, d].
-        let tokens = self
-            .embed
-            .forward(input)
-            .reshape([n, BOARDS, IDS_PER_BOARD, d])
-            .sum_dim(2)
-            .reshape([n, BOARDS, d]);
-        let stream = encode_all_to_all(&self.body, tokens).flatten::<2>(1, 2);
+        let stream = self.encoder.forward(input).flatten::<2>(1, 2);
         Prediction {
             wdl: self.wdl_head.forward(stream.clone()),
             policy: self.policy_head.forward(stream),
@@ -179,6 +243,33 @@ impl<B: Backend> Model<B> for BoardTransformer<B> {
 }
 
 crate::nn::train::impl_train_steps!(BoardTransformer);
+
+impl<B: Backend> BoardTransformerV2<B> {
+    pub fn config(&self) -> BoardTransformerV2Config {
+        self.config.clone()
+    }
+}
+
+impl<B: Backend> Model<B> for BoardTransformerV2<B> {
+    type Input = BoardTokens<B>;
+
+    fn encode(states: &[BitState], device: &B::Device) -> BoardTokens<B> {
+        board_tokens(states, device)
+    }
+
+    fn predict(&self, input: BoardTokens<B>) -> Prediction<B> {
+        let stream = self.encoder.forward(input);
+        let n = stream.dims()[0];
+        // Board-major `[n, 9, 9]` is `Move::index` order (`board * 9 + square`).
+        let policy = self.policy.forward(stream.clone()).reshape([n, MOVES]);
+        Prediction {
+            wdl: self.wdl.forward(stream),
+            policy,
+        }
+    }
+}
+
+crate::nn::train::impl_train_steps!(BoardTransformerV2);
 
 #[cfg(test)]
 mod tests {
@@ -199,6 +290,26 @@ mod tests {
                 .with_n_layers(1)
                 .with_n_heads(2),
         )
+    }
+
+    fn small_v2() -> BoardTransformerV2Config {
+        BoardTransformerV2Config::new(small().body.with_n_layers(2))
+    }
+
+    #[test]
+    fn v2_predicts_shapes_and_legal_policies() {
+        let _device = crate::nn::device_lock();
+        let device = BackendKind::preferred().device();
+        let model = small_v2().init::<Dispatch>(&device);
+        let states = [BitState::initial(), x_wins_in_one()];
+        let p = predict_host(&model, &states, &device);
+        assert_eq!(p.wdl.len(), 2);
+        assert_eq!(p.policy[0].len(), 81);
+        assert_eq!(p.policy[1].len(), 7);
+        for (wdl, policy) in p.wdl.iter().zip(&p.policy) {
+            assert!((wdl.iter().sum::<f32>() - 1.0).abs() < 1e-4);
+            assert!((policy.iter().map(|(_, p)| p).sum::<f32>() - 1.0).abs() < 1e-3);
+        }
     }
 
     /// The ids of a position, unpacked into `(content, status, forced, cells)` with the table
@@ -348,6 +459,36 @@ mod tests {
         );
         assert!(
             report.validation.policy_accuracy > report.baseline.policy_accuracy,
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "trains a network; run with: cargo test --release -- --include-ignored"]
+    fn v2_learns_the_synthetic_dataset() {
+        let _device = crate::nn::device_lock();
+        let kind = BackendKind::preferred();
+        let device = kind.device();
+        let data = synthetic_dataset(8000, 4);
+        let untrained = small_v2().init::<Dispatch>(&device);
+        let (valid, _) = data.clone().split(0.9, 0);
+        let before = evaluate(&untrained, &device, &valid.samples);
+        let options = crate::nn::train::TrainOptions {
+            batch_size: 64,
+            learning_rate: 1e-3,
+            ..opts(kind, "board-tf-v2", 20)
+        };
+        let (_, report) = train(|d| small_v2().init::<Dispatch>(d), &device, data, &options);
+        // The synthetic policy target is linear in the features of *all* boards, which the
+        // flattened perceptron of `BoardTransformer` reads directly but a per-board head only
+        // sees through the body's attention, so the margin asked of it here is smaller.
+        assert!(
+            report.validation.policy_accuracy > report.baseline.policy_accuracy + 0.05
+                && report.validation.policy_accuracy > before.policy_accuracy,
+            "{report:?} (untrained {before:?})"
+        );
+        assert!(
+            report.validation.value_mse < report.baseline.value_mse,
             "{report:?}"
         );
     }

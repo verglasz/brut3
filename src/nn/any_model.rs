@@ -10,8 +10,12 @@ use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use burn::{Dispatch, DispatchDevice};
 use serde::{Deserialize, Serialize};
 
-use super::board_transformer::{BoardTransformer, BoardTransformerConfig};
-use super::cell_transformer::{CellTransformer, CellTransformerConfig};
+use super::board_transformer::{
+    BoardTransformer, BoardTransformerConfig, BoardTransformerV2, BoardTransformerV2Config,
+};
+use super::cell_transformer::{
+    CellTransformer, CellTransformerConfig, CellTransformerV2, CellTransformerV2Config,
+};
 use super::heads::BodyConfig;
 use super::linear::{LinearNet, LinearNetConfig};
 use super::model::{HostPrediction, predict_host, predict_logits, predict_logits_tensor};
@@ -24,15 +28,19 @@ pub type Recorder = NamedMpkFileRecorder<FullPrecisionSettings>;
 pub enum ModelSpec {
     /// One linear layer per head over the flat features.
     Linear,
-    /// Transformer over nine small-board tokens.
+    /// Transformer over nine small-board tokens, perceptron heads over the flattened stream.
     BoardTransformer(BoardTransformerConfig),
-    /// Transformer over 81 cell tokens.
+    /// Transformer over 81 cell tokens, perceptron heads over the flattened stream.
     CellTransformer(CellTransformerConfig),
+    /// Board tokens with a per-token policy head and an attention readout for the value.
+    BoardTransformerV2(BoardTransformerV2Config),
+    /// Cell tokens with a per-token policy head and an attention readout for the value.
+    CellTransformerV2(CellTransformerV2Config),
 }
 
 impl ModelSpec {
-    pub const NAMES: &str = "`linear`, `board-transformer [d_model] [layers] [heads]` or \
-         `cell-transformer [d_model] [layers] [heads]`";
+    pub const NAMES: &str = "`linear`, `board-transformer`, `cell-transformer`, `board-v2` or \
+         `cell-v2`, each transformer followed by `[d_model] [layers] [heads]`";
 
     /// Parses a model name with optional hyperparameters, e.g. `linear`,
     /// `board-transformer 64 2 4` (`d_model`, layers, heads).
@@ -50,6 +58,12 @@ impl ModelSpec {
             Some("cell-transformer") => Ok(Self::CellTransformer(CellTransformerConfig::new(
                 body(&words[1..])?,
             ))),
+            Some("board-v2") => Ok(Self::BoardTransformerV2(BoardTransformerV2Config::new(
+                body(&words[1..])?,
+            ))),
+            Some("cell-v2") => Ok(Self::CellTransformerV2(CellTransformerV2Config::new(body(
+                &words[1..],
+            )?))),
             Some(other) => Err(format!("unknown model {other:?}; try {}", Self::NAMES)),
             None => Err(format!("missing model name; try {}", Self::NAMES)),
         }
@@ -60,6 +74,8 @@ impl ModelSpec {
             ModelSpec::Linear => AnyModel::Linear(LinearNetConfig::default().init(device)),
             ModelSpec::BoardTransformer(cfg) => AnyModel::BoardTransformer(cfg.init(device)),
             ModelSpec::CellTransformer(cfg) => AnyModel::CellTransformer(cfg.init(device)),
+            ModelSpec::BoardTransformerV2(cfg) => AnyModel::BoardTransformerV2(cfg.init(device)),
+            ModelSpec::CellTransformerV2(cfg) => AnyModel::CellTransformerV2(cfg.init(device)),
         }
     }
 
@@ -109,6 +125,16 @@ impl fmt::Display for ModelSpec {
                 "cell-transformer (d_model {}, {} layers, {} heads)",
                 cfg.body.d_model, cfg.body.n_layers, cfg.body.n_heads
             ),
+            ModelSpec::BoardTransformerV2(cfg) => write!(
+                f,
+                "board-v2 (d_model {}, {} layers, {} heads)",
+                cfg.body.d_model, cfg.body.n_layers, cfg.body.n_heads
+            ),
+            ModelSpec::CellTransformerV2(cfg) => write!(
+                f,
+                "cell-v2 (d_model {}, {} layers, {} heads)",
+                cfg.body.d_model, cfg.body.n_layers, cfg.body.n_heads
+            ),
         }
     }
 }
@@ -120,6 +146,8 @@ pub enum AnyModel {
     Linear(LinearNet<Dispatch>),
     BoardTransformer(BoardTransformer<Dispatch>),
     CellTransformer(CellTransformer<Dispatch>),
+    BoardTransformerV2(BoardTransformerV2<Dispatch>),
+    CellTransformerV2(CellTransformerV2<Dispatch>),
 }
 
 /// Runs `$body` with `$m` bound to the model inside `$any`, whatever its kind.
@@ -129,6 +157,8 @@ macro_rules! with_model {
             AnyModel::Linear($m) => $body,
             AnyModel::BoardTransformer($m) => $body,
             AnyModel::CellTransformer($m) => $body,
+            AnyModel::BoardTransformerV2($m) => $body,
+            AnyModel::CellTransformerV2($m) => $body,
         }
     };
 }
@@ -139,6 +169,8 @@ impl AnyModel {
             AnyModel::Linear(_) => ModelSpec::Linear,
             AnyModel::BoardTransformer(m) => ModelSpec::BoardTransformer(m.config()),
             AnyModel::CellTransformer(m) => ModelSpec::CellTransformer(m.config()),
+            AnyModel::BoardTransformerV2(m) => ModelSpec::BoardTransformerV2(m.config()),
+            AnyModel::CellTransformerV2(m) => ModelSpec::CellTransformerV2(m.config()),
         }
     }
 
@@ -197,6 +229,14 @@ impl AnyModel {
                 m.load_file(path.to_path_buf(), &Recorder::new(), device)
                     .map_err(load_err)?,
             ),
+            AnyModel::BoardTransformerV2(m) => AnyModel::BoardTransformerV2(
+                m.load_file(path.to_path_buf(), &Recorder::new(), device)
+                    .map_err(load_err)?,
+            ),
+            AnyModel::CellTransformerV2(m) => AnyModel::CellTransformerV2(
+                m.load_file(path.to_path_buf(), &Recorder::new(), device)
+                    .map_err(load_err)?,
+            ),
         })
     }
 }
@@ -236,6 +276,16 @@ mod tests {
             "not divisible"
         );
         assert!(ModelSpec::parse(&["cell-transformer", "32", "1", "2", "9"]).is_err());
+        match ModelSpec::parse(&["board-v2", "48", "3", "4"]).unwrap() {
+            ModelSpec::BoardTransformerV2(cfg) => assert_eq!(cfg.body.d_model, 48),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            ModelSpec::parse(&["cell-v2"])
+                .unwrap()
+                .to_string()
+                .starts_with("cell-v2")
+        );
         assert!(ModelSpec::parse(&["board-transformer", "big"]).is_err());
     }
 
@@ -248,6 +298,8 @@ mod tests {
         for (name, words) in [
             ("board", vec!["board-transformer", "16", "1", "2"]),
             ("cell", vec!["cell-transformer", "16", "1", "2"]),
+            ("board-v2", vec!["board-v2", "16", "1", "2"]),
+            ("cell-v2", vec!["cell-v2", "16", "1", "2"]),
         ] {
             let spec = ModelSpec::parse(&words).unwrap();
             let model = spec.init(&device);

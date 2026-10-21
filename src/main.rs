@@ -144,8 +144,8 @@ struct TrainArgs {
     /// Self-play: Dirichlet alpha of the root noise (0 disables it).
     #[arg(long, default_value_t = 0.3)]
     dirichlet_alpha: f32,
-    /// Model to train: `linear`, `board-transformer [d_model] [layers] [heads]` or
-    /// `cell-transformer [d_model] [layers] [heads]`.
+    /// Model to train: `linear`, or `board-transformer`, `cell-transformer`, `board-v2` or
+    /// `cell-v2` followed by `[d_model] [layers] [heads]`.
     #[arg(long, default_value = "linear")]
     model: String,
     /// Number of self-play games to generate.

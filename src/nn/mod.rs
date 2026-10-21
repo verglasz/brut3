@@ -25,8 +25,12 @@ pub mod train;
 pub use agent::NetAgent;
 pub use any_model::{AnyModel, ModelSpec};
 pub use backend::BackendKind;
-pub use board_transformer::{BoardTransformer, BoardTransformerConfig};
-pub use cell_transformer::{CellTransformer, CellTransformerConfig};
+pub use board_transformer::{
+    BoardTransformer, BoardTransformerConfig, BoardTransformerV2, BoardTransformerV2Config,
+};
+pub use cell_transformer::{
+    CellTransformer, CellTransformerConfig, CellTransformerV2, CellTransformerV2Config,
+};
 pub use encode::{FEATURES, encode_batch, encode_into};
 pub use linear::{LinearNet, LinearNetConfig};
 pub use model::{HostPrediction, MOVES, Model, Prediction, Verdict, expected_value};
