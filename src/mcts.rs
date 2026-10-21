@@ -104,6 +104,8 @@ impl SearchResult {
 
 const NO_NODE: u32 = u32::MAX;
 
+/// What a node is: its position and its place in the tree. Read when a node is expanded or
+/// backed up, not while choosing among siblings.
 struct Node<S> {
     state: S,
     /// Move that led here; `None` for the root.
@@ -115,17 +117,24 @@ struct Node<S> {
     expanded: bool,
     /// Claimed by the current round, awaiting evaluation.
     pending: bool,
-    visits: u32,
-    /// Sum of backed-up values, from the perspective of the side to move *at this node*.
-    value_sum: f32,
-    /// Virtual losses currently applied (paths through here claimed in the current round).
-    virtual_losses: u32,
-    prior: f32,
     outcome: Option<Outcome>,
 }
 
+/// The numbers PUCT selection reads for every child of a node, kept in their own array
+/// (parallel to the nodes, so siblings are contiguous) so that scanning the children of a
+/// node touches 16 bytes per child instead of the whole node.
+#[derive(Clone, Copy)]
+struct Stats {
+    visits: u32,
+    /// Virtual losses currently applied (paths through here claimed in the current round).
+    virtual_losses: u32,
+    /// Sum of backed-up values, from the perspective of the side to move *at this node*.
+    value_sum: f32,
+    prior: f32,
+}
+
 impl<S: GameState> Node<S> {
-    fn new(state: S, mv: Option<Move>, parent: u32, prior: f32) -> Self {
+    fn new(state: S, mv: Option<Move>, parent: u32) -> Self {
         let outcome = state.outcome();
         Self {
             state,
@@ -135,16 +144,23 @@ impl<S: GameState> Node<S> {
             n_children: 0,
             expanded: false,
             pending: false,
-            visits: 0,
-            value_sum: 0.0,
-            virtual_losses: 0,
-            prior,
             outcome,
         }
     }
 
     fn children(&self) -> std::ops::Range<u32> {
         self.first_child..self.first_child + self.n_children as u32
+    }
+}
+
+impl Stats {
+    fn new(prior: f32) -> Self {
+        Self {
+            visits: 0,
+            virtual_losses: 0,
+            value_sum: 0.0,
+            prior,
+        }
     }
 
     /// Visits including virtual ones.
@@ -190,6 +206,8 @@ enum Selection {
 /// hand the results to [`SearchTree::resolve`]; repeat until [`SearchTree::is_done`].
 pub struct SearchTree<S: GameState> {
     nodes: Vec<Node<S>>,
+    /// `stats[i]` belongs to `nodes[i]`.
+    stats: Vec<Stats>,
     c_puct: f32,
     virtual_loss: f32,
     /// Leaves claimed in the current round, in claim order.
@@ -204,7 +222,8 @@ impl<S: GameState> SearchTree<S> {
     /// A search from `root` of `simulations` leaf evaluations.
     pub fn new(root: S, simulations: u32, c_puct: f32, virtual_loss: f32) -> Self {
         Self {
-            nodes: vec![Node::new(root, None, NO_NODE, 1.0)],
+            nodes: vec![Node::new(root, None, NO_NODE)],
+            stats: vec![Stats::new(1.0)],
             c_puct,
             virtual_loss,
             claimed: Vec::new(),
@@ -301,12 +320,13 @@ impl<S: GameState> SearchTree<S> {
         let visits = root
             .children()
             .map(|c| {
-                let child = &self.nodes[c as usize];
-                (child.mv.expect("child has a move"), child.visits)
+                let mv = self.nodes[c as usize].mv.expect("child has a move");
+                (mv, self.stats[c as usize].visits)
             })
             .collect();
+        let root_stats = &self.stats[0];
         SearchResult {
-            root_value: root.value_sum / root.visits.max(1) as f32,
+            root_value: root_stats.value_sum / root_stats.visits.max(1) as f32,
             visits,
         }
     }
@@ -330,18 +350,18 @@ impl<S: GameState> SearchTree<S> {
     }
 
     fn select_child(&self, idx: u32) -> u32 {
-        let node = &self.nodes[idx as usize];
-        let sqrt_n = (node.effective_visits() as f32).sqrt();
-        let mut best = node.first_child;
+        let children = self.nodes[idx as usize].children();
+        let sqrt_n = (self.stats[idx as usize].effective_visits() as f32).sqrt();
+        let mut best = children.start;
         let mut best_score = f32::NEG_INFINITY;
-        for c in node.children() {
-            let child = &self.nodes[c as usize];
+        let first = children.start as usize;
+        for (i, child) in self.stats[first..children.end as usize].iter().enumerate() {
             let exploration =
                 self.c_puct * child.prior * sqrt_n / (1.0 + child.effective_visits() as f32);
             let score = child.q_for_parent(self.virtual_loss) + exploration;
             if score > best_score {
                 best_score = score;
-                best = c;
+                best = (first + i) as u32;
             }
         }
         best
@@ -349,17 +369,15 @@ impl<S: GameState> SearchTree<S> {
 
     fn add_virtual_loss(&mut self, mut idx: u32) {
         while idx != NO_NODE {
-            let node = &mut self.nodes[idx as usize];
-            node.virtual_losses += 1;
-            idx = node.parent;
+            self.stats[idx as usize].virtual_losses += 1;
+            idx = self.nodes[idx as usize].parent;
         }
     }
 
     fn remove_virtual_loss(&mut self, mut idx: u32) {
         while idx != NO_NODE {
-            let node = &mut self.nodes[idx as usize];
-            node.virtual_losses -= 1;
-            idx = node.parent;
+            self.stats[idx as usize].virtual_losses -= 1;
+            idx = self.nodes[idx as usize].parent;
         }
     }
 
@@ -367,11 +385,11 @@ impl<S: GameState> SearchTree<S> {
     /// at each step.
     fn backup(&mut self, mut idx: u32, mut value: f32) {
         while idx != NO_NODE {
-            let node = &mut self.nodes[idx as usize];
-            node.visits += 1;
-            node.value_sum += value;
+            let stats = &mut self.stats[idx as usize];
+            stats.visits += 1;
+            stats.value_sum += value;
             value = -value;
-            idx = node.parent;
+            idx = self.nodes[idx as usize].parent;
         }
     }
 
@@ -396,8 +414,8 @@ impl<S: GameState> SearchTree<S> {
             };
             let mut child_state = state.clone();
             child_state.apply(mv);
-            self.nodes
-                .push(Node::new(child_state, Some(mv), idx, prior));
+            self.nodes.push(Node::new(child_state, Some(mv), idx));
+            self.stats.push(Stats::new(prior));
         }
 
         let node = &mut self.nodes[idx as usize];
@@ -417,7 +435,7 @@ impl<S: GameState> SearchTree<S> {
         let children = self.nodes[0].children();
         let sample = dirichlet(rng, noise.alpha, children.len());
         for (c, d) in children.zip(sample) {
-            let child = &mut self.nodes[c as usize];
+            let child = &mut self.stats[c as usize];
             child.prior = (1.0 - noise.fraction) * child.prior + noise.fraction * d;
         }
     }
@@ -427,8 +445,8 @@ impl<S: GameState> SearchTree<S> {
         self.nodes[0]
             .children()
             .map(|c| {
-                let n = &self.nodes[c as usize];
-                (n.mv.unwrap(), n.prior, n.visits)
+                let (n, s) = (&self.nodes[c as usize], &self.stats[c as usize]);
+                (n.mv.unwrap(), s.prior, s.visits)
             })
             .collect()
     }
@@ -437,13 +455,14 @@ impl<S: GameState> SearchTree<S> {
     /// expanded node's visits equal its own evaluation plus its children's visits.
     #[cfg(test)]
     pub(crate) fn assert_consistent(&self) {
-        for (i, node) in self.nodes.iter().enumerate() {
-            assert_eq!(node.virtual_losses, 0, "node {i} has virtual losses");
+        assert_eq!(self.nodes.len(), self.stats.len());
+        for (i, (node, stats)) in self.nodes.iter().zip(&self.stats).enumerate() {
+            assert_eq!(stats.virtual_losses, 0, "node {i} has virtual losses");
             assert!(!node.pending, "node {i} still pending");
             if node.expanded {
                 let child_visits: u32 =
-                    node.children().map(|c| self.nodes[c as usize].visits).sum();
-                assert_eq!(node.visits, child_visits + 1, "node {i} visit mismatch");
+                    node.children().map(|c| self.stats[c as usize].visits).sum();
+                assert_eq!(stats.visits, child_visits + 1, "node {i} visit mismatch");
             }
         }
     }
