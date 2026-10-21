@@ -86,8 +86,3 @@ pub fn encode_all_to_all<B: Backend>(
 ) -> Tensor<B, 3> {
     encoder.forward(TransformerEncoderInput::new(tokens))
 }
-
-/// Position ids `0..n` as a `[1, n]` int tensor, for a positional embedding.
-pub fn positions<B: Backend>(n: usize, device: &B::Device) -> Tensor<B, 2, Int> {
-    Tensor::<B, 1, Int>::arange(0..n as i64, device).reshape([1, n])
-}

@@ -3,15 +3,17 @@
 //! Each cell is one token: an embedding of its content (empty, mine, theirs, from the side to
 //! move's view) plus embeddings of its position among the 81 cells, the status of the small
 //! board it belongs to (open, won by me, won by them, full), whether that board is the forced
-//! one, and whether the cell is a legal move right now. The tokens go through pre-norm encoder
-//! layers with all-to-all attention, and two perceptron heads read the flattened final
-//! residual stream to produce the move and outcome logits.
+//! one, and whether the cell is a legal move right now. All five live in one embedding table
+//! at distinct offsets, so a position is `81 * 5` ids in one upload and one gather, summed per
+//! cell. The tokens go through pre-norm encoder layers with all-to-all attention, and two
+//! perceptron heads read the flattened final residual stream to produce the move and outcome
+//! logits.
 
 use burn::nn::transformer::TransformerEncoder;
 use burn::nn::{Embedding, EmbeddingConfig};
 use burn::prelude::*;
 
-use super::heads::{BodyConfig, Perceptron, PerceptronConfig, encode_all_to_all, positions};
+use super::heads::{BodyConfig, Perceptron, PerceptronConfig, encode_all_to_all};
 use super::model::{MOVES, Model, Prediction, Verdict};
 use crate::game::{BitState, BoardStatus, GameState, Move, MoveSet, Square};
 
@@ -20,6 +22,18 @@ const CELLS: usize = MOVES;
 const CONTENTS: usize = 3;
 /// Board statuses: open, won by me, won by them, full.
 const STATUSES: usize = 4;
+
+// One embedding table holds every kind of id, each kind at its own offset.
+const CONTENT_BASE: usize = 0;
+const POSITION_BASE: usize = CONTENT_BASE + CONTENTS;
+const STATUS_BASE: usize = POSITION_BASE + CELLS;
+const FORCED_BASE: usize = STATUS_BASE + STATUSES;
+const LEGAL_BASE: usize = FORCED_BASE + 2;
+const VOCABULARY: usize = LEGAL_BASE + 2;
+/// Ids per cell token: content, position, status, forced, legal.
+const IDS_PER_CELL: usize = 5;
+/// Ids per position.
+pub const IDS: usize = CELLS * IDS_PER_CELL;
 
 #[derive(Config, Debug, PartialEq)]
 pub struct CellTransformerConfig {
@@ -61,11 +75,7 @@ impl CellTransformerConfig {
         };
         CellTransformer {
             config: self.clone(),
-            content: embedding(CONTENTS),
-            position: embedding(CELLS),
-            status: embedding(STATUSES),
-            forced: embedding(2),
-            legal: embedding(2),
+            embed: embedding(VOCABULARY),
             body: self.body.init(device),
             policy_head: head(MOVES),
             wdl_head: head(Verdict::ALL.len()),
@@ -77,66 +87,57 @@ impl CellTransformerConfig {
 pub struct CellTransformer<B: Backend> {
     #[module(skip)]
     config: CellTransformerConfig,
-    content: Embedding<B>,
-    position: Embedding<B>,
-    status: Embedding<B>,
-    forced: Embedding<B>,
-    legal: Embedding<B>,
+    /// Content, position, status, forced and legal embeddings, at the `*_BASE` offsets.
+    embed: Embedding<B>,
     body: TransformerEncoder<B>,
     policy_head: Perceptron<B>,
     wdl_head: Perceptron<B>,
 }
 
-/// Per-cell token ids for a batch, each `[batch, 81]` indexed by `Move::index`.
-#[derive(Clone, Debug)]
-pub struct CellTokens<B: Backend> {
-    /// `0` empty, `1` mine, `2` theirs.
-    pub content: Tensor<B, 2, Int>,
-    /// Status of the cell's board: `0` open, `1` won by me, `2` won by them, `3` full.
-    pub status: Tensor<B, 2, Int>,
-    /// `1` if the cell's board is the forced board.
-    pub forced: Tensor<B, 2, Int>,
-    /// `1` if playing this cell is legal now.
-    pub legal: Tensor<B, 2, Int>,
-}
+/// Embedding ids for a batch: `[batch, IDS]`, see [`cell_token_ids`].
+pub type CellTokens<B> = Tensor<B, 2, Int>;
 
-/// Token ids of one position, from the side to move's view: `(content, status, forced, legal)`.
-pub fn cell_token_ids(
-    state: &BitState,
-) -> ([i32; CELLS], [i32; CELLS], [i32; CELLS], [i32; CELLS]) {
+/// Embedding ids of one position, cell-major by `Move::index`: for each cell its content
+/// (`0` empty, `1` mine, `2` theirs), position, its board's status (`0` open, `1` won by me,
+/// `2` won by them, `3` full), whether that board is the forced one and whether the cell is a
+/// legal move now, each at its table offset.
+pub type CellTokenIds = [i32; IDS];
+
+/// Writes the ids of `state`, from the side to move's view, into `out`.
+pub fn cell_token_ids(state: &BitState, out: &mut CellTokenIds) {
     let me = state.to_move();
     let them = me.other();
     let forced_board = state.forced_board();
     let legal_moves = state.legal_moves();
-    let mut content = [0; CELLS];
-    let mut status = [0; CELLS];
-    let mut forced = [0; CELLS];
-    let mut legal = [0; CELLS];
     for (b, board) in Square::ALL.iter().enumerate() {
         let mine = state.board_marks(me, b);
         let theirs = state.board_marks(them, b);
-        let board_status = match state.board_status(*board) {
-            BoardStatus::Open => 0,
-            BoardStatus::Won(p) if p == me => 1,
-            BoardStatus::Won(_) => 2,
-            BoardStatus::Full => 3,
-        };
-        let board_forced = i32::from(forced_board == Some(*board));
-        for (c, square) in Square::ALL.iter().enumerate() {
-            let i = Move::new(*board, *square).index();
-            content[i] = if mine >> c & 1 != 0 {
-                1
-            } else if theirs >> c & 1 != 0 {
-                2
-            } else {
-                0
+        let status = STATUS_BASE as i32
+            + match state.board_status(*board) {
+                BoardStatus::Open => 0,
+                BoardStatus::Won(p) if p == me => 1,
+                BoardStatus::Won(_) => 2,
+                BoardStatus::Full => 3,
             };
-            status[i] = board_status;
-            forced[i] = board_forced;
-            legal[i] = i32::from(legal_moves.contains(Move::new(*board, *square)));
+        let forced = FORCED_BASE as i32 + i32::from(forced_board == Some(*board));
+        for (c, square) in Square::ALL.iter().enumerate() {
+            let mv = Move::new(*board, *square);
+            let i = mv.index();
+            let token = &mut out[i * IDS_PER_CELL..(i + 1) * IDS_PER_CELL];
+            token[0] = CONTENT_BASE as i32
+                + if mine >> c & 1 != 0 {
+                    1
+                } else if theirs >> c & 1 != 0 {
+                    2
+                } else {
+                    0
+                };
+            token[1] = (POSITION_BASE + i) as i32;
+            token[2] = status;
+            token[3] = forced;
+            token[4] = LEGAL_BASE as i32 + i32::from(legal_moves.contains(mv));
         }
     }
-    (content, status, forced, legal)
 }
 
 impl<B: Backend> CellTransformer<B> {
@@ -150,33 +151,24 @@ impl<B: Backend> Model<B> for CellTransformer<B> {
 
     fn encode(states: &[BitState], device: &B::Device) -> CellTokens<B> {
         let n = states.len();
-        let mut content = Vec::with_capacity(n * CELLS);
-        let mut status = Vec::with_capacity(n * CELLS);
-        let mut forced = Vec::with_capacity(n * CELLS);
-        let mut legal = Vec::with_capacity(n * CELLS);
-        for state in states {
-            let (c, s, f, l) = cell_token_ids(state);
-            content.extend_from_slice(&c);
-            status.extend_from_slice(&s);
-            forced.extend_from_slice(&f);
-            legal.extend_from_slice(&l);
+        let mut ids = vec![0i32; n * IDS];
+        for (state, out) in states.iter().zip(ids.chunks_exact_mut(IDS)) {
+            cell_token_ids(state, out.try_into().expect("IDS ids per position"));
         }
-        let tensor = |v: Vec<i32>| Tensor::from_data(TensorData::new(v, [n, CELLS]), device);
-        CellTokens {
-            content: tensor(content),
-            status: tensor(status),
-            forced: tensor(forced),
-            legal: tensor(legal),
-        }
+        Tensor::from_data(TensorData::new(ids, [n, IDS]), device)
     }
 
     fn predict(&self, input: CellTokens<B>) -> Prediction<B> {
-        let device = input.content.device();
-        let tokens = self.content.forward(input.content)
-            + self.status.forward(input.status)
-            + self.forced.forward(input.forced)
-            + self.legal.forward(input.legal)
-            + self.position.forward(positions(CELLS, &device));
+        let n = input.dims()[0];
+        let d = self.config.body.d_model;
+        // One gather for every id, then the 5 embeddings of each cell summed into its token:
+        // [n, 405, d] -> [n, 81, 5, d] -> [n, 81, d].
+        let tokens = self
+            .embed
+            .forward(input)
+            .reshape([n, CELLS, IDS_PER_CELL, d])
+            .sum_dim(2)
+            .reshape([n, CELLS, d]);
         let stream = encode_all_to_all(&self.body, tokens).flatten::<2>(1, 2);
         Prediction {
             wdl: self.wdl_head.forward(stream.clone()),
@@ -208,16 +200,34 @@ mod tests {
         )
     }
 
+    /// The ids of a position, unpacked into `(content, status, forced, legal)` with the table
+    /// offsets removed; checks the position ids on the way.
+    fn unpacked(state: &BitState) -> ([i32; 81], [i32; 81], [i32; 81], [i32; 81]) {
+        let mut ids = [0; IDS];
+        cell_token_ids(state, &mut ids);
+        assert!(ids.iter().all(|&id| (id as usize) < VOCABULARY));
+        let (mut content, mut status, mut forced, mut legal) = ([0; 81], [0; 81], [0; 81], [0; 81]);
+        for i in 0..CELLS {
+            let token = &ids[i * IDS_PER_CELL..(i + 1) * IDS_PER_CELL];
+            content[i] = token[0] - CONTENT_BASE as i32;
+            assert_eq!(token[1] as usize, POSITION_BASE + i);
+            status[i] = token[2] - STATUS_BASE as i32;
+            forced[i] = token[3] - FORCED_BASE as i32;
+            legal[i] = token[4] - LEGAL_BASE as i32;
+        }
+        (content, status, forced, legal)
+    }
+
     #[test]
     fn token_ids_describe_the_position() {
-        let (content, status, forced, legal) = cell_token_ids(&BitState::initial());
+        let (content, status, forced, legal) = unpacked(&BitState::initial());
         assert_eq!(content, [0; 81]);
         assert_eq!(status, [0; 81]);
         assert_eq!(forced, [0; 81]);
         assert_eq!(legal, [1; 81]);
 
         let state = x_wins_in_one(); // X to move, boards 0 and 1 won by X, forced to board 2
-        let (content, status, forced, legal) = cell_token_ids(&state);
+        let (content, status, forced, legal) = unpacked(&state);
         let at = |b: Square, s: Square| Move::new(b, s).index();
         assert_eq!(content[at(sq(0, 2), sq(0, 0))], 1, "X's own mark");
         assert_eq!(content[at(sq(1, 1), sq(2, 0))], 2, "O's mark");
