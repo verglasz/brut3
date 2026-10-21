@@ -149,15 +149,45 @@ pub fn predict_logits<B: Backend, M: Model<B>>(
     logits_to_host(predict_logits_tensor(model, states, device))
 }
 
+/// Smallest batch the device is asked for; see [`padded_len`].
+const MIN_BATCH: usize = 32;
+
+/// The batch size the device sees for `n` positions: `n` rounded up to a multiple of an
+/// eighth of its power-of-two octave (so 8 sizes per octave, under 12.5% padding), at least
+/// [`MIN_BATCH`]. Kernels and autotune results are compiled per shape, and self-play batches
+/// shrink round by round as games finish, so unpadded batches made the CUDA runtime compile
+/// kernels for every new size: two thirds of all CPU time in a profile. With a few dozen
+/// sizes in all, the compiled kernels serve every round after the first few.
+fn padded_len(n: usize) -> usize {
+    let n = n.max(MIN_BATCH);
+    let step = (n.next_power_of_two() / 16).max(1);
+    n.div_ceil(step) * step
+}
+
 /// The `[n, LOGITS]` tensor behind [`predict_logits`], still on the device: queue it with
 /// this, do other work, then read it with [`logits_to_host`]. `states` must not be empty.
+/// The batch is padded to [`padded_len`] positions on the way and the padding sliced off.
 pub fn predict_logits_tensor<B: Backend, M: Model<B>>(
     model: &M,
     states: &[BitState],
     device: &B::Device,
 ) -> Tensor<B, 2> {
-    let prediction = model.predict(M::encode(states, device));
-    Tensor::cat(vec![prediction.wdl, prediction.policy], 1)
+    let n = states.len();
+    let padded = padded_len(n);
+    let prediction = if padded == n {
+        model.predict(M::encode(states, device))
+    } else {
+        let mut full = Vec::with_capacity(padded);
+        full.extend_from_slice(states);
+        full.resize(padded, states[0]);
+        model.predict(M::encode(&full, device))
+    };
+    let logits = Tensor::cat(vec![prediction.wdl, prediction.policy], 1);
+    if padded == n {
+        logits
+    } else {
+        logits.slice([0..n])
+    }
 }
 
 /// Reads a [`predict_logits_tensor`] result back, row-major.
@@ -222,6 +252,24 @@ pub fn predict_host<B: Backend, M: Model<B>>(
 mod tests {
     use super::*;
     use crate::game::test_positions::x_wins_in_one;
+
+    #[test]
+    fn padded_len_rounds_up_to_eighths_of_an_octave() {
+        assert_eq!(padded_len(1), MIN_BATCH);
+        assert_eq!(padded_len(MIN_BATCH), MIN_BATCH);
+        assert_eq!(padded_len(33), 36);
+        assert_eq!(padded_len(575), 576);
+        assert_eq!(padded_len(577), 640);
+        assert_eq!(padded_len(1024), 1024);
+        assert_eq!(padded_len(1025), 1152);
+        for n in 1..5000 {
+            let p = padded_len(n);
+            assert!(
+                p >= n && (p - n) as f32 <= 0.125 * p as f32 || p == MIN_BATCH,
+                "{n} -> {p}"
+            );
+        }
+    }
 
     #[test]
     fn verdict_round_trips() {
