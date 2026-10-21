@@ -187,9 +187,9 @@ The search is generic over the agent that evaluates leaves:
   `--model cell-transformer ...`. `board-v2` and `cell-v2` keep the same encoders but replace
   the perceptron heads, which hold most of the cell model's parameters, with per-token heads:
   the policy is one shared linear map per token (a board token to its nine cells' logits, a
-  cell token to its own), and the value is an `AttentionReadout`, a single learned query that
-  cross-attends over all encoder positions, followed by a feed-forward block and a linear map
-  to the three verdict logits.
+  cell token to its own), and the value comes from a class token (`ClsReadout`) that goes
+  through the encoder with the board or cell tokens and is read off the end through a final
+  layer norm and a linear map to the three verdict logits.
 - `benchmark` plays round-robin matches between any agents (colours alternate) and prints
   pairwise results and standings, for comparing trained models with each other and with the
   search and heuristic baselines.

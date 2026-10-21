@@ -1,10 +1,8 @@
 //! Pieces shared by the transformer models: the encoder body and the perceptron heads.
 
 use burn::module::Param;
-use burn::nn::attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig};
 use burn::nn::transformer::{
-    PositionWiseFeedForward, PositionWiseFeedForwardConfig, TransformerEncoder,
-    TransformerEncoderConfig, TransformerEncoderInput,
+    TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput,
 };
 use burn::nn::{
     Dropout, DropoutConfig, Embedding, EmbeddingConfig, Gelu, Initializer, LayerNorm,
@@ -95,65 +93,52 @@ impl BodyConfig {
     }
 }
 
-/// Reads the whole residual stream through one learned query: a decoder layer with a single
-/// query token that cross-attends to every encoder position (pre-norm, residual), then a
-/// feed-forward block and a linear map to `d_output`. Unlike a perceptron over the flattened
-/// stream, its size does not grow with the number of tokens.
+/// A class token for the per-token models: a learned token prepended to the encoder input, so
+/// that it mixes with every position in every layer, and read off the end of the stream
+/// through a final layer norm and a linear map to `d_output`. The same final norm is applied
+/// to the other tokens for the per-token heads, as in GPT-2's `ln_f`.
 #[derive(Config, Debug, PartialEq)]
-pub struct AttentionReadoutConfig {
+pub struct ClsReadoutConfig {
     pub d_model: usize,
-    pub n_heads: usize,
-    pub d_ff: usize,
     pub d_output: usize,
-    #[config(default = 0.0)]
-    pub dropout: f64,
 }
 
-impl AttentionReadoutConfig {
-    pub fn init<B: Backend>(&self, device: &B::Device) -> AttentionReadout<B> {
-        AttentionReadout {
-            query: Initializer::Normal {
+impl ClsReadoutConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> ClsReadout<B> {
+        ClsReadout {
+            cls: Initializer::Normal {
                 mean: 0.0,
                 std: 0.02,
             }
             .init([1, 1, self.d_model], device),
-            norm_stream: LayerNormConfig::new(self.d_model).init(device),
-            attention: MultiHeadAttentionConfig::new(self.d_model, self.n_heads)
-                .with_dropout(self.dropout)
-                .init(device),
-            norm_ff: LayerNormConfig::new(self.d_model).init(device),
-            ff: PositionWiseFeedForwardConfig::new(self.d_model, self.d_ff)
-                .with_dropout(self.dropout)
-                .init(device),
+            norm: LayerNormConfig::new(self.d_model).init(device),
             output: LinearConfig::new(self.d_model, self.d_output).init(device),
         }
     }
 }
 
 #[derive(Module, Debug)]
-pub struct AttentionReadout<B: Backend> {
-    /// The single query token, `[1, 1, d_model]`.
-    query: Param<Tensor<B, 3>>,
-    norm_stream: LayerNorm<B>,
-    attention: MultiHeadAttention<B>,
-    norm_ff: LayerNorm<B>,
-    ff: PositionWiseFeedForward<B>,
+pub struct ClsReadout<B: Backend> {
+    /// The class token, `[1, 1, d_model]`.
+    cls: Param<Tensor<B, 3>>,
+    norm: LayerNorm<B>,
     output: Linear<B>,
 }
 
-impl<B: Backend> AttentionReadout<B> {
-    /// `[batch, tokens, d_model] -> [batch, d_output]`
-    pub fn forward(&self, stream: Tensor<B, 3>) -> Tensor<B, 2> {
-        let [n, _, d] = stream.dims();
-        let query = self.query.val().expand([n, 1, d]);
-        let keys = self.norm_stream.forward(stream);
-        let context = self
-            .attention
-            .forward(MhaInput::new(query.clone(), keys.clone(), keys))
-            .context;
-        let h = query + context;
-        let h = h.clone() + self.ff.forward(self.norm_ff.forward(h));
-        self.output.forward(h.reshape([n, d]))
+impl<B: Backend> ClsReadout<B> {
+    /// `[batch, tokens, d_model] -> [batch, tokens + 1, d_model]`, the class token first.
+    pub fn prepend(&self, tokens: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [n, _, d] = tokens.dims();
+        Tensor::cat(vec![self.cls.val().expand([n, 1, d]), tokens], 1)
+    }
+
+    /// Splits the encoded stream `[batch, tokens + 1, d_model]` into the class output
+    /// `[batch, d_output]` and the normalised token stream `[batch, tokens, d_model]`.
+    pub fn split(&self, stream: Tensor<B, 3>) -> (Tensor<B, 2>, Tensor<B, 3>) {
+        let [n, t1, d] = stream.dims();
+        let stream = self.norm.forward(stream);
+        let cls = stream.clone().slice([0..n, 0..1]).reshape([n, d]);
+        (self.output.forward(cls), stream.slice([0..n, 1..t1]))
     }
 }
 

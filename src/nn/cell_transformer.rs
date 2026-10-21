@@ -14,7 +14,7 @@ use burn::nn::{Embedding, Linear, LinearConfig};
 use burn::prelude::*;
 
 use super::heads::{
-    AttentionReadout, AttentionReadoutConfig, BodyConfig, Perceptron, PerceptronConfig, embedding,
+    BodyConfig, ClsReadout, ClsReadoutConfig, Perceptron, PerceptronConfig, embedding,
     encode_all_to_all,
 };
 use super::model::{MOVES, Model, Prediction, Verdict};
@@ -58,18 +58,26 @@ impl<B: Backend> CellEncoder<B> {
         }
     }
 
-    /// One gather for every id, then the 5 embeddings of each cell summed into its token
-    /// (`[n, 405, d] -> [n, 81, 5, d] -> [n, 81, d]`), then the encoder.
-    pub fn forward(&self, input: CellTokens<B>) -> Tensor<B, 3> {
+    /// One gather for every id, then the 5 embeddings of each cell summed into its token:
+    /// `[n, 405, d] -> [n, 81, 5, d] -> [n, 81, d]`.
+    pub fn tokens(&self, input: CellTokens<B>) -> Tensor<B, 3> {
         let n = input.dims()[0];
         let d = self.d_model;
-        let tokens = self
-            .embed
+        self.embed
             .forward(input)
             .reshape([n, CELLS, IDS_PER_CELL, d])
             .sum_dim(2)
-            .reshape([n, CELLS, d]);
+            .reshape([n, CELLS, d])
+    }
+
+    /// The encoder body over any token sequence `[n, tokens, d]`.
+    pub fn body(&self, tokens: Tensor<B, 3>) -> Tensor<B, 3> {
         encode_all_to_all(&self.body, tokens)
+    }
+
+    /// Ids in, residual stream `[n, 81, d]` out.
+    pub fn forward(&self, input: CellTokens<B>) -> Tensor<B, 3> {
+        self.body(self.tokens(input))
     }
 }
 
@@ -122,9 +130,10 @@ pub struct CellTransformer<B: Backend> {
     wdl_head: Perceptron<B>,
 }
 
-/// [`CellTransformerV2`]: the same encoder with per-token heads. Each cell token is one move,
-/// so the policy is one linear map, shared by the 81 tokens, from a token to its logit; the
-/// value is an [`AttentionReadout`] whose single query attends over all 81 tokens.
+/// [`CellTransformerV2`]: the same encoder with per-token heads. A class token
+/// ([`ClsReadout`]) goes through the encoder with the 81 cell tokens and is read out as the
+/// value; each cell token is one move, so the policy is one linear map, shared by the cell
+/// tokens, from a token to its logit. Both read the stream through one final layer norm.
 #[derive(Config, Debug, PartialEq)]
 pub struct CellTransformerV2Config {
     pub body: BodyConfig,
@@ -142,14 +151,7 @@ impl CellTransformerV2Config {
             config: self.clone(),
             encoder: CellEncoder::init(&self.body, device),
             policy: LinearConfig::new(self.body.d_model, 1).init(device),
-            wdl: AttentionReadoutConfig::new(
-                self.body.d_model,
-                self.body.n_heads,
-                self.body.d_ff(),
-                Verdict::ALL.len(),
-            )
-            .with_dropout(self.body.dropout)
-            .init(device),
+            cls: ClsReadoutConfig::new(self.body.d_model, Verdict::ALL.len()).init(device),
         }
     }
 }
@@ -160,7 +162,7 @@ pub struct CellTransformerV2<B: Backend> {
     config: CellTransformerV2Config,
     encoder: CellEncoder<B>,
     policy: Linear<B>,
-    wdl: AttentionReadout<B>,
+    cls: ClsReadout<B>,
 }
 
 /// Embedding ids for a batch: `[batch, IDS]`, see [`cell_token_ids`].
@@ -257,14 +259,13 @@ impl<B: Backend> Model<B> for CellTransformerV2<B> {
     }
 
     fn predict(&self, input: CellTokens<B>) -> Prediction<B> {
-        let stream = self.encoder.forward(input);
-        let n = stream.dims()[0];
-        // Tokens are in `Move::index` order, one logit each.
-        let policy = self.policy.forward(stream.clone()).reshape([n, MOVES]);
-        Prediction {
-            wdl: self.wdl.forward(stream),
-            policy,
-        }
+        let tokens = self.encoder.tokens(input);
+        let n = tokens.dims()[0];
+        let stream = self.encoder.body(self.cls.prepend(tokens));
+        let (wdl, cells) = self.cls.split(stream);
+        // Cell tokens are in `Move::index` order, one logit each.
+        let policy = self.policy.forward(cells).reshape([n, MOVES]);
+        Prediction { wdl, policy }
     }
 }
 
