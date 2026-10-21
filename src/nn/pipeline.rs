@@ -82,6 +82,11 @@ impl ReplayBuffer {
         }
     }
 
+    /// Changes the capacity; the oldest games beyond it are dropped at the next push.
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity.max(1);
+    }
+
     /// Adds every game of `data` (grouped by its game id), dropping the oldest beyond capacity.
     pub fn push(&mut self, data: Dataset) {
         let mut by_game: std::collections::BTreeMap<usize, Vec<Sample>> = Default::default();
@@ -123,12 +128,24 @@ pub struct LoopConfig {
     /// Continue from `dir/best` and the existing history instead of fresh weights.
     pub resume: bool,
     pub generations: usize,
-    /// Self-play games per generation.
+    /// Self-play games of the first generation.
     pub games: usize,
+    /// Games schedule: the count grows by this factor per generation (`1.0` keeps it fixed)
+    /// up to `max_games`.
+    pub games_growth: f64,
+    pub max_games: usize,
     pub selfplay: SelfPlayConfig,
-    /// Games kept in the replay buffer.
+    /// Games kept in the replay buffer when `buffer_generations` is zero.
     pub buffer_games: usize,
+    /// When nonzero, the buffer keeps the games of the last this many generations instead
+    /// of a fixed game count (so that it follows the games schedule).
+    pub buffer_generations: usize,
+    /// Training options of the first generation; the learning rate then follows the schedule.
     pub train: TrainOptions,
+    /// Learning-rate schedule: multiplied by this factor per generation (`1.0` keeps it
+    /// fixed), never below `lr_min`.
+    pub lr_decay: f64,
+    pub lr_min: f64,
     /// Promotion match: games, simulations per move, per-tree batch.
     pub eval_games: usize,
     pub eval_simulations: u32,
@@ -149,6 +166,8 @@ pub struct LoopConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenerationReport {
     pub generation: usize,
+    /// Learning rate of this generation's training, from the schedule.
+    pub learning_rate: f64,
     pub selfplay: SelfPlayStats,
     pub buffer_games: usize,
     pub buffer_positions: usize,
@@ -165,6 +184,7 @@ impl GenerationReport {
     fn to_json(&self) -> serde_json::Value {
         json!({
             "generation": self.generation,
+            "learning_rate": self.learning_rate,
             "selfplay": {
                 "games": self.selfplay.games,
                 "positions": self.selfplay.positions,
@@ -202,6 +222,20 @@ impl GenerationReport {
                 .collect::<serde_json::Map<_, _>>(),
             "seconds": self.seconds,
         })
+    }
+}
+
+impl LoopConfig {
+    /// Self-play games of `generation` (1-based) under the games schedule.
+    pub fn games_at(&self, generation: usize) -> usize {
+        let grown = self.games as f64 * self.games_growth.powi(generation as i32 - 1);
+        (grown.round() as usize).clamp(1, self.max_games.max(1))
+    }
+
+    /// Learning rate of `generation` (1-based) under the schedule.
+    pub fn learning_rate_at(&self, generation: usize) -> f64 {
+        let decayed = self.train.learning_rate * self.lr_decay.powi(generation as i32 - 1);
+        decayed.max(self.lr_min)
     }
 }
 
@@ -283,12 +317,16 @@ pub fn run_loop(
     }
 
     let mut buffer = ReplayBuffer::new(cfg.buffer_games);
+    // Games per generation so far, for a buffer measured in generations.
+    let mut recent_games: VecDeque<usize> = VecDeque::new();
     let mut reports = Vec::new();
     let loop_started = Instant::now();
     for generation in first + 1..=first + cfg.generations {
         let started = Instant::now();
+        let games = cfg.games_at(generation);
+        let learning_rate = cfg.learning_rate_at(generation);
         log(format!(
-            "generation {generation}: self-play with the best model"
+            "generation {generation}: self-play of {games} games with the best model"
         ));
         let evaluator = AgentSpec::Nn {
             path: best.clone(),
@@ -298,7 +336,7 @@ pub fn run_loop(
             seed: cfg.selfplay.seed.wrapping_add(generation as u64),
             ..cfg.selfplay.clone()
         };
-        let (data, stats) = generate_parallel(&evaluator, cfg.games, &selfplay, |_| {})?;
+        let (data, stats) = generate_parallel(&evaluator, games, &selfplay, |_| {})?;
         log(format!(
             "  {} positions from {} games, {:.0} simulations/s, mean batch {:.1}",
             data.len(),
@@ -306,15 +344,23 @@ pub fn run_loop(
             stats.simulations_per_second(),
             stats.mean_batch()
         ));
+        if cfg.buffer_generations > 0 {
+            recent_games.push_back(games);
+            while recent_games.len() > cfg.buffer_generations {
+                recent_games.pop_front();
+            }
+            buffer.set_capacity(recent_games.iter().sum());
+        }
         buffer.push(data);
 
         log(format!(
-            "  training {} on {} positions from {} buffered games",
+            "  training {} on {} positions from {} buffered games at lr {learning_rate:.2e}",
             last.display(),
             buffer.positions(),
             buffer.games()
         ));
         let train_opts = TrainOptions {
+            learning_rate,
             seed: cfg.train.seed.wrapping_add(generation as u64),
             artifact_dir: cfg.dir.join(format!("artifacts-gen-{generation}")),
             ..cfg.train.clone()
@@ -392,6 +438,7 @@ pub fn run_loop(
 
         let report = GenerationReport {
             generation,
+            learning_rate,
             selfplay: stats,
             buffer_games: buffer.games(),
             buffer_positions: buffer.positions(),
@@ -446,6 +493,43 @@ mod tests {
     use crate::nn::train::temp_artifact_dir;
 
     #[test]
+    fn schedules_grow_games_and_decay_the_learning_rate() {
+        let cfg = LoopConfig {
+            spec: ModelSpec::Linear,
+            backend: BackendKind::preferred(),
+            dir: PathBuf::new(),
+            resume: false,
+            generations: 1,
+            games: 100,
+            games_growth: 2.0,
+            max_games: 500,
+            selfplay: SelfPlayConfig::default(),
+            buffer_games: 1,
+            buffer_generations: 0,
+            train: TrainOptions {
+                learning_rate: 1e-3,
+                ..Default::default()
+            },
+            lr_decay: 0.5,
+            lr_min: 2e-4,
+            eval_games: 1,
+            eval_simulations: 1,
+            eval_batch: 1,
+            eval_exploration: MatchExploration::default(),
+            promote_threshold: 0.5,
+            baselines: vec![],
+            baseline_games: 1,
+            time_budget: None,
+        };
+        assert_eq!(
+            (1..=5).map(|g| cfg.games_at(g)).collect::<Vec<_>>(),
+            [100, 200, 400, 500, 500]
+        );
+        let lrs: Vec<f64> = (1..=5).map(|g| cfg.learning_rate_at(g)).collect();
+        assert_eq!(lrs, [1e-3, 5e-4, 2.5e-4, 2e-4, 2e-4]);
+    }
+
+    #[test]
     fn replay_buffer_keeps_the_latest_games() {
         let mut buffer = ReplayBuffer::new(2);
         let mut data = Dataset::default();
@@ -478,6 +562,8 @@ mod tests {
             resume: false,
             generations: 2,
             games: 6,
+            games_growth: 1.0,
+            max_games: usize::MAX,
             selfplay: SelfPlayConfig {
                 simulations: 12,
                 tree_batch: 4,
@@ -485,11 +571,14 @@ mod tests {
                 ..Default::default()
             },
             buffer_games: 8,
+            buffer_generations: 0,
             train: TrainOptions {
                 epochs: 1,
                 tui: false,
                 ..Default::default()
             },
+            lr_decay: 1.0,
+            lr_min: 0.0,
             eval_games: 2,
             eval_simulations: 8,
             eval_batch: 4,

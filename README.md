@@ -198,10 +198,12 @@ The search is generic over the agent that evaluates leaves:
   pairwise results and standings, for comparing trained models with each other and with the
   search and heuristic baselines.
 - `nn::pipeline` is the self-play training loop (`loop` command): each generation plays
-  `--games` games with the best model as search evaluator, pushes them into a replay buffer of
-  the last `--buffer-games` games, trains a candidate on the buffer from the previous
-  generation's candidate (promoted or not), plays a promotion match of candidate against
-  best with `mcts-nn` and promotes it at
+  `--games` games with the best model as search evaluator (growing by `--games-growth` per
+  generation up to `--max-games`), pushes them into a replay buffer of the last
+  `--buffer-games` games or `--buffer-generations` generations, trains a candidate on the
+  buffer from the previous generation's candidate (promoted or not) at a learning rate that
+  starts at `--lr` and decays by `--lr-decay` per generation down to `--lr-min`, plays a
+  promotion match of candidate against best with `mcts-nn` and promotes it at
   `--promote-threshold`, measures the best against each fixed `--baseline` over
   `--baseline-games`, and a JSON line to `<dir>/history.jsonl`. `--resume` continues from `<dir>/best`;
   `--max-minutes` stops the loop between generations once a wall-clock budget is spent.

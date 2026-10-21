@@ -61,9 +61,15 @@ struct LoopArgs {
     resume: bool,
     #[arg(long, default_value_t = 10)]
     generations: usize,
-    /// Self-play games per generation.
+    /// Self-play games of the first generation.
     #[arg(long, default_value_t = 1000)]
     games: usize,
+    /// Games per generation grow by this factor each generation (1 keeps them fixed).
+    #[arg(long, default_value_t = 1.0)]
+    games_growth: f64,
+    /// Cap of the games schedule (0 for none).
+    #[arg(long, default_value_t = 0)]
+    max_games: usize,
     #[arg(long, default_value_t = 200)]
     simulations: u32,
     #[arg(long, default_value_t = 256)]
@@ -74,16 +80,27 @@ struct LoopArgs {
     temperature_moves: usize,
     #[arg(long, default_value_t = 0.3)]
     dirichlet_alpha: f32,
-    /// Games kept in the replay buffer.
+    /// Games kept in the replay buffer (when `--buffer-generations` is 0).
     #[arg(long, default_value_t = 5000)]
     buffer_games: usize,
+    /// Keep the games of the last this many generations in the replay buffer instead of a
+    /// fixed count, so that the buffer follows the games schedule (0 to use --buffer-games).
+    #[arg(long, default_value_t = 0)]
+    buffer_generations: usize,
     /// Training epochs per generation, continuing from the previous generation's weights.
     #[arg(long, default_value_t = 2)]
     epochs: usize,
     #[arg(long, default_value_t = 1024)]
     batch_size: usize,
+    /// Learning rate of the first generation.
     #[arg(long, default_value_t = 1e-3)]
     lr: f64,
+    /// The learning rate is multiplied by this each generation (1 keeps it fixed) ...
+    #[arg(long, default_value_t = 1.0)]
+    lr_decay: f64,
+    /// ... but never goes below this.
+    #[arg(long, default_value_t = 0.0)]
+    lr_min: f64,
     #[arg(long, default_value_t = 1e-4)]
     weight_decay: f32,
     #[arg(long)]
@@ -283,7 +300,16 @@ fn run_loop(args: &LoopArgs) -> Result<(), String> {
             seed: args.seed,
             ..Default::default()
         },
+        games_growth: args.games_growth,
+        max_games: if args.max_games == 0 {
+            usize::MAX
+        } else {
+            args.max_games
+        },
         buffer_games: args.buffer_games,
+        buffer_generations: args.buffer_generations,
+        lr_decay: args.lr_decay,
+        lr_min: args.lr_min,
         train: TrainOptions {
             epochs: args.epochs,
             batch_size: args.batch_size,
