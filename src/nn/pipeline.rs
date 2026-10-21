@@ -230,15 +230,17 @@ impl GenerationReport {
 }
 
 impl LoopConfig {
-    /// Self-play games of `generation` (1-based) under the games schedule.
+    /// Self-play games of `generation` under the games schedule (generation 1 plays `games`;
+    /// generation 0, the training on the initial games, counts as 1).
     pub fn games_at(&self, generation: usize) -> usize {
-        let grown = self.games as f64 * self.games_growth.powi(generation as i32 - 1);
+        let grown = self.games as f64 * self.games_growth.powi(generation.max(1) as i32 - 1);
         (grown.round() as usize).clamp(1, self.max_games.max(1))
     }
 
-    /// Learning rate of `generation` (1-based) under the schedule.
+    /// Learning rate of `generation` under the schedule (generations 0 and 1 use `lr`).
     pub fn learning_rate_at(&self, generation: usize) -> f64 {
-        let decayed = self.train.learning_rate * self.lr_decay.powi(generation as i32 - 1);
+        let decayed =
+            self.train.learning_rate * self.lr_decay.powi(generation.max(1) as i32 - 1);
         decayed.max(self.lr_min)
     }
 }
@@ -288,10 +290,16 @@ fn copy_model(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Number of generations already recorded in `dir/history.jsonl`.
-fn recorded_generations(dir: &Path) -> usize {
+/// The last generation recorded in `dir/history.jsonl` (0 when there is none).
+fn last_recorded_generation(dir: &Path) -> usize {
     std::fs::read_to_string(dir.join("history.jsonl"))
-        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter_map(|v| v.get("generation").and_then(|g| g.as_u64()))
+                .max()
+                .unwrap_or(0) as usize
+        })
         .unwrap_or(0)
 }
 
@@ -306,7 +314,8 @@ pub fn run_loop(
     let best = best_path(&cfg.dir);
 
     let mut first = 0;
-    if cfg.resume && best.with_extension("bpk").exists() {
+    let resuming = cfg.resume && best.with_extension("bpk").exists();
+    if resuming {
         let existing = AnyModel::load(&best, &device)?;
         if existing.spec() != cfg.spec {
             return Err(format!(
@@ -316,7 +325,7 @@ pub fn run_loop(
                 cfg.spec
             ));
         }
-        first = recorded_generations(&cfg.dir);
+        first = last_recorded_generation(&cfg.dir);
         log(format!(
             "resuming from {} after {first} generations",
             best.display()
@@ -391,33 +400,46 @@ pub fn run_loop(
     }
     let mut reports = Vec::new();
     let loop_started = Instant::now();
-    for generation in first + 1..=first + cfg.generations {
+    // A fresh start with initial games first trains on them alone, as generation 0, so that
+    // the first self-play already uses what they teach.
+    let start = if !resuming && !cfg.initial_games.is_empty() {
+        0
+    } else {
+        first + 1
+    };
+    for generation in start..=first + cfg.generations {
         let started = Instant::now();
         let games = cfg.games_at(generation);
         let learning_rate = cfg.learning_rate_at(generation);
-        log(format!(
-            "generation {generation}: self-play of {games} games with the best model"
-        ));
-        let evaluator = AgentSpec::Nn {
-            path: best.clone(),
-            backend: cfg.backend,
+        let stats = if generation == 0 {
+            log("generation 0: training on the initial games before any self-play".to_string());
+            SelfPlayStats::default()
+        } else {
+            log(format!(
+                "generation {generation}: self-play of {games} games with the best model"
+            ));
+            let evaluator = AgentSpec::Nn {
+                path: best.clone(),
+                backend: cfg.backend,
+            };
+            let selfplay = SelfPlayConfig {
+                seed: cfg.selfplay.seed.wrapping_add(generation as u64),
+                ..cfg.selfplay.clone()
+            };
+            let (data, stats) = generate_parallel(&evaluator, games, &selfplay, |_| {})?;
+            let games_file = games_path(&cfg.dir, generation);
+            games::save(&games_file, &data)?;
+            log(format!(
+                "  {} positions from {} games, {:.0} simulations/s, mean batch {:.1}, saved to {}",
+                data.len(),
+                stats.games,
+                stats.simulations_per_second(),
+                stats.mean_batch(),
+                games_file.display()
+            ));
+            push_generation(cfg, &mut buffer, &mut recent_games, data);
+            stats
         };
-        let selfplay = SelfPlayConfig {
-            seed: cfg.selfplay.seed.wrapping_add(generation as u64),
-            ..cfg.selfplay.clone()
-        };
-        let (data, stats) = generate_parallel(&evaluator, games, &selfplay, |_| {})?;
-        let games_file = games_path(&cfg.dir, generation);
-        games::save(&games_file, &data)?;
-        log(format!(
-            "  {} positions from {} games, {:.0} simulations/s, mean batch {:.1}, saved to {}",
-            data.len(),
-            stats.games,
-            stats.simulations_per_second(),
-            stats.mean_batch(),
-            games_file.display()
-        ));
-        push_generation(cfg, &mut buffer, &mut recent_games, data);
 
         log(format!(
             "  training {} on {} positions from {} buffered games at lr {learning_rate:.2e}",
@@ -589,9 +611,10 @@ mod tests {
             time_budget: None,
         };
         assert_eq!(
-            (1..=5).map(|g| cfg.games_at(g)).collect::<Vec<_>>(),
-            [100, 200, 400, 500, 500]
+            (0..=5).map(|g| cfg.games_at(g)).collect::<Vec<_>>(),
+            [100, 100, 200, 400, 500, 500]
         );
+        assert_eq!(cfg.learning_rate_at(0), 1e-3);
         let lrs: Vec<f64> = (1..=5).map(|g| cfg.learning_rate_at(g)).collect();
         assert_eq!(lrs, [1e-3, 5e-4, 2.5e-4, 2e-4, 2e-4]);
     }
@@ -665,7 +688,7 @@ mod tests {
         assert!(reports[1].buffer_games <= 8 && reports[1].buffer_games >= reports[0].buffer_games);
         assert!(dir.join("best.bpk").exists() && dir.join("best.json").exists());
         assert!(dir.join("gen-1.bpk").exists() && dir.join("gen-2.bpk").exists());
-        assert_eq!(recorded_generations(&dir), 2);
+        assert_eq!(last_recorded_generation(&dir), 2);
         assert!(reports.iter().all(|r| r.baseline_scores.len() == 1));
         assert!(lines.iter().any(|l| l.contains("candidate vs best")));
 
@@ -680,7 +703,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resumed[0].generation, 3);
-        assert_eq!(recorded_generations(&dir), 3);
+        assert_eq!(last_recorded_generation(&dir), 3);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
