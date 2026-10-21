@@ -65,25 +65,27 @@ fast iteration on the engine. Development builds use `--all-features`.
 Known upstream issues worked around:
 
 - Kernel fusion is off on the CubeCL backends (cuda, wgpu, cpu-mlir): burn is built without its
-  default features and the pieces we need are enabled one by one (`nn` feature). In burn 0.21
-  fusion returns wrong values when an elementwise op is fused onto a matmul with a single
-  output column (which broke `burn::nn::Linear` with one output), and its multi-stream
-  bookkeeping races under the Learner's threads with the transformer models ("Should have
-  handle for tensor"). To experiment with fusion, add `burn/default` to the `nn` feature in
-  `Cargo.toml`; it is deliberately not a cargo feature, so `--all-features` stays fusion-free.
-  `nn/linear.rs` keeps a test of both heads against a host computation on every compiled
-  backend. Re-measured on 2026-10-21 with `burn/fusion`: the full test suite passes (the value
-  head now has three outputs, and step outputs are read back per tensor rather than through a
-  multi-tensor transaction), but one `loop` generation on an RTX 2080 (200 games, 200
-  simulations, board transformer 64/2/4) took 97-105 s against 70 s without fusion, with
-  self-play at 44k instead of 58k simulations/s. Re-tested the same day after self-play was
-  pipelined and the GPU had become the bottleneck (~85% busy): fusion still ran at 69k against
-  84k simulations/s. So fusion stays off for speed, not only for correctness.
+  default features and the pieces we need are enabled one by one (`nn` feature). History: in
+  burn 0.21 fusion miscomputed elementwise ops fused onto single-column matmuls and raced under
+  the Learner's threads; once those stopped biting it was still 20-40% slower, because its
+  deferred execution undoes the self-play pipelining (the device starts only at the readback)
+  and its graph exploration runs on the issuing thread. On burn 0.22.0 (the `fusion` feature
+  of 0.22.1 does not resolve: it needs an unpublished burn-remote) it is neutral on self-play
+  and about 10% slower per generation: steady state 106-108k against 109-114k simulations/s,
+  52-54 s against 45-48 s per reference generation. To experiment, add `burn/fusion` to the
+  `nn` feature in `Cargo.toml`; it is deliberately not a cargo feature, so `--all-features`
+  stays fusion-free. `nn/linear.rs` keeps a test of both heads against a host computation on
+  every compiled backend.
 - On burn 0.21 the MLIR CPU backend (cubecl-cpu 0.10) panicked when the Learner's metric and
   checkpoint threads read tensors produced on the training thread, and `nn/train.rs` carried a
   workaround (eager host reads, no checkpoints there). The port to burn 0.22 dropped it, and
   cpu-mlir has not been re-tested since; treat it as experimental. `ndarray` is deprecated
   upstream in favour of `flex` but remains the dependable CPU backend here.
+- Compiled CubeCL kernels are cached on disk under `~/.cache/cubecl` (burn's `persistence`
+  feature, part of `nn`). CubeCL 0.11 compiles CUDA kernels through LLVM on the thread that
+  also launches them, so a cold process spends a third of its CPU time compiling and the GPU
+  starves: the reference generation took 73-90 s cold and 47-49 s warm. The first run after a
+  build or a new model shape is the slow one; delete the cache directory to start over.
 - The per-backend tests honour `UTTT_SKIP_BACKENDS=wgpu,...` for machines where a compiled
   backend cannot initialise (for example an NVIDIA driver update pending a reboot).
 
