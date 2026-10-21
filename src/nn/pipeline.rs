@@ -161,7 +161,7 @@ pub struct LoopConfig {
     /// Games files (see [`games`]) pushed into the replay buffer before the first generation,
     /// e.g. games played by another agent to learn from first.
     pub initial_games: Vec<PathBuf>,
-    /// Fixed opponents the best model is also measured against each generation.
+    /// Fixed opponents the candidate is also measured against each generation.
     pub baselines: Vec<AgentSpec>,
     /// Games of each baseline match.
     pub baseline_games: usize,
@@ -182,8 +182,8 @@ pub struct GenerationReport {
     /// Candidate against the previous best.
     pub eval: MatchResult,
     pub promoted: bool,
-    /// Best model (after promotion) against each baseline, in `LoopConfig::baselines` order.
-    pub baseline_scores: Vec<(AgentSpec, f32)>,
+    /// The candidate against each baseline, in `LoopConfig::baselines` order.
+    pub baseline_results: Vec<(AgentSpec, MatchResult)>,
     pub seconds: f32,
 }
 
@@ -223,9 +223,17 @@ impl GenerationReport {
             },
             "promoted": self.promoted,
             "baselines": self
-                .baseline_scores
+                .baseline_results
                 .iter()
-                .map(|(spec, score)| (spec.to_string(), json!(score)))
+                .map(|(spec, m)| {
+                    let result = json!({
+                        "score": m.score_a(),
+                        "wins": m.a_wins,
+                        "draws": m.draws,
+                        "losses": m.b_wins,
+                    });
+                    (spec.to_string(), result)
+                })
                 .collect::<serde_json::Map<_, _>>(),
             "seconds": self.seconds,
         })
@@ -351,6 +359,7 @@ pub fn run_loop(
         ));
         model.save(&best)?;
         let _ = std::fs::remove_file(cfg.dir.join("history.jsonl"));
+        let _ = std::fs::remove_file(cfg.dir.join("history.md"));
     } else {
         let model = cfg.spec.init(&device);
         log(format!(
@@ -360,6 +369,7 @@ pub fn run_loop(
         ));
         model.save(&best)?;
         let _ = std::fs::remove_file(cfg.dir.join("history.jsonl"));
+        let _ = std::fs::remove_file(cfg.dir.join("history.md"));
     }
 
     // Self-play always uses the best model; training continues from the previous
@@ -526,23 +536,23 @@ pub fn run_loop(
             copy_model(&candidate_path, &best)?;
         }
 
-        let mut baseline_scores = Vec::with_capacity(cfg.baselines.len());
+        let mut baseline_results = Vec::with_capacity(cfg.baselines.len());
         for baseline in &cfg.baselines {
             let m = play_match_with(
-                &searcher(&best),
+                &searcher(&candidate_path),
                 baseline,
                 cfg.baseline_games,
                 &cfg.eval_exploration,
                 |_| {},
             )?;
             log(format!(
-                "  best vs {baseline}: {}-{}-{} (score {:.3})",
+                "  candidate vs {baseline}: {}-{}-{} (score {:.3})",
                 m.a_wins,
                 m.draws,
                 m.b_wins,
                 m.score_a()
             ));
-            baseline_scores.push((baseline.clone(), m.score_a()));
+            baseline_results.push((baseline.clone(), m));
         }
 
         let report = GenerationReport {
@@ -554,10 +564,11 @@ pub fn run_loop(
             train: train_report,
             eval,
             promoted,
-            baseline_scores,
+            baseline_results,
             seconds: started.elapsed().as_secs_f32(),
         };
         append_history(&cfg.dir, &report)?;
+        append_markdown(&cfg.dir, cfg, &report)?;
         log(format!(
             "  generation {generation} done in {:.0}s",
             report.seconds
@@ -581,6 +592,74 @@ pub fn run_loop(
         }
     }
     Ok(reports)
+}
+
+/// A short name of an agent spec for table headers: `random`, `greedy`, `minimax 4`,
+/// `mcts 200`, `nn <file>`, `mcts-nn <file> 200`.
+fn short_name(spec: &AgentSpec) -> String {
+    fn stem(path: &Path) -> String {
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string())
+    }
+    match spec {
+        AgentSpec::Random { .. } => "random".to_string(),
+        AgentSpec::Greedy { .. } => "greedy".to_string(),
+        AgentSpec::Minimax { depth, .. } => format!("minimax {depth}"),
+        AgentSpec::Mcts { simulations, .. } => format!("mcts {simulations}"),
+        AgentSpec::Nn { path, .. } => format!("nn {}", stem(path)),
+        AgentSpec::MctsNn {
+            path, simulations, ..
+        } => format!("mcts-nn {} {simulations}", stem(path)),
+    }
+}
+
+fn match_cell(m: &MatchResult) -> String {
+    format!("{}-{}-{} ({:.3})", m.a_wins, m.draws, m.b_wins, m.score_a())
+}
+
+/// Appends the generation as a row of `dir/history.md`, writing the table header first when
+/// the file does not exist. Match cells are `wins-draws-losses (score)` for the candidate.
+fn append_markdown(dir: &Path, cfg: &LoopConfig, report: &GenerationReport) -> Result<(), String> {
+    use std::io::Write;
+    let path = dir.join("history.md");
+    let fresh = !path.exists();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let write = |file: &mut std::fs::File, line: String| {
+        writeln!(file, "{line}").map_err(|e| format!("cannot write {}: {e}", path.display()))
+    };
+    if fresh {
+        let mut header = vec![
+            "gen", "games", "lr", "sims/s", "positions", "verdict acc", "value mse",
+            "policy acc", "vs best", "promoted",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        header.extend(cfg.baselines.iter().map(short_name));
+        header.push("minutes".to_string());
+        write(&mut file, format!("| {} |", header.join(" | ")))?;
+        write(&mut file, format!("|{}", " --- |".repeat(header.len())))?;
+    }
+    let mut row = vec![
+        report.generation.to_string(),
+        report.selfplay.games.to_string(),
+        format!("{:.1e}", report.learning_rate),
+        format!("{:.0}", report.selfplay.simulations_per_second()),
+        report.buffer_positions.to_string(),
+        format!("{:.3}", report.train.validation.verdict_accuracy),
+        format!("{:.4}", report.train.validation.value_mse),
+        format!("{:.3}", report.train.validation.policy_accuracy),
+        match_cell(&report.eval),
+        if report.promoted { "yes" } else { "no" }.to_string(),
+    ];
+    row.extend(report.baseline_results.iter().map(|(_, m)| match_cell(m)));
+    row.push(format!("{:.1}", report.seconds / 60.0));
+    write(&mut file, format!("| {} |", row.join(" | ")))
 }
 
 fn append_history(dir: &Path, report: &GenerationReport) -> Result<(), String> {
@@ -712,7 +791,7 @@ mod tests {
         assert!(dir.join("best.bpk").exists() && dir.join("best.json").exists());
         assert!(dir.join("gen-1.bpk").exists() && dir.join("gen-2.bpk").exists());
         assert_eq!(last_recorded_generation(&dir), 2);
-        assert!(reports.iter().all(|r| r.baseline_scores.len() == 1));
+        assert!(reports.iter().all(|r| r.baseline_results.len() == 1));
         assert!(lines.iter().any(|l| l.contains("candidate vs best")));
 
         // Resuming continues the numbering and reuses the best model.

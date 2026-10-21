@@ -204,8 +204,9 @@ The search is generic over the agent that evaluates leaves:
   buffer from the previous generation's candidate (promoted or not) at a learning rate that
   starts at `--lr` and decays by `--lr-decay` per generation down to `--lr-min`, plays a
   promotion match of candidate against best with `mcts-nn` and promotes it at
-  `--promote-threshold`, measures the best against each fixed `--baseline` over
-  `--baseline-games`, and appends a JSON line to `<dir>/history.jsonl`. Each generation's
+  `--promote-threshold`, measures the candidate against each fixed `--baseline` over
+  `--baseline-games`, and appends a JSON line to `<dir>/history.jsonl` and a row to the
+  markdown table `<dir>/history.md`. Each generation's
   games are saved to `<dir>/games/gen-<n>.games` (a compact binary, `nn::games`), and
   `--initial-games` seeds the buffer from such files, e.g. games played by random-playout
   MCTS with `selfplay --evaluator random --games 4000 --out models/mcts-200.games`; a fresh

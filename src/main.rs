@@ -136,7 +136,7 @@ struct LoopArgs {
     /// `train --data-out` from another agent's games), so that training starts from them.
     #[arg(long, num_args = 1..)]
     initial_games: Vec<std::path::PathBuf>,
-    /// Fixed opponent to measure the best model against each generation, e.g. `mcts 200`;
+    /// Fixed opponent to measure the candidate against each generation, e.g. `mcts 200`;
     /// repeat the flag for several, `none` to skip.
     #[arg(long, default_value = "mcts 200")]
     baseline: Vec<String>,
