@@ -23,6 +23,10 @@ nn = [
     "dep:burn",
     "burn/std",
     "burn/autotune",
+    # Caches compiled CubeCL kernels on disk (~/.cache/cubecl) across runs. Without it every
+    # process recompiles every kernel shape it meets, on the thread that also launches kernels:
+    # a generation went from 47 s warm to 73-90 s cold on an RTX 2080.
+    "burn/persistence",
     "burn/train",
     "burn/tui",
     "dep:serde",
