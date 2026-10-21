@@ -107,6 +107,11 @@ cargo run --release --all-features -- play mcts-nn models/value cuda 400 16
 cargo run --release --all-features -- train --backend cuda --model "board-transformer 64 2 4" \
   --selfplay-evaluator "nn models/board cuda" --games 5000 --simulations 200 --concurrent 64 --tree-batch 8 --out models/board2
 
+# The whole loop: 10 generations of 1000 self-play games each, promotion matches of 20 games
+cargo run --release --all-features -- loop --backend cuda --model "board-transformer 64 2 4" --dir models/loop \
+  --generations 10 --games 1000 --simulations 200 --eval-games 20 --baseline "mcts 200"
+cargo run --release --all-features -- loop --dir models/loop --resume --generations 10
+
 # For scripts and CI: plain log lines instead of the dashboard
 cargo run --release --all-features -- train --backend ndarray --no-tui --artifact-dir artifacts/run1
 
@@ -172,6 +177,12 @@ The search is generic over the agent that evaluates leaves:
 - `benchmark` plays round-robin matches between any agents (colours alternate) and prints
   pairwise results and standings, for comparing trained models with each other and with the
   search and heuristic baselines.
+- `nn::pipeline` is the self-play training loop (`loop` command): each generation plays
+  `--games` games with the best model as search evaluator, pushes them into a replay buffer of
+  the last `--buffer-games` games, trains a candidate from the best weights on the buffer,
+  plays a promotion match of candidate against best with `mcts-nn` and promotes it at
+  `--promote-threshold`, optionally measures the best against a fixed `--baseline`, and
+  appends a JSON line to `<dir>/history.jsonl`. `--resume` continues from `<dir>/best`.
 
 ## Status
 
@@ -193,8 +204,10 @@ Planned next, roughly in order:
 - [ ] Tree reuse between moves
 - [x] Real networks: a transformer over small-board tokens and one over cell tokens
 - [x] Self-play with the current network as evaluator, many games batched per forward pass
-- [ ] Iterated generations: replay buffer, evaluation against the previous generation before
-      promotion, a loop command
+- [x] Iterated generations: replay buffer, promotion match, `loop` command
+- [ ] Lockstep matches for the promotion and benchmark games (they still search one tree at a
+      time)
+- [ ] Learning-rate schedule and larger models once the loop is shown to climb
 - [x] CLI for agent-vs-agent matches (`benchmark`)
 
 ## Layout

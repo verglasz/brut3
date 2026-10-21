@@ -11,7 +11,10 @@ use burn::optim::AdamWConfig;
 use burn::prelude::*;
 use burn::tensor::activation::log_softmax;
 use burn::train::metric::{AccuracyInput, AccuracyMetric, Adaptor, LossInput, LossMetric};
-use burn::train::renderer::CliMetricsRenderer;
+use burn::train::renderer::{
+    EvaluationName, EvaluationProgress, MetricState, MetricsRenderer, MetricsRendererEvaluation,
+    MetricsRendererTraining, ProgressType, TrainingProgress,
+};
 use burn::train::{
     ExecutionStrategy, InferenceStep, ItemLazy, Learner, SupervisedTraining, TrainStep,
 };
@@ -483,6 +486,27 @@ pub struct TrainReport {
     pub validation: Evaluation,
 }
 
+/// A renderer that shows nothing: callers print what they need from the [`TrainReport`], and
+/// the Learner's metric logs under the artifact directory keep the full curves.
+struct QuietRenderer;
+
+impl MetricsRendererTraining for QuietRenderer {
+    fn update_train(&mut self, _state: MetricState) {}
+    fn update_valid(&mut self, _state: MetricState) {}
+    fn render_train(&mut self, _item: TrainingProgress, _indicators: Vec<ProgressType>) {}
+    fn render_valid(&mut self, _item: TrainingProgress, _indicators: Vec<ProgressType>) {}
+}
+
+impl MetricsRendererEvaluation for QuietRenderer {
+    fn render_test(&mut self, _item: EvaluationProgress, _indicators: Vec<ProgressType>) {}
+    fn update_test(&mut self, _name: EvaluationName, _state: MetricState) {}
+}
+
+impl MetricsRenderer for QuietRenderer {
+    fn manual_close(&mut self) {}
+    fn register_metric(&mut self, _definition: burn::train::metric::MetricDefinition) {}
+}
+
 /// Models that can go through [`train`].
 pub trait Trainable:
     Model<Dispatch>
@@ -559,16 +583,17 @@ pub fn train<M: Trainable>(
         .metric_valid_numeric(LossMetric::<Dispatch>::new())
         .metric_train_numeric(AccuracyMetric::<Dispatch>::new())
         .metric_valid_numeric(AccuracyMetric::<Dispatch>::new())
-        .with_training_strategy(ExecutionStrategy::single(ad_device).into())
-        .summary();
+        .with_training_strategy(ExecutionStrategy::single(ad_device).into());
     // The checkpointer saves from its own thread, which the MLIR CPU backend cannot serve
     // (see `StepOutputSync`); it is skipped there.
     if !eager_host_read(device) {
         training = training.with_file_checkpointer(Recorder::new());
     }
-    if !opts.tui {
-        training = training.renderer(CliMetricsRenderer::new());
-    }
+    training = if opts.tui {
+        training.summary()
+    } else {
+        training.renderer(QuietRenderer)
+    };
     let checkpoints = !eager_host_read(device);
     let mut model = training.launch(learner).model;
 

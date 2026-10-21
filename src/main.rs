@@ -26,6 +26,10 @@ enum Command {
     /// Generate self-play games and train the value network on them.
     #[cfg(feature = "nn")]
     Train(TrainArgs),
+    /// Self-play training loop: generate games with the best model, train a candidate on a
+    /// replay buffer, promote it if it beats the best; repeat.
+    #[cfg(feature = "nn")]
+    Loop(LoopArgs),
     /// List the backends compiled into this binary.
     #[cfg(feature = "nn")]
     Backends,
@@ -38,6 +42,69 @@ enum Command {
         #[arg(required = true, num_args = 2..)]
         specs: Vec<String>,
     },
+}
+
+#[cfg(feature = "nn")]
+#[derive(clap::Args)]
+struct LoopArgs {
+    /// Backend to run on (default: fastest compiled in).
+    #[arg(long)]
+    backend: Option<String>,
+    /// Model kind for a fresh start, e.g. `board-transformer 64 2 4`.
+    #[arg(long, default_value = "board-transformer 64 2 4")]
+    model: String,
+    /// Directory for `best.*`, `gen-<n>.*`, per-generation artifacts and `history.jsonl`.
+    #[arg(long, default_value = "models/loop")]
+    dir: std::path::PathBuf,
+    /// Continue from `<dir>/best` and the recorded history.
+    #[arg(long)]
+    resume: bool,
+    #[arg(long, default_value_t = 10)]
+    generations: usize,
+    /// Self-play games per generation.
+    #[arg(long, default_value_t = 1000)]
+    games: usize,
+    #[arg(long, default_value_t = 200)]
+    simulations: u32,
+    #[arg(long, default_value_t = 64)]
+    concurrent: usize,
+    #[arg(long, default_value_t = 8)]
+    tree_batch: usize,
+    #[arg(long, default_value_t = 16)]
+    temperature_moves: usize,
+    #[arg(long, default_value_t = 0.3)]
+    dirichlet_alpha: f32,
+    /// Games kept in the replay buffer.
+    #[arg(long, default_value_t = 5000)]
+    buffer_games: usize,
+    /// Training epochs per generation, continuing from the best weights.
+    #[arg(long, default_value_t = 2)]
+    epochs: usize,
+    #[arg(long, default_value_t = 256)]
+    batch_size: usize,
+    #[arg(long, default_value_t = 1e-3)]
+    lr: f64,
+    #[arg(long, default_value_t = 1e-4)]
+    weight_decay: f32,
+    #[arg(long)]
+    no_augment: bool,
+    /// Show the Learner dashboard while training each generation.
+    #[arg(long)]
+    tui: bool,
+    /// Promotion match length (colours alternate).
+    #[arg(long, default_value_t = 20)]
+    eval_games: usize,
+    #[arg(long, default_value_t = 200)]
+    eval_simulations: u32,
+    /// Candidate score (wins + draws/2 over games) needed to replace the best model.
+    #[arg(long, default_value_t = 0.55)]
+    promote_threshold: f32,
+    /// Fixed opponent to measure the best model against each generation, e.g. `mcts 200`;
+    /// `none` to skip.
+    #[arg(long, default_value = "mcts 200")]
+    baseline: String,
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
 }
 
 #[cfg(feature = "nn")]
@@ -108,6 +175,8 @@ fn main() -> ExitCode {
         Command::Play { spec } => play(&spec),
         #[cfg(feature = "nn")]
         Command::Train(args) => train(&args),
+        #[cfg(feature = "nn")]
+        Command::Loop(args) => run_loop(&args),
         Command::Benchmark { games, specs } => benchmark(games, &specs),
         #[cfg(feature = "nn")]
         Command::Backends => {
@@ -164,10 +233,70 @@ fn play(spec: &[String]) -> Result<(), String> {
 }
 
 #[cfg(feature = "nn")]
+fn run_loop(args: &LoopArgs) -> Result<(), String> {
+    use ultimate_ttt_burn::nn::{BackendKind, LoopConfig, ModelSpec, TrainOptions, run_loop};
+    use ultimate_ttt_burn::selfplay::SelfPlayConfig;
+
+    let backend = match &args.backend {
+        Some(name) => name.parse::<BackendKind>()?,
+        None => BackendKind::preferred(),
+    };
+    let model_words: Vec<&str> = args.model.split_whitespace().collect();
+    let baseline = match args.baseline.trim() {
+        "" | "none" => None,
+        words => {
+            let words: Vec<&str> = words.split_whitespace().collect();
+            Some(AgentSpec::parse(&words)?)
+        }
+    };
+    let cfg = LoopConfig {
+        spec: ModelSpec::parse(&model_words)?,
+        backend,
+        dir: args.dir.clone(),
+        resume: args.resume,
+        generations: args.generations,
+        games: args.games,
+        selfplay: SelfPlayConfig {
+            simulations: args.simulations,
+            tree_batch: args.tree_batch,
+            concurrent: args.concurrent,
+            temperature_moves: args.temperature_moves,
+            root_noise: (args.dirichlet_alpha > 0.0).then_some((args.dirichlet_alpha, 0.25)),
+            seed: args.seed,
+            ..Default::default()
+        },
+        buffer_games: args.buffer_games,
+        train: TrainOptions {
+            epochs: args.epochs,
+            batch_size: args.batch_size,
+            learning_rate: args.lr,
+            weight_decay: args.weight_decay,
+            augment: !args.no_augment,
+            tui: args.tui,
+            seed: args.seed,
+            ..Default::default()
+        },
+        eval_games: args.eval_games,
+        eval_simulations: args.eval_simulations,
+        eval_batch: args.tree_batch,
+        promote_threshold: args.promote_threshold,
+        baseline,
+    };
+    let reports = run_loop(&cfg, |line| println!("{line}"))?;
+    println!(
+        "{} generations done; best model at {}; history in {}",
+        reports.len(),
+        args.dir.join("best.mpk").display(),
+        args.dir.join("history.jsonl").display()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "nn")]
 fn train(args: &TrainArgs) -> Result<(), String> {
     use std::io::Write;
     use std::time::Instant;
-    use ultimate_ttt_burn::nn::{AnyModel, BackendKind, ModelSpec, TrainOptions, generate, train};
+    use ultimate_ttt_burn::nn::{BackendKind, ModelSpec, TrainOptions, generate};
 
     let backend = match &args.backend {
         Some(name) => name.parse::<BackendKind>()?,
@@ -241,25 +370,8 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         augment: !args.no_augment,
         ..Default::default()
     };
-    let (model, report) = match &model_spec {
-        ModelSpec::Linear => {
-            let (m, report) = train(
-                |d| ultimate_ttt_burn::nn::LinearNetConfig::default().init(d),
-                &device,
-                data,
-                &opts,
-            );
-            (AnyModel::Linear(m), report)
-        }
-        ModelSpec::BoardTransformer(cfg) => {
-            let (m, report) = train(|d| cfg.init(d), &device, data, &opts);
-            (AnyModel::BoardTransformer(m), report)
-        }
-        ModelSpec::CellTransformer(cfg) => {
-            let (m, report) = train(|d| cfg.init(d), &device, data, &opts);
-            (AnyModel::CellTransformer(m), report)
-        }
-    };
+    let (model, report) =
+        ultimate_ttt_burn::nn::train_model(&model_spec, None, &device, data, &opts)?;
     println!(
         "  {} train / {} validation positions; kept epoch {} of {} (lowest validation loss)",
         report.train_positions, report.validation_positions, report.best_epoch, report.epochs
