@@ -53,7 +53,7 @@ burn is backend-agnostic, so the same model and training code runs on:
 |---------|---------------|-----|
 | `Cuda`  | `cuda` (opt-in) | Primary target for training and large self-play runs. Needs the CUDA toolkit at build time. |
 | `Wgpu`  | `wgpu` (default) | Portable GPU fallback (Vulkan/Metal/DX12). |
-| `NdArray` | `ndarray` (default) | Pure-Rust CPU backend for tests and GPU-less machines. |
+| Flex | `flex` (default) | Pure-Rust CPU backend for tests and GPU-less machines. |
 | CubeCL CPU | `cpu-mlir` (opt-in) | MLIR-based CPU backend; downloads a prebuilt LLVM on first build. |
 
 Default features are everything that builds with no extra system requirements. All tensors go
@@ -79,8 +79,8 @@ Known upstream issues worked around:
 - On burn 0.21 the MLIR CPU backend (cubecl-cpu 0.10) panicked when the Learner's metric and
   checkpoint threads read tensors produced on the training thread, and `nn/train.rs` carried a
   workaround (eager host reads, no checkpoints there). The port to burn 0.22 dropped it, and
-  cpu-mlir has not been re-tested since; treat it as experimental. `ndarray` is deprecated
-  upstream in favour of `flex` but remains the dependable CPU backend here.
+  cpu-mlir has not been re-tested since; treat it as experimental. `flex` is the dependable CPU
+  backend (burn deprecated `ndarray` in its favour).
 - Compiled CubeCL kernels are cached on disk under `~/.cache/cubecl` (burn's `persistence`
   feature, part of `nn`). CubeCL 0.11 compiles CUDA kernels through LLVM on the thread that
   also launches them, so a cold process spends a third of its CPU time compiling and the GPU
@@ -98,7 +98,7 @@ Requires a recent stable Rust toolchain (edition 2024).
 cargo build --no-default-features
 cargo test --no-default-features
 
-# Default: burn with ndarray + wgpu
+# Default: burn with flex + wgpu
 cargo build --release
 
 # Everything, including CUDA (needs nvcc / CUDA_PATH) and the MLIR CPU backend
@@ -121,7 +121,7 @@ cargo run --release --all-features -- loop --backend cuda --model "board-transfo
 cargo run --release --all-features -- loop --dir models/loop --resume --generations 10
 
 # For scripts and CI: plain log lines instead of the dashboard
-cargo run --release --all-features -- train --backend ndarray --no-tui --artifact-dir artifacts/run1
+cargo run --release --all-features -- train --backend flex --no-tui --artifact-dir artifacts/run1
 
 # A plain `cargo test` skips the tests that train networks or play many search games; include them
 # (in release, they are slow) with:
@@ -214,7 +214,7 @@ Present:
   tested against the random agent.
 - `AnyAgent`, one concrete enum over the built agents, and a REPL for interactive play.
 - A policy/value model interface with a linear baseline, trained from self-play on any compiled
-  backend (ndarray, wgpu, cuda, cpu-mlir) with burn's `Learner`, and `nn` / `mcts-nn` agents
+  backend (flex, wgpu, cuda, cpu-mlir) with burn's `Learner`, and `nn` / `mcts-nn` agents
   using it. The linear model only shaves a little off the baselines; it is the plumbing for
   the real networks.
 

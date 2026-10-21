@@ -999,6 +999,7 @@ dependencies = [
  "burn-autodiff",
  "burn-core",
  "burn-cubecl",
+ "burn-flex",
  "burn-fusion",
  "burn-std",
 ]

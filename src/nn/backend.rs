@@ -13,20 +13,20 @@ pub enum BackendKind {
     Wgpu,
     /// MLIR/LLVM CPU backend (feature `cpu-mlir`).
     CpuMlir,
-    /// Pure-Rust CPU backend (feature `ndarray`).
-    NdArray,
+    /// Pure-Rust CPU backend (feature `flex`).
+    Flex,
 }
 
 impl BackendKind {
     /// Every kind this crate knows about, fastest first. Not all are necessarily compiled in.
-    pub const ALL: [BackendKind; 4] = [Self::Cuda, Self::Wgpu, Self::CpuMlir, Self::NdArray];
+    pub const ALL: [BackendKind; 4] = [Self::Cuda, Self::Wgpu, Self::CpuMlir, Self::Flex];
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::Cuda => "cuda",
             Self::Wgpu => "wgpu",
             Self::CpuMlir => "cpu-mlir",
-            Self::NdArray => "ndarray",
+            Self::Flex => "flex",
         }
     }
 
@@ -35,7 +35,7 @@ impl BackendKind {
             Self::Cuda => cfg!(feature = "cuda"),
             Self::Wgpu => cfg!(feature = "wgpu"),
             Self::CpuMlir => cfg!(feature = "cpu-mlir"),
-            Self::NdArray => cfg!(feature = "ndarray"),
+            Self::Flex => cfg!(feature = "flex"),
         }
     }
 
@@ -63,10 +63,8 @@ impl BackendKind {
             Self::Wgpu => Device::wgpu(burn::prelude::DeviceKind::default()),
             #[cfg(feature = "cpu-mlir")]
             Self::CpuMlir => Device::cpu(),
-            // Deprecated upstream in favour of `flex`; kept as the dependable pure-Rust backend.
-            #[cfg(feature = "ndarray")]
-            #[allow(deprecated)]
-            Self::NdArray => Device::ndarray(),
+            #[cfg(feature = "flex")]
+            Self::Flex => Device::flex(),
             #[allow(unreachable_patterns)]
             other => panic!("backend {} is not compiled in", other.name()),
         }
@@ -109,7 +107,7 @@ impl FromStr for BackendKind {
             "cuda" => Self::Cuda,
             "wgpu" => Self::Wgpu,
             "cpu-mlir" | "cpu" => Self::CpuMlir,
-            "ndarray" => Self::NdArray,
+            "flex" => Self::Flex,
             other => {
                 return Err(format!(
                     "unknown backend {other:?}; compiled in: {}",

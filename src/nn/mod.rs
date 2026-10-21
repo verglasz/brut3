@@ -2,7 +2,7 @@
 //! on self-play data, an agent that plays with them, and runtime backend selection.
 //!
 //! Tensors carry no backend type: burn's [`Device`](burn::prelude::Device) picks the concrete
-//! backend (ndarray, wgpu, CUDA, MLIR CPU) at runtime among those compiled in, and its autodiff
+//! backend (flex, wgpu, CUDA, MLIR CPU) at runtime among those compiled in, and its autodiff
 //! form is used for training. One model type serves everywhere.
 //!
 //! Every model implements [`Model`]: it encodes raw [`BitState`](crate::game::BitState)s into

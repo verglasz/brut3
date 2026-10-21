@@ -12,7 +12,7 @@ serde_json = { version = "1", optional = true }
 
 [features]
 # Default: every backend that builds with no extra system requirements.
-default = ["ndarray", "wgpu"]
+default = ["flex", "wgpu"]
 # Pulls in burn itself plus the pieces every backend needs: burn-train (autodiff, datasets, the
 # Learner with its TUI dashboard) for training. Backend selection among the compiled backends
 # is built into burn 0.22's `Device`. burn's default features are off so that kernel fusion
@@ -33,7 +33,7 @@ nn = [
     "dep:serde_json",
 ]
 # Pure-Rust CPU backend.
-ndarray = ["nn", "burn/ndarray"]
+flex = ["nn", "burn/flex"]
 # Portable GPU backend (Vulkan/Metal/DX12); no SDK needed at build time.
 wgpu = ["nn", "burn/wgpu"]
 # Opt-in backends, each needing something on the system:

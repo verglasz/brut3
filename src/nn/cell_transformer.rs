@@ -395,7 +395,7 @@ mod tests {
     fn backends_agree() {
         let _device = crate::nn::device_lock();
         let kinds = BackendKind::for_tests();
-        let reference = kinds[kinds.len() - 1].device(); // ndarray when compiled: not CubeCL
+        let reference = kinds[kinds.len() - 1].device(); // flex when compiled: not CubeCL
         let model = small().init(&reference);
         let states: Vec<BitState> = synthetic_dataset(16, 5)
             .samples
