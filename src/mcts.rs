@@ -117,6 +117,9 @@ struct Node<S> {
     expanded: bool,
     /// Claimed by the current round, awaiting evaluation.
     pending: bool,
+    /// The game's outcome here, or one proven from the children (MCTS-solver): a node with
+    /// a winning child is won, one whose children are all decided is drawn if any draws and
+    /// lost otherwise. Decided nodes are backed up exactly and never evaluated.
     outcome: Option<Outcome>,
 }
 
@@ -308,27 +311,44 @@ impl<S: GameState> SearchTree<S> {
         self.claimed.clear();
     }
 
-    /// Root statistics so far.
+    /// Root statistics so far. A decided root reports the exact value; when it is proven
+    /// (won or drawn) only the moves that keep that result keep their visits, so that the
+    /// move choice and the policy target follow the proof.
     pub fn result(&self) -> SearchResult {
         let root = &self.nodes[0];
+        let to_move = root.state.to_move();
         if let Some(outcome) = root.outcome {
-            return SearchResult {
-                root_value: outcome.value_for(root.state.to_move()),
-                visits: Vec::new(),
-            };
+            if !root.expanded {
+                return SearchResult {
+                    root_value: outcome.value_for(to_move),
+                    visits: Vec::new(),
+                };
+            }
         }
+        let keeps_result = |child: &Node<S>| match root.outcome {
+            Some(Outcome::Win(p)) if p == to_move => child.outcome == Some(Outcome::Win(p)),
+            Some(Outcome::Draw) => child.outcome == Some(Outcome::Draw),
+            _ => true,
+        };
         let visits = root
             .children()
             .map(|c| {
-                let mv = self.nodes[c as usize].mv.expect("child has a move");
-                (mv, self.stats[c as usize].visits)
+                let (child, stats) = (&self.nodes[c as usize], &self.stats[c as usize]);
+                let mv = child.mv.expect("child has a move");
+                let n = match root.outcome {
+                    Some(_) if keeps_result(child) => stats.visits.max(1),
+                    Some(_) => 0,
+                    None => stats.visits,
+                };
+                (mv, n)
             })
             .collect();
         let root_stats = &self.stats[0];
-        SearchResult {
-            root_value: root_stats.value_sum / root_stats.visits.max(1) as f32,
-            visits,
-        }
+        let root_value = match root.outcome {
+            Some(outcome) => outcome.value_for(to_move),
+            None => root_stats.value_sum / root_stats.visits.max(1) as f32,
+        };
+        SearchResult { root_value, visits }
     }
 
     fn select_leaf(&self) -> Selection {
@@ -425,7 +445,75 @@ impl<S: GameState> SearchTree<S> {
         if idx == 0 {
             self.apply_root_noise();
         }
-        value.clamp(-1.0, 1.0)
+        if self.try_prove(idx) {
+            self.propagate_proof(idx);
+        }
+        match self.nodes[idx as usize].outcome {
+            Some(outcome) => outcome.value_for(self.nodes[idx as usize].state.to_move()),
+            None => value.clamp(-1.0, 1.0),
+        }
+    }
+
+    /// Decides `idx` from its children's outcomes when they allow it (see `Node::outcome`).
+    /// Returns whether it became decided.
+    fn try_prove(&mut self, idx: u32) -> bool {
+        let node = &self.nodes[idx as usize];
+        if node.outcome.is_some() || !node.expanded {
+            return false;
+        }
+        let me = node.state.to_move();
+        let mut all_decided = true;
+        let mut any_draw = false;
+        let mut proven = None;
+        for c in node.children() {
+            match self.nodes[c as usize].outcome {
+                Some(Outcome::Win(p)) if p == me => {
+                    proven = Some(Outcome::Win(me));
+                    break;
+                }
+                Some(Outcome::Win(_)) => {}
+                Some(Outcome::Draw) => any_draw = true,
+                None => all_decided = false,
+            }
+        }
+        if proven.is_none() && all_decided {
+            proven = Some(if any_draw {
+                Outcome::Draw
+            } else {
+                Outcome::Win(me.other())
+            });
+        }
+        match proven {
+            Some(outcome) => {
+                self.nodes[idx as usize].outcome = Some(outcome);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Carries a fresh decision at `idx` up the tree: a move into a position its mover is
+    /// proven to lose gets a zero prior so selection avoids it, and each ancestor is
+    /// re-examined while it keeps resolving.
+    fn propagate_proof(&mut self, mut idx: u32) {
+        loop {
+            let node = &self.nodes[idx as usize];
+            let Some(outcome) = node.outcome else {
+                return;
+            };
+            let parent = node.parent;
+            let lost_by_mover = outcome == Outcome::Win(node.state.to_move());
+            if parent == NO_NODE {
+                return;
+            }
+            if lost_by_mover {
+                self.stats[idx as usize].prior = 0.0;
+            }
+            if !self.try_prove(parent) {
+                return;
+            }
+            idx = parent;
+        }
     }
 
     fn apply_root_noise(&mut self) {
@@ -462,7 +550,12 @@ impl<S: GameState> SearchTree<S> {
             if node.expanded {
                 let child_visits: u32 =
                     node.children().map(|c| self.stats[c as usize].visits).sum();
-                assert_eq!(stats.visits, child_visits + 1, "node {i} visit mismatch");
+                if node.outcome.is_some() {
+                    // Proven nodes are backed up exactly without visiting their children.
+                    assert!(stats.visits >= child_visits + 1, "node {i} visit mismatch");
+                } else {
+                    assert_eq!(stats.visits, child_visits + 1, "node {i} visit mismatch");
+                }
             }
         }
     }
@@ -613,7 +706,7 @@ impl<A: UtttAgent> UtttAgent for Mcts<A> {
 mod tests {
     use super::*;
     use crate::agent::RandomAgent;
-    use crate::game::test_positions::x_wins_in_one;
+    use crate::game::test_positions::{X_WINNING_MOVE, x_wins_in_one};
     use crate::game::{BitState, Outcome, Player, Position, sq};
 
     fn cfg(simulations: u32) -> MctsConfig {
@@ -629,19 +722,16 @@ mod tests {
         let mut mcts = Mcts::new(RandomAgent::<BitState>::new(1), cfg(100));
         let result = mcts.search(&state);
         assert_eq!(result.best_move(), Some(Move::new(sq(0, 2), sq(0, 2))));
-        assert!(result.root_value > 0.5, "root value {}", result.root_value);
+        assert_eq!(result.root_value, 1.0, "a win in one is proven");
         assert_eq!(mcts.choose_move(&state), Move::new(sq(0, 2), sq(0, 2)));
 
-        // The first simulation expands the root itself; the other 99 each visit one child.
+        // Expanding the root creates the terminal winning child, which proves the root and
+        // ends the search; the result keeps only the winning move.
         let total: u32 = result.visits.iter().map(|(_, n)| n).sum();
-        assert_eq!(total, 99);
-        // The winning child is terminal and gets the lion's share of visits.
-        let (_, wins) = result
-            .visits
-            .iter()
-            .find(|(m, _)| *m == Move::new(sq(0, 2), sq(0, 2)))
-            .unwrap();
-        assert!(*wins > 50);
+        assert!(total < 99, "{total} visits");
+        for (m, n) in &result.visits {
+            assert_eq!(*n > 0, *m == Move::new(sq(0, 2), sq(0, 2)), "{m}: {n}");
+        }
     }
 
     #[test]
@@ -659,17 +749,13 @@ mod tests {
             let result = mcts.search(&state);
             mcts.assert_tree_consistent();
             let total: u32 = result.visits.iter().map(|(_, n)| n).sum();
-            assert_eq!(total, 119, "batch {batch_size}");
+            assert!(total < 119, "batch {batch_size}: {total} visits");
             assert_eq!(
                 result.best_move(),
                 Some(Move::new(sq(0, 2), sq(0, 2))),
                 "batch {batch_size}"
             );
-            assert!(
-                result.root_value > 0.5,
-                "batch {batch_size}: {}",
-                result.root_value
-            );
+            assert_eq!(result.root_value, 1.0, "batch {batch_size}");
         }
     }
 
@@ -742,7 +828,8 @@ mod tests {
     #[test]
     fn search_tree_is_resumable_and_bounded_by_budget() {
         let mut agent = RandomAgent::<BitState>::new(4);
-        let mut tree = SearchTree::new(x_wins_in_one(), 50, 1.4, 1.0);
+        // The opening: nothing to prove within 50 simulations, so the budget is the limit.
+        let mut tree = SearchTree::new(BitState::initial(), 50, 1.4, 1.0);
         let mut states = Vec::new();
         let mut evals = Evaluations::default();
         let mut rounds = 0;
@@ -761,11 +848,37 @@ mod tests {
         }
         assert_eq!(tree.completed(), 50);
         assert!(rounds >= 7, "{rounds} rounds");
-        assert_eq!(
-            tree.result().best_move(),
-            Some(Move::new(sq(0, 2), sq(0, 2)))
-        );
+        assert!(tree.result().best_move().is_some());
         assert_eq!(tree.claim(8, &mut states), 0, "done trees claim nothing");
+    }
+
+    #[test]
+    fn solver_proves_a_win_in_one_and_stops() {
+        let mut agent = RandomAgent::<BitState>::new(4);
+        let mut tree = SearchTree::new(x_wins_in_one(), 50, 1.4, 1.0);
+        let mut states = Vec::new();
+        let mut evals = Evaluations::default();
+        while !tree.is_done() {
+            states.clear();
+            if tree.claim(8, &mut states) > 0 {
+                evals.clear();
+                agent.evaluate_batch(&states, &mut evals);
+                tree.resolve(&evals, 0);
+            }
+            tree.assert_consistent();
+        }
+        // The root's expansion creates the terminal winning child, proving the root.
+        assert_eq!(tree.completed(), 1);
+        let result = tree.result();
+        assert_eq!(result.root_value, 1.0);
+        assert_eq!(result.best_move(), Some(X_WINNING_MOVE));
+        let others: u32 = result
+            .visits
+            .iter()
+            .filter(|(m, _)| *m != X_WINNING_MOVE)
+            .map(|(_, n)| n)
+            .sum();
+        assert_eq!(others, 0, "only the proven winning move keeps visits");
     }
 
     #[test]
