@@ -271,6 +271,17 @@ pub fn run_loop(
         let _ = std::fs::remove_file(cfg.dir.join("history.jsonl"));
     }
 
+    // Self-play always uses the best model; training continues from the previous
+    // generation's candidate, promoted or not, so that the weights keep moving and a
+    // candidate that just missed the threshold is not thrown away.
+    let mut last = best.clone();
+    if first > 0 {
+        let previous = generation_path(&cfg.dir, first);
+        if previous.with_extension("bpk").exists() {
+            last = previous;
+        }
+    }
+
     let mut buffer = ReplayBuffer::new(cfg.buffer_games);
     let mut reports = Vec::new();
     let loop_started = Instant::now();
@@ -298,7 +309,8 @@ pub fn run_loop(
         buffer.push(data);
 
         log(format!(
-            "  training on {} positions from {} buffered games",
+            "  training {} on {} positions from {} buffered games",
+            last.display(),
             buffer.positions(),
             buffer.games()
         ));
@@ -309,13 +321,14 @@ pub fn run_loop(
         };
         let (candidate, train_report) = train_model(
             &cfg.spec,
-            Some(&best),
+            Some(&last),
             &device,
             buffer.dataset(),
             &train_opts,
         )?;
         let candidate_path = generation_path(&cfg.dir, generation);
         candidate.save(&candidate_path)?;
+        last = candidate_path.clone();
         log(format!(
             "  validation: verdict accuracy {:.3} (baseline {:.3}), value mse {:.4} (baseline {:.4}), policy accuracy {:.3} (baseline {:.3}); kept epoch {}",
             train_report.validation.verdict_accuracy,

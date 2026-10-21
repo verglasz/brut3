@@ -77,7 +77,7 @@ struct LoopArgs {
     /// Games kept in the replay buffer.
     #[arg(long, default_value_t = 5000)]
     buffer_games: usize,
-    /// Training epochs per generation, continuing from the best weights.
+    /// Training epochs per generation, continuing from the previous generation's weights.
     #[arg(long, default_value_t = 2)]
     epochs: usize,
     #[arg(long, default_value_t = 1024)]
