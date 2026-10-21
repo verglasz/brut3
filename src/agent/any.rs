@@ -116,6 +116,40 @@ impl AgentSpec {
         }
     }
 
+    /// For a search agent (`mcts`, `mcts-nn`): the leaf evaluator it searches over and its
+    /// search settings, so that many of its games can be played in lockstep
+    /// ([`crate::selfplay::lockstep_match`]). `None` for agents that are not searches. Fails
+    /// only for network agents whose weights cannot be loaded.
+    pub fn search_parts(&self) -> Result<Option<(AnyAgent, MctsConfig)>, String> {
+        Ok(match self {
+            AgentSpec::Mcts { simulations, seed } => Some((
+                AnyAgent::Random(RandomAgent::new(seed ^ 0x9E37_79B9_7F4A_7C15)),
+                MctsConfig {
+                    simulations: *simulations,
+                    seed: *seed,
+                    ..Default::default()
+                },
+            )),
+            #[cfg(feature = "nn")]
+            AgentSpec::MctsNn {
+                path,
+                backend,
+                simulations,
+                batch_size,
+                seed,
+            } => Some((
+                AnyAgent::Nn(NetAgent::load(path, *backend)?),
+                MctsConfig {
+                    simulations: *simulations,
+                    batch_size: *batch_size,
+                    seed: *seed,
+                    ..Default::default()
+                },
+            )),
+            _ => None,
+        })
+    }
+
     /// Builds the agent. Fails only for network agents whose weights cannot be loaded.
     pub fn build(&self) -> Result<AnyAgent, String> {
         Ok(match self {

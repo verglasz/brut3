@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use crate::agent::{AgentSpec, UtttAgent};
 use crate::game::{BitState, GameState, Outcome, Player};
+use crate::selfplay::{Side, lockstep_match};
 
 /// Outcome of a series of games between two agents, alternating colours.
 #[derive(Clone, Debug, PartialEq)]
@@ -56,16 +57,17 @@ impl fmt::Display for MatchResult {
 }
 
 /// Plays `games` games between `a` and `b`, `a` taking X in even-numbered games and O in
-/// odd-numbered ones. Both agents are built once, so their internal state (search RNGs)
-/// carries across games. `on_game` is called after each game with the number played so far.
+/// odd-numbered ones. When both are searches (`mcts`, `mcts-nn`) the games are played in
+/// lockstep, all at once with each side's leaves batched to its evaluator
+/// ([`lockstep_match`]); otherwise one game at a time. Both agents are built once, so their
+/// internal state (search RNGs) carries across games. `on_game` is called after each game
+/// with the number played so far.
 pub fn play_match(
     a: &AgentSpec,
     b: &AgentSpec,
     games: usize,
     mut on_game: impl FnMut(usize),
 ) -> Result<MatchResult, String> {
-    let mut agent_a = a.build()?;
-    let mut agent_b = b.build()?;
     let start = Instant::now();
     let mut result = MatchResult {
         a: a.clone(),
@@ -79,6 +81,32 @@ pub fn play_match(
         moves: 0,
         seconds: 0.0,
     };
+    if let (Some((mut eval_a, search_a)), Some((mut eval_b, search_b))) =
+        (a.search_parts()?, b.search_parts()?)
+    {
+        let tally = lockstep_match(
+            Side {
+                evaluator: &mut eval_a,
+                search: search_a,
+            },
+            Side {
+                evaluator: &mut eval_b,
+                search: search_b,
+            },
+            games,
+            on_game,
+        );
+        result.a_wins = tally.a_wins;
+        result.b_wins = tally.b_wins;
+        result.draws = tally.draws;
+        result.a_wins_as_x = tally.a_wins_as_x;
+        result.a_wins_as_o = tally.a_wins_as_o;
+        result.moves = tally.moves;
+        result.seconds = start.elapsed().as_secs_f32();
+        return Ok(result);
+    }
+    let mut agent_a = a.build()?;
+    let mut agent_b = b.build()?;
     for game in 0..games {
         let a_plays = if game % 2 == 0 { Player::X } else { Player::O };
         let mut state = BitState::initial();
@@ -234,6 +262,25 @@ mod tests {
         assert!(r.a_wins >= 5, "{r}");
         assert!(r.moves >= 6 * 17);
         assert!((r.score_a() + r.score_b() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn two_searches_play_in_lockstep() {
+        let a = AgentSpec::Mcts {
+            simulations: 40,
+            seed: 1,
+        };
+        let b = AgentSpec::Mcts {
+            simulations: 1,
+            seed: 2,
+        };
+        let mut seen = 0;
+        let r = play_match(&a, &b, 4, |n| seen = n).unwrap();
+        assert_eq!(seen, 4);
+        assert_eq!(r.a_wins + r.b_wins + r.draws, 4);
+        assert_eq!(r.a_wins, r.a_wins_as_x + r.a_wins_as_o);
+        assert!(r.a_wins >= r.b_wins, "{r}");
+        assert!(r.moves >= 4 * 17);
     }
 
     #[test]

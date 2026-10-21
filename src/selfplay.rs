@@ -13,8 +13,8 @@ use std::time::Instant;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use crate::agent::{Evaluations, UtttAgent};
-use crate::game::{BitState, GameState, Move, Outcome};
-use crate::mcts::{RootNoise, SearchTree};
+use crate::game::{BitState, GameState, Move, Outcome, Player};
+use crate::mcts::{MctsConfig, RootNoise, SearchTree};
 
 #[derive(Clone, Debug)]
 pub struct SelfPlayConfig {
@@ -270,6 +270,225 @@ pub fn self_play<A: UtttAgent<State = BitState>>(
     (records, stats)
 }
 
+/// One side of a [`lockstep_match`]: a search with `search`'s simulations, per-tree batch,
+/// exploration constant, virtual loss and move temperature, over `evaluator`'s leaf
+/// evaluations. This is what an `mcts` or `mcts-nn` agent is, taken apart so that many of
+/// its games can share one evaluator call.
+pub struct Side<'a, A> {
+    pub evaluator: &'a mut A,
+    pub search: MctsConfig,
+}
+
+/// How a match went, from `a`'s side.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MatchTally {
+    pub games: usize,
+    pub a_wins: usize,
+    pub b_wins: usize,
+    pub draws: usize,
+    /// Wins of `a` in the games it played as X, and as O.
+    pub a_wins_as_x: usize,
+    pub a_wins_as_o: usize,
+    pub moves: usize,
+}
+
+struct MatchGame {
+    state: BitState,
+    /// The search of the side to move.
+    tree: SearchTree<BitState>,
+    a_plays: Player,
+    /// Finished games stay in place (a batch in flight refers to games by index) and are
+    /// skipped.
+    finished: bool,
+}
+
+impl MatchGame {
+    fn a_to_move(&self) -> bool {
+        self.state.to_move() == self.a_plays
+    }
+}
+
+/// The leaves one side's trees claimed this round: the states, each game's span in them
+/// (`(game, from, to)`), and the evaluations once they are back.
+#[derive(Default)]
+struct SideBatch {
+    states: Vec<BitState>,
+    spans: Vec<(usize, usize, usize)>,
+    evals: Evaluations,
+    in_flight: bool,
+}
+
+impl SideBatch {
+    fn claim(&mut self, games: &mut [MatchGame], side_a: bool, tree_batch: usize) {
+        self.states.clear();
+        self.spans.clear();
+        for (g, game) in games.iter_mut().enumerate() {
+            if game.finished || game.a_to_move() != side_a {
+                continue;
+            }
+            let from = self.states.len();
+            game.tree.claim(tree_batch, &mut self.states);
+            self.spans.push((g, from, self.states.len()));
+        }
+    }
+
+    fn begin<E: UtttAgent<State = BitState>>(&mut self, evaluator: &mut E) {
+        if self.states.is_empty() {
+            return;
+        }
+        evaluator.begin_batch(&self.states);
+        self.in_flight = true;
+    }
+
+    fn finish<E: UtttAgent<State = BitState>>(
+        &mut self,
+        games: &mut [MatchGame],
+        evaluator: &mut E,
+    ) {
+        if !self.in_flight {
+            return;
+        }
+        self.in_flight = false;
+        self.evals.clear();
+        evaluator.finish_batch(&self.states, &mut self.evals);
+        debug_assert_eq!(self.evals.len(), self.states.len());
+        for &(g, from, to) in &self.spans {
+            if to > from {
+                games[g].tree.resolve(&self.evals, from);
+            }
+        }
+    }
+}
+
+fn search_tree(state: BitState, search: &MctsConfig) -> SearchTree<BitState> {
+    SearchTree::new(
+        state,
+        search.simulations,
+        search.c_puct,
+        search.virtual_loss,
+    )
+}
+
+/// Games of `side_a` whose search is done play their move; the side to move changes, so the
+/// game's next tree belongs to the other side. Finished games are tallied and marked.
+fn advance_match(
+    games: &mut [MatchGame],
+    side_a: bool,
+    searches: (&MctsConfig, &MctsConfig),
+    rng: &mut SmallRng,
+    tally: &mut MatchTally,
+    on_game: &mut impl FnMut(usize),
+) {
+    let search = if side_a { searches.0 } else { searches.1 };
+    for game in games.iter_mut() {
+        if game.finished || game.a_to_move() != side_a || !game.tree.is_done() {
+            continue;
+        }
+        let mv = game
+            .tree
+            .result()
+            .sample_move(search.temperature, rng)
+            .expect("non-terminal position has moves");
+        game.state.apply(mv);
+        tally.moves += 1;
+        match game.state.outcome() {
+            Some(outcome) => {
+                tally.games += 1;
+                match outcome {
+                    Outcome::Win(p) if p == game.a_plays => {
+                        tally.a_wins += 1;
+                        if game.a_plays == Player::X {
+                            tally.a_wins_as_x += 1;
+                        } else {
+                            tally.a_wins_as_o += 1;
+                        }
+                    }
+                    Outcome::Win(_) => tally.b_wins += 1,
+                    Outcome::Draw => tally.draws += 1,
+                }
+                game.finished = true;
+                on_game(tally.games);
+            }
+            None => {
+                let next = if game.a_to_move() {
+                    searches.0
+                } else {
+                    searches.1
+                };
+                game.tree = search_tree(game.state, next);
+            }
+        }
+    }
+}
+
+/// Plays `games` games between two searches, all at once: `a` takes X in even-numbered games
+/// and O in odd-numbered ones. Every round, the leaves claimed by all trees of one side go to
+/// that side's evaluator in one call, and as in [`self_play`] the two sides take turns so one
+/// side's tree work overlaps the other's evaluation. Moves follow each side's `temperature`
+/// (argmax at `0`). `on_game` is called after each finished game with the number so far.
+pub fn lockstep_match<A: UtttAgent<State = BitState>, B: UtttAgent<State = BitState>>(
+    a: Side<'_, A>,
+    b: Side<'_, B>,
+    games: usize,
+    mut on_game: impl FnMut(usize),
+) -> MatchTally {
+    let mut tally = MatchTally::default();
+    let mut rng_a = SmallRng::seed_from_u64(a.search.seed);
+    let mut rng_b = SmallRng::seed_from_u64(b.search.seed);
+    let mut active: Vec<MatchGame> = (0..games)
+        .map(|g| {
+            let a_plays = if g % 2 == 0 { Player::X } else { Player::O };
+            let opener = if a_plays == Player::X {
+                &a.search
+            } else {
+                &b.search
+            };
+            MatchGame {
+                state: BitState::initial(),
+                tree: search_tree(BitState::initial(), opener),
+                a_plays,
+                finished: false,
+            }
+        })
+        .collect();
+    let (mut batch_a, mut batch_b) = (SideBatch::default(), SideBatch::default());
+    let searches = (&a.search, &b.search);
+
+    // Same interleaving as self-play, with the two sides as the two groups.
+    let mut current_a = true;
+    batch_a.claim(&mut active, true, a.search.batch_size);
+    batch_a.begin(a.evaluator);
+    while active.iter().any(|g| !g.finished) {
+        if current_a {
+            batch_b.claim(&mut active, false, b.search.batch_size);
+            batch_a.finish(&mut active, a.evaluator);
+            batch_b.begin(b.evaluator);
+            advance_match(
+                &mut active,
+                true,
+                searches,
+                &mut rng_a,
+                &mut tally,
+                &mut on_game,
+            );
+        } else {
+            batch_a.claim(&mut active, true, a.search.batch_size);
+            batch_b.finish(&mut active, b.evaluator);
+            batch_a.begin(a.evaluator);
+            advance_match(
+                &mut active,
+                false,
+                searches,
+                &mut rng_b,
+                &mut tally,
+                &mut on_game,
+            );
+        }
+        current_a = !current_a;
+    }
+    tally
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +574,36 @@ mod tests {
         };
         assert_eq!(run(11), run(11));
         assert_ne!(run(11), run(12));
+    }
+
+    #[test]
+    fn lockstep_match_alternates_colours_and_counts_every_game() {
+        let mut strong = RandomAgent::<BitState>::new(1);
+        let mut weak = RandomAgent::<BitState>::new(2);
+        let search = |simulations, seed| MctsConfig {
+            simulations,
+            batch_size: 4,
+            seed,
+            ..Default::default()
+        };
+        let mut seen = 0;
+        let tally = lockstep_match(
+            Side {
+                evaluator: &mut strong,
+                search: search(40, 3),
+            },
+            Side {
+                evaluator: &mut weak,
+                search: search(1, 4),
+            },
+            6,
+            |n| seen = n,
+        );
+        assert_eq!(seen, 6);
+        assert_eq!(tally.games, 6);
+        assert_eq!(tally.a_wins + tally.b_wins + tally.draws, 6);
+        assert_eq!(tally.a_wins, tally.a_wins_as_x + tally.a_wins_as_o);
+        assert!(tally.moves >= 6 * 17);
+        assert!(tally.a_wins >= 4, "{tally:?}");
     }
 }
