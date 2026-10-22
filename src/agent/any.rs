@@ -7,7 +7,9 @@ use std::fmt;
 #[cfg(feature = "nn")]
 use std::path::PathBuf;
 
-use super::{Evaluation, Evaluations, GreedyAgent, MinimaxAgent, RandomAgent, UtttAgent};
+use super::{
+    Evaluation, Evaluations, GreedyAgent, MinimaxAgent, NeutralAgent, RandomAgent, UtttAgent,
+};
 use crate::game::{BitState, Move};
 use crate::mcts::{Mcts, MctsConfig};
 #[cfg(feature = "nn")]
@@ -33,6 +35,16 @@ pub enum AgentSpec {
         simulations: u32,
         seed: u64,
     },
+    /// Plays at random; as a leaf evaluator, values every unfinished position at 0 with no
+    /// priors.
+    Neutral {
+        seed: u64,
+    },
+    /// MCTS with flat leaves: nothing but the tree and the terminal positions it reaches.
+    MctsFlat {
+        simulations: u32,
+        seed: u64,
+    },
     /// One-ply lookahead with a trained value network.
     #[cfg(feature = "nn")]
     Nn {
@@ -51,9 +63,10 @@ pub enum AgentSpec {
 }
 
 #[cfg(not(feature = "nn"))]
-const NAMES: &str = "`random`, `greedy`, `minimax` or `mcts`";
+const NAMES: &str = "`random`, `greedy`, `minimax`, `mcts`, `neutral` or `mcts-flat`";
 #[cfg(feature = "nn")]
-const NAMES: &str = "`random`, `greedy`, `minimax`, `mcts`, `nn` or `mcts-nn`";
+const NAMES: &str =
+    "`random`, `greedy`, `minimax`, `mcts`, `neutral`, `mcts-flat`, `nn` or `mcts-nn`";
 
 impl AgentSpec {
     pub const DEFAULT_SIMULATIONS: u32 = 400;
@@ -61,7 +74,8 @@ impl AgentSpec {
     pub const DEFAULT_NN_BATCH: usize = 16;
 
     /// Parses `random [seed]`, `greedy [seed]`, `minimax [depth] [seed]`,
-    /// `mcts [simulations] [seed]`, `nn <weights> [backend]` or
+    /// `mcts [simulations] [seed]`, `neutral [seed]`, `mcts-flat [simulations] [seed]`,
+    /// `nn <weights> [backend]` or
     /// `mcts-nn <weights> [backend] [simulations] [batch] [seed]`.
     pub fn parse(words: &[&str]) -> Result<Self, String> {
         fn num<T: std::str::FromStr>(
@@ -89,6 +103,13 @@ impl AgentSpec {
                 seed: num(words, 2, "seed", 0)?,
             }),
             Some("mcts") => Ok(Self::Mcts {
+                simulations: num(words, 1, "simulations", Self::DEFAULT_SIMULATIONS)?,
+                seed: num(words, 2, "seed", 0)?,
+            }),
+            Some("neutral") => Ok(Self::Neutral {
+                seed: num(words, 1, "seed", 0)?,
+            }),
+            Some("mcts-flat") => Ok(Self::MctsFlat {
                 simulations: num(words, 1, "simulations", Self::DEFAULT_SIMULATIONS)?,
                 seed: num(words, 2, "seed", 0)?,
             }),
@@ -130,6 +151,14 @@ impl AgentSpec {
                     ..Default::default()
                 },
             )),
+            AgentSpec::MctsFlat { simulations, seed } => Some((
+                AnyAgent::Neutral(NeutralAgent::new(seed ^ 0x9E37_79B9_7F4A_7C15)),
+                MctsConfig {
+                    simulations: *simulations,
+                    seed: *seed,
+                    ..Default::default()
+                },
+            )),
             #[cfg(feature = "nn")]
             AgentSpec::MctsNn {
                 path,
@@ -160,6 +189,15 @@ impl AgentSpec {
             }
             AgentSpec::Mcts { simulations, seed } => AnyAgent::Mcts(Mcts::new(
                 RandomAgent::new(seed ^ 0x9E37_79B9_7F4A_7C15),
+                MctsConfig {
+                    simulations: *simulations,
+                    seed: *seed,
+                    ..Default::default()
+                },
+            )),
+            AgentSpec::Neutral { seed } => AnyAgent::Neutral(NeutralAgent::new(*seed)),
+            AgentSpec::MctsFlat { simulations, seed } => AnyAgent::MctsFlat(Mcts::new(
+                NeutralAgent::new(seed ^ 0x9E37_79B9_7F4A_7C15),
                 MctsConfig {
                     simulations: *simulations,
                     seed: *seed,
@@ -224,6 +262,10 @@ impl fmt::Display for AgentSpec {
                     "mcts ({simulations} simulations, random playouts, seed {seed})"
                 )
             }
+            AgentSpec::Neutral { seed } => write!(f, "neutral (seed {seed})"),
+            AgentSpec::MctsFlat { simulations, seed } => {
+                write!(f, "mcts-flat ({simulations} simulations, flat leaves, seed {seed})")
+            }
             #[cfg(feature = "nn")]
             AgentSpec::Nn { path, backend } => {
                 write!(f, "nn ({} on {backend})", path.display())
@@ -252,6 +294,8 @@ pub enum AnyAgent {
     Greedy(GreedyAgent),
     Minimax(MinimaxAgent),
     Mcts(Mcts<RandomAgent<BitState>>),
+    Neutral(NeutralAgent<BitState>),
+    MctsFlat(Mcts<NeutralAgent<BitState>>),
     #[cfg(feature = "nn")]
     Nn(NetAgent),
     #[cfg(feature = "nn")]
@@ -267,6 +311,8 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Greedy(a) => a.choose_move(state),
             AnyAgent::Minimax(a) => a.choose_move(state),
             AnyAgent::Mcts(a) => a.choose_move(state),
+            AnyAgent::Neutral(a) => a.choose_move(state),
+            AnyAgent::MctsFlat(a) => a.choose_move(state),
             #[cfg(feature = "nn")]
             AnyAgent::Nn(a) => a.choose_move(state),
             #[cfg(feature = "nn")]
@@ -280,6 +326,8 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Greedy(a) => a.choose_move_with_policy(state),
             AnyAgent::Minimax(a) => a.choose_move_with_policy(state),
             AnyAgent::Mcts(a) => a.choose_move_with_policy(state),
+            AnyAgent::Neutral(a) => a.choose_move_with_policy(state),
+            AnyAgent::MctsFlat(a) => a.choose_move_with_policy(state),
             #[cfg(feature = "nn")]
             AnyAgent::Nn(a) => a.choose_move_with_policy(state),
             #[cfg(feature = "nn")]
@@ -293,6 +341,8 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Greedy(a) => a.evaluate(state),
             AnyAgent::Minimax(a) => a.evaluate(state),
             AnyAgent::Mcts(a) => a.evaluate(state),
+            AnyAgent::Neutral(a) => a.evaluate(state),
+            AnyAgent::MctsFlat(a) => a.evaluate(state),
             #[cfg(feature = "nn")]
             AnyAgent::Nn(a) => a.evaluate(state),
             #[cfg(feature = "nn")]
@@ -306,6 +356,8 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Greedy(a) => a.evaluate_batch(states, out),
             AnyAgent::Minimax(a) => a.evaluate_batch(states, out),
             AnyAgent::Mcts(a) => a.evaluate_batch(states, out),
+            AnyAgent::Neutral(a) => a.evaluate_batch(states, out),
+            AnyAgent::MctsFlat(a) => a.evaluate_batch(states, out),
             #[cfg(feature = "nn")]
             AnyAgent::Nn(a) => a.evaluate_batch(states, out),
             #[cfg(feature = "nn")]
@@ -319,6 +371,8 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Greedy(a) => a.begin_batch(states),
             AnyAgent::Minimax(a) => a.begin_batch(states),
             AnyAgent::Mcts(a) => a.begin_batch(states),
+            AnyAgent::Neutral(a) => a.begin_batch(states),
+            AnyAgent::MctsFlat(a) => a.begin_batch(states),
             #[cfg(feature = "nn")]
             AnyAgent::Nn(a) => a.begin_batch(states),
             #[cfg(feature = "nn")]
@@ -332,6 +386,8 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Greedy(a) => a.finish_batch(states, out),
             AnyAgent::Minimax(a) => a.finish_batch(states, out),
             AnyAgent::Mcts(a) => a.finish_batch(states, out),
+            AnyAgent::Neutral(a) => a.finish_batch(states, out),
+            AnyAgent::MctsFlat(a) => a.finish_batch(states, out),
             #[cfg(feature = "nn")]
             AnyAgent::Nn(a) => a.finish_batch(states, out),
             #[cfg(feature = "nn")]
@@ -370,6 +426,17 @@ mod tests {
             })
         );
         assert!(AgentSpec::parse(&["mcts", "lots"]).is_err());
+        assert_eq!(
+            AgentSpec::parse(&["mcts-flat", "30"]),
+            Ok(AgentSpec::MctsFlat {
+                simulations: 30,
+                seed: 0
+            })
+        );
+        assert_eq!(
+            AgentSpec::parse(&["neutral", "4"]),
+            Ok(AgentSpec::Neutral { seed: 4 })
+        );
         assert_eq!(
             AgentSpec::parse(&["greedy"]),
             Ok(AgentSpec::Greedy { seed: 0 })
@@ -430,6 +497,11 @@ mod tests {
             AgentSpec::Greedy { seed: 1 },
             AgentSpec::Minimax { depth: 2, seed: 1 },
             AgentSpec::Mcts {
+                simulations: 20,
+                seed: 1,
+            },
+            AgentSpec::Neutral { seed: 1 },
+            AgentSpec::MctsFlat {
                 simulations: 20,
                 seed: 1,
             },

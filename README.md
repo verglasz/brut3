@@ -154,8 +154,10 @@ The search is generic over the agent that evaluates leaves:
   override `evaluate_batch` to run one forward pass per batch of leaves.
 - `mcts::SearchTree` is a PUCT search over an arena tree written as a resumable state machine:
   it hands out leaves to evaluate (`claim`) and takes their evaluations back (`resolve`), with
-  virtual loss within a round and optional Dirichlet noise on the root priors. With no priors it
-  behaves as plain UCT with rollouts; with network priors it is the AlphaZero search. It is also
+  virtual loss within a round and optional Dirichlet noise on the root priors. The leaf
+  evaluator is any agent: `mcts` uses random playouts (plain UCT), `mcts-flat` the `neutral`
+  agent that values every unfinished leaf at 0 so only terminal positions inform the tree, and
+  `mcts-nn` the network, which makes it the AlphaZero search. It is also
   an MCTS-solver: terminal outcomes propagate up as proofs (a node with a winning child is won,
   one whose children are all decided is drawn or lost), proven nodes are backed up exactly and
   never evaluated, moves into proven-lost positions get a zero prior, and a proven root ends

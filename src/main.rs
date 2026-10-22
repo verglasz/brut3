@@ -17,7 +17,8 @@ struct Cli {
 enum Command {
     /// Play against an agent in the terminal (the default command).
     ///
-    /// SPEC is e.g. `mcts 800 3`, `minimax 4`, `greedy`, `random`, `nn models/value cuda`,
+    /// SPEC is e.g. `mcts 800 3` (random playouts), `mcts-flat 800` (flat leaves),
+    /// `minimax 4`, `greedy`, `random`, `nn models/value cuda`,
     /// `mcts-nn models/value cuda 400 16`. Defaults to `mcts 400`.
     Play {
         #[arg(trailing_var_arg = true)]
@@ -154,7 +155,8 @@ struct LoopArgs {
 #[cfg(feature = "nn")]
 #[derive(clap::Args)]
 struct SelfplayArgs {
-    /// Leaf evaluator of the search: `random` for playouts, or `nn <weights> [backend]`.
+    /// Leaf evaluator of the search: `random` for playouts, `neutral` for flat leaves (the
+    /// tree learns only from terminal positions), or `nn <weights> [backend]`.
     #[arg(long, default_value = "random")]
     evaluator: String,
     #[arg(long, default_value_t = 1000)]
