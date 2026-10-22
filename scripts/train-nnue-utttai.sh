@@ -59,7 +59,8 @@ if [ "$EPOCHS1" -gt 0 ]; then
         --out "models/$NAME-s1" --artifact-dir "artifacts/$NAME-s1" "$@"
 fi
 if [ "$EPOCHS2" -gt 0 ]; then
-    "$BIN" train --backend "$BACKEND" --data "$STAGE2" --model "$MODEL" --init "models/$NAME-s1" \
+    "$BIN" train --backend "$BACKEND" --data "$STAGE2" --model "$MODEL" \
+		--init "models/$NAME-s1" \
         --epochs "$EPOCHS2" --batch-size "$BATCH" --lr "$LR" --lr-min "$LR_MIN" \
         --augment all --validation-fraction "$VALID" --workers "$WORKERS" \
         --outcome-weight 1 --search-value-weight 1 \

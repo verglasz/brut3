@@ -40,7 +40,7 @@ pub const CONTENTS: usize = OPEN_CONTENTS + 3;
 
 /// Compact id of a raw code; `u16::MAX` for the unreachable codes where both players have a
 /// line.
-const COMPACT: [u16; RAW_CONTENTS] = compact_table();
+static COMPACT: [u16; RAW_CONTENTS] = compact_table();
 
 const fn winner(code: usize) -> (bool, bool) {
     let mut mine = 0u16;
@@ -189,7 +189,12 @@ pub fn nnue_ids(state: &BitState, out: &mut [i32; IDS]) {
         } else {
             decided += 1;
         }
-        write_token(&mut out[b * IDS_PER_BOARD..(b + 1) * IDS_PER_BOARD], *content, mine, theirs);
+        write_token(
+            &mut out[b * IDS_PER_BOARD..(b + 1) * IDS_PER_BOARD],
+            *content,
+            mine,
+            theirs,
+        );
     }
     let forced = state.forced_board().map(|sq| sq.index());
     let forced_token = &mut out[BOARDS * IDS_PER_BOARD..TOKENS * IDS_PER_BOARD];
@@ -385,7 +390,7 @@ impl Model for Nnue {
             ids.clone().slice([0..n, TOKENS * IDS_PER_BOARD..IDS]),
         )
         .sum_dim(1)
-            .reshape([n, d_acc]);
+        .reshape([n, d_acc]);
         let acc = relu(self.mix.forward(boards) + self.forced_mix.forward(forced) + features);
 
         let mut h = relu(self.hidden[0].forward(acc.clone()));
@@ -473,13 +478,28 @@ mod tests {
         let state = x_wins_in_one();
         nnue_ids(&state, &mut ids);
         assert_eq!(ids[0], WON_BY_ME as i32);
-        assert_eq!(ids[1], CELL_PAD as i32, "a decided board's cells are padding");
+        assert_eq!(
+            ids[1], CELL_PAD as i32,
+            "a decided board's cells are padding"
+        );
         assert_eq!(ids[IDS_PER_BOARD], WON_BY_ME as i32);
         let board2 = ids[2 * IDS_PER_BOARD] as usize;
         assert!(board2 < OPEN_CONTENTS);
-        assert_eq!(ids[2 * IDS_PER_BOARD + 1], (CELL_BASE + 1) as i32, "square 0 mine");
-        assert_eq!(ids[2 * IDS_PER_BOARD + 3], (CELL_BASE + 6) as i32, "square 2 empty");
-        assert_eq!(ids[BOARDS * IDS_PER_BOARD], board2 as i32, "forced token is board 2");
+        assert_eq!(
+            ids[2 * IDS_PER_BOARD + 1],
+            (CELL_BASE + 1) as i32,
+            "square 0 mine"
+        );
+        assert_eq!(
+            ids[2 * IDS_PER_BOARD + 3],
+            (CELL_BASE + 6) as i32,
+            "square 2 empty"
+        );
+        assert_eq!(
+            ids[BOARDS * IDS_PER_BOARD],
+            board2 as i32,
+            "forced token is board 2"
+        );
         let features = &ids[TOKENS * IDS_PER_BOARD..];
         assert_eq!(features[0], (FORCED_BASE + 2) as i32);
         // Top row: mine, mine, open.
@@ -506,7 +526,10 @@ mod tests {
             .with_d_hidden(16)
             .with_layers(2)
             .init(&device);
-        assert_eq!(model.folded_macs(), 32 * 16 + 16 * 16 + 16 * 3 + 32 * 3 + 16 * 81);
+        assert_eq!(
+            model.folded_macs(),
+            32 * 16 + 16 * 16 + 16 * 3 + 32 * 3 + 16 * 81
+        );
         let states = [BitState::initial(), x_wins_in_one(), o_must_block()];
         let p = predict_host(&model, &states, &device);
         assert_eq!(p.wdl.len(), 3);
