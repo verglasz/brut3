@@ -54,9 +54,10 @@ enum Command {
         /// Games per pair of agents (colours alternate; game g uses each agent's seed + g).
         #[arg(long, default_value_t = 20)]
         games: usize,
-        /// Search vs search: plies per game sampled by visit count before argmax, so that
-        /// games with the same seed differ (0 plays every move greedily).
-        #[arg(long, default_value_t = 0)]
+        /// Search vs search: opening plies per game sampled by visit count before argmax, so
+        /// that the games of a match differ (0 plays every move greedily, which between two
+        /// deterministic searches repeats one game per colour).
+        #[arg(long, default_value_t = 6)]
         temperature_moves: usize,
         /// Search vs search: Dirichlet alpha of the root noise (0 disables it).
         #[arg(long, default_value_t = 0.0)]
