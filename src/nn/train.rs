@@ -205,7 +205,6 @@ pub fn generate(
                 policy,
                 game,
                 search_value: None,
-                search_value: None,
             });
         }
         on_game(game + 1);
@@ -232,7 +231,6 @@ pub fn generate_parallel(
                 state,
                 policy,
                 game,
-                search_value: None,
                 search_value: Some(value),
             });
         }
@@ -274,6 +272,9 @@ impl<M: Model> Clone for Batch<M> {
         Self {
             input: self.input.clone(),
             verdicts: self.verdicts.clone(),
+            values: self.values.clone(),
+            outcome_weight: self.outcome_weight,
+            search_value_weight: self.search_value_weight,
             policy: self.policy.clone(),
             legal: self.legal.clone(),
         }
@@ -828,6 +829,7 @@ pub(crate) mod tests {
             verdict: Verdict::Draw,
             policy: vec![(Move::new(crate::game::sq(1, 1), crate::game::sq(1, 1)), 1.0)],
             game: 0,
+            search_value: None,
         });
         assert!(d.augmented().samples.iter().all(|s| *s == d.samples[0]));
     }
@@ -859,6 +861,7 @@ pub(crate) mod tests {
                 verdict: Verdict::from_index(i % 3),
                 policy: vec![(Move::from_index(i), 1.0)],
                 game: i / 4, // 5 games of 4 positions
+                search_value: None,
             });
         }
         let (train, valid) = data.clone().split(0.2, 1);
