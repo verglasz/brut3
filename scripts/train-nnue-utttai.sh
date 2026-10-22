@@ -27,21 +27,27 @@ BIN=target/release/ultimate-ttt-burn
 
 # The burn dashboard assumes a dark background. When it is going to be shown (a terminal,
 # and no --no-tui among the extra arguments), give the terminal a dark background and a light
-# foreground for the run (OSC 11 and 10) and restore its own colours on exit (OSC 111, 110).
-# Inside tmux the sequences are wrapped for passthrough.
-osc() {
-    # The argument is part of the format so that its \007 is interpreted; tmux passthrough
-    # doubles the escape.
-    if [ -n "${TMUX:-}" ]; then printf '\033Ptmux;\033\033'"$1"'\033\\'; else printf '\033'"$1"; fi
+# foreground for the run and restore its own colours on exit. Inside tmux this styles the
+# pane through tmux (OSC sequences would need allow-passthrough); elsewhere it uses OSC 11
+# and 10, reset with OSC 111 and 110.
+dark_on() {
+    if [ -n "${TMUX:-}" ]; then
+        tmux select-pane -P 'bg=#1c1c1c,fg=#d7d7d7'
+    else
+        printf '\033]11;#1c1c1c\007\033]10;#d7d7d7\007'
+    fi
+}
+dark_off() {
+    if [ -n "${TMUX:-}" ]; then
+        tmux select-pane -P 'default'
+    else
+        printf '\033]111\007\033]110\007'
+    fi
 }
 if [ -t 1 ]; then
     case " $* " in
         *" --no-tui "*) ;;
-        *)
-            osc ']11;#1c1c1c\007'
-            osc ']10;#d7d7d7\007'
-            trap 'osc "]111\007"; osc "]110\007"' EXIT INT TERM
-            ;;
+        *) dark_on; trap dark_off EXIT INT TERM ;;
     esac
 fi
 
