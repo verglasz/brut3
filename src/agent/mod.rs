@@ -4,13 +4,11 @@ pub mod any;
 pub mod greedy;
 pub mod heuristic;
 pub mod minimax;
-pub mod neutral;
 pub mod random;
 
 pub use any::{AgentSpec, AnyAgent};
 pub use greedy::GreedyAgent;
 pub use minimax::MinimaxAgent;
-pub use neutral::NeutralAgent;
 pub use random::RandomAgent;
 
 use crate::game::{GameState, Move};
