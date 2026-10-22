@@ -102,12 +102,14 @@ pub fn parse_line(line: &str) -> Result<Option<Sample>, String> {
     let (wdl, search_value) = match state_fields.len() {
         // STATE VISITS WINS DRAWS LOSSES
         5 => {
-            let n: f32 = num(state_fields[1])?;
+            // The counts occasionally sum to one less than the visit count, so the counts'
+            // own sum is the denominator.
             let w: f32 = num(state_fields[2])?;
             let d: f32 = num(state_fields[3])?;
             let l: f32 = num(state_fields[4])?;
-            if n <= 0.0 || (w + d + l - n).abs() > 0.5 {
-                return Err(format!("win/draw/loss counts {w}/{d}/{l} do not sum to {n}"));
+            let n = w + d + l;
+            if n <= 0.0 {
+                return Err(format!("win/draw/loss counts {w}/{d}/{l} are empty"));
             }
             (Some([w / n, d / n, l / n]), Some((w - l) / n))
         }
@@ -337,8 +339,8 @@ mod tests {
     fn rejects_illegal_actions_and_bad_lines() {
         let bad = format!("evaluatedState{{{INITIAL} 10 5 3 2}} evaluatedActions{{1 81 10 5 3 2}}");
         assert!(parse_line(&bad).is_err());
-        let sums = format!("evaluatedState{{{INITIAL} 10 5 3 3}} evaluatedActions{{1 0 10 5 3 2}}");
-        assert!(parse_line(&sums).is_err());
+        let empty = format!("evaluatedState{{{INITIAL} 0 0 0 0}} evaluatedActions{{1 0 10 5 3 2}}");
+        assert!(parse_line(&empty).is_err());
         assert!(parse_line("nonsense").is_err());
     }
 
