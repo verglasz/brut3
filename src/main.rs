@@ -35,6 +35,17 @@ enum Command {
     /// replay buffer, promote it if it beats the best; repeat.
     #[cfg(feature = "nn")]
     Loop(LoopArgs),
+    /// Convert the uttt.ai text datasets (stage1-mcts, stage2-nmcts) into a games file for
+    /// `train --data`: e.g. `import-utttai --out datasets/stage1.games datasets/stage1-mcts`.
+    #[cfg(feature = "nn")]
+    ImportUtttai {
+        /// Dataset directories (every `.txt` inside) or files.
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<std::path::PathBuf>,
+        /// Games file to write.
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
     /// List the backends compiled into this binary.
     #[cfg(feature = "nn")]
     Backends,
@@ -112,8 +123,10 @@ struct LoopArgs {
     lr_min: f64,
     #[arg(long, default_value_t = 1e-4)]
     weight_decay: f32,
-    #[arg(long)]
-    no_augment: bool,
+    /// Symmetry augmentation: `all` (eight copies, for small datasets), `random` (one random
+    /// symmetry per sample per epoch, for large ones) or `none`.
+    #[arg(long, default_value = "all")]
+    augment: String,
     /// Weight of the outcome cross-entropy in the loss (0 with --search-value-weight trains
     /// the value head on the search's values only).
     #[arg(long, default_value_t = 1.0)]
@@ -229,10 +242,15 @@ struct TrainArgs {
     /// Self-play: Dirichlet alpha of the root noise (0 disables it).
     #[arg(long, default_value_t = 0.3)]
     dirichlet_alpha: f32,
-    /// Model to train: `linear`, or `board-transformer`, `cell-transformer`, `board-v2` or
-    /// `cell-v2` followed by `[d_model] [layers] [heads]`.
+    /// Model to train: `linear`; `board-transformer`, `cell-transformer`, `board-v2` or
+    /// `cell-v2` followed by `[d_model] [layers] [heads]`; or `nnue` followed by
+    /// `[d_embed] [d_acc] [d_hidden] [layers]`.
     #[arg(long, default_value = "linear")]
     model: String,
+    /// Continue training from this saved model (path stem of its `.bpk`/`.json`); its shape
+    /// must match `--model`.
+    #[arg(long)]
+    init: Option<std::path::PathBuf>,
     /// Number of self-play games to generate.
     #[arg(long, default_value_t = 1000)]
     games: usize,
@@ -243,9 +261,18 @@ struct TrainArgs {
     /// Learning rate.
     #[arg(long, default_value_t = 1e-3)]
     lr: f64,
+    /// Cosine-anneal the learning rate down to this over the run (0 keeps it constant).
+    #[arg(long, default_value_t = 0.0)]
+    lr_min: f64,
     /// AdamW weight decay; raise it (e.g. 1e-2) when a large model overfits a small dataset.
     #[arg(long, default_value_t = 1e-4)]
     weight_decay: f32,
+    /// Fraction of the positions held out for validation.
+    #[arg(long, default_value_t = 0.1)]
+    validation_fraction: f32,
+    /// Data loader threads (0 = one per core).
+    #[arg(long, default_value_t = 0)]
+    workers: usize,
     #[arg(long, default_value_t = 0)]
     seed: u64,
     /// Where to save the weights (the `.bpk` extension is added).
@@ -257,9 +284,10 @@ struct TrainArgs {
     /// Log metrics as plain lines instead of the live dashboard (for scripts and CI).
     #[arg(long)]
     no_tui: bool,
-    /// Train only on the positions as played, without the eight board symmetries.
-    #[arg(long)]
-    no_augment: bool,
+    /// Symmetry augmentation: `all` (eight copies, for small datasets), `random` (one random
+    /// symmetry per sample per epoch, for large ones) or `none`.
+    #[arg(long, default_value = "all")]
+    augment: String,
     /// Weight of the outcome cross-entropy in the loss (0 with --search-value-weight is
     /// distillation: the value head learns the generating search's values only).
     #[arg(long, default_value_t = 1.0)]
@@ -281,6 +309,8 @@ fn main() -> ExitCode {
         #[cfg(feature = "nn")]
         Command::Loop(args) => run_loop(&args),
         Command::Benchmark { games, specs } => benchmark(games, &specs),
+        #[cfg(feature = "nn")]
+        Command::ImportUtttai { paths, out } => import_utttai(&paths, &out),
         #[cfg(feature = "nn")]
         Command::Backends => {
             use ultimate_ttt_burn::nn::BackendKind;
@@ -387,7 +417,7 @@ fn run_loop(args: &LoopArgs) -> Result<(), String> {
             batch_size: args.batch_size,
             learning_rate: args.lr,
             weight_decay: args.weight_decay,
-            augment: !args.no_augment,
+            augment: args.augment.parse()?,
             outcome_weight: args.outcome_weight,
             search_value_weight: args.search_value_weight,
             tui: args.tui,
@@ -511,6 +541,24 @@ fn selfplay(args: &SelfplayArgs) -> Result<(), String> {
 }
 
 #[cfg(feature = "nn")]
+fn import_utttai(paths: &[std::path::PathBuf], out: &std::path::Path) -> Result<(), String> {
+    use std::time::Instant;
+    use ultimate_ttt_burn::nn::{games, utttai};
+
+    let start = Instant::now();
+    let data = utttai::import(paths)?;
+    let with_wdl = data.samples.iter().filter(|s| s.wdl.is_some()).count();
+    println!(
+        "parsed {} positions ({with_wdl} with win/draw/loss counts) in {:.0}s",
+        data.len(),
+        start.elapsed().as_secs_f32()
+    );
+    games::save(out, &data)?;
+    println!("saved to {}", out.display());
+    Ok(())
+}
+
+#[cfg(feature = "nn")]
 fn train(args: &TrainArgs) -> Result<(), String> {
     use std::io::Write;
     use std::time::Instant;
@@ -594,17 +642,24 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         epochs: args.epochs,
         batch_size: args.batch_size,
         learning_rate: args.lr,
+        lr_min: args.lr_min,
         weight_decay: args.weight_decay,
+        validation_fraction: args.validation_fraction,
+        workers: args.workers,
         seed: args.seed,
         artifact_dir: args.artifact_dir.clone(),
         tui: !args.no_tui,
-        augment: !args.no_augment,
+        augment: args.augment.parse()?,
         outcome_weight: args.outcome_weight,
         search_value_weight: args.search_value_weight,
-        ..Default::default()
     };
-    let (model, report) =
-        ultimate_ttt_burn::nn::train_model(&model_spec, None, &device, data, &opts)?;
+    let (model, report) = ultimate_ttt_burn::nn::train_model(
+        &model_spec,
+        args.init.as_deref(),
+        &device,
+        data,
+        &opts,
+    )?;
     println!(
         "  {} train / {} validation positions; kept epoch {} of {} (lowest validation loss)",
         report.train_positions, report.validation_positions, report.best_epoch, report.epochs

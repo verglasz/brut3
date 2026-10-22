@@ -23,6 +23,7 @@ pub mod model;
 pub mod nnue;
 pub mod pipeline;
 pub mod train;
+pub mod utttai;
 
 pub use agent::NetAgent;
 pub use any_model::{AnyModel, ModelSpec};
@@ -38,7 +39,9 @@ pub use linear::{LinearNet, LinearNetConfig};
 pub use model::{HostPrediction, MOVES, Model, Prediction, Verdict, expected_value};
 pub use nnue::{Nnue, NnueConfig};
 pub use pipeline::{GenerationReport, LoopConfig, ReplayBuffer, run_loop, train_model};
-pub use train::{Dataset, Sample, TrainOptions, TrainReport, generate, generate_parallel, train};
+pub use train::{
+    Augment, Dataset, Sample, TrainOptions, TrainReport, generate, generate_parallel, train,
+};
 
 /// Tests that touch a device take this lock: initialising or driving several CubeCL backends
 /// (wgpu, cuda, MLIR CPU) from parallel test threads in one process deadlocks.

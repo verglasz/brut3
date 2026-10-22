@@ -28,6 +28,34 @@ use super::model::{
 };
 use crate::agent::{AgentSpec, UtttAgent};
 use crate::game::{BitState, GameState, Move, Outcome, Symmetry};
+
+/// How training data is multiplied by the eight board symmetries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Augment {
+    /// Positions as played only.
+    None,
+    /// Every sample under all eight symmetries, materialised: an epoch sees each eight
+    /// times. Right for small datasets (self-play generations).
+    #[default]
+    All,
+    /// Each sample under one symmetry drawn at random every time it is batched: an epoch
+    /// sees the data once and the symmetries over the epochs, in the memory of one copy.
+    /// Right for datasets of millions of positions.
+    Random,
+}
+
+impl std::str::FromStr for Augment {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "none" => Ok(Self::None),
+            "all" => Ok(Self::All),
+            "random" => Ok(Self::Random),
+            other => Err(format!("augmentation {other:?} is not none, all or random")),
+        }
+    }
+}
 use crate::selfplay::{SelfPlayConfig, SelfPlayStats, self_play};
 
 /// One position with its targets, all from the side to move's view: a move distribution, and
@@ -196,6 +224,16 @@ impl Dataset {
             / self.len() as f32
     }
 
+    /// Every sample under all eight board symmetries (the identity first): eight times the
+    /// data, with the same game ids.
+    pub fn augmented(&self) -> Dataset {
+        let mut samples = Vec::with_capacity(self.len() * Symmetry::ALL.len());
+        for sym in Symmetry::ALL {
+            samples.extend(self.samples.iter().map(|s| s.transform(sym)));
+        }
+        Dataset { samples }
+    }
+
     /// Splits off about `fraction` of the positions as validation data, whole games at a
     /// time (games are shuffled with `seed`). When there are at least two games, each part
     /// gets at least one.
@@ -324,23 +362,22 @@ impl<M: Model> Clone for Batch<M> {
     }
 }
 
-/// Turns samples into a [`Batch`] for model `M`, carrying the loss weights. With `augment`
-/// each sample is seen through a board symmetry drawn at random every time it is batched, so
-/// an epoch covers the data once and the symmetries over the epochs, without eight copies of
-/// the data in memory.
+/// Turns samples into a [`Batch`] for model `M`, carrying the loss weights. With `random_symmetry`
+/// each sample is seen through a board symmetry drawn at random every time it is batched
+/// ([`Augment::Random`]).
 pub struct ModelBatcher<M> {
     pub outcome_weight: f32,
     pub search_value_weight: f32,
-    pub augment: bool,
+    pub random_symmetry: bool,
     _model: PhantomData<fn() -> M>,
 }
 
 impl<M> ModelBatcher<M> {
-    pub fn new(outcome_weight: f32, search_value_weight: f32, augment: bool) -> Self {
+    pub fn new(outcome_weight: f32, search_value_weight: f32, random_symmetry: bool) -> Self {
         Self {
             outcome_weight,
             search_value_weight,
-            augment,
+            random_symmetry,
             _model: PhantomData,
         }
     }
@@ -354,13 +391,17 @@ impl<M> Default for ModelBatcher<M> {
 
 impl<M> Clone for ModelBatcher<M> {
     fn clone(&self) -> Self {
-        Self::new(self.outcome_weight, self.search_value_weight, self.augment)
+        Self::new(
+            self.outcome_weight,
+            self.search_value_weight,
+            self.random_symmetry,
+        )
     }
 }
 
 impl<M: Model> Batcher<Sample, Batch<M>> for ModelBatcher<M> {
     fn batch(&self, items: Vec<Sample>, device: &Device) -> Batch<M> {
-        let items: Vec<Sample> = if self.augment {
+        let items: Vec<Sample> = if self.random_symmetry {
             let mut rng = rand::rng();
             items
                 .into_iter()
@@ -475,9 +516,8 @@ pub struct TrainOptions {
     pub weight_decay: f32,
     /// Fraction of positions held out for validation.
     pub validation_fraction: f32,
-    /// See each sample through a random board symmetry each time it is batched. Validation
-    /// is never augmented.
-    pub augment: bool,
+    /// Symmetry augmentation of the training split. Validation is never augmented.
+    pub augment: Augment,
     /// Weight of the win/draw/loss cross-entropy in the loss; `0` with a search-value weight
     /// trains the value head purely on scalar values (distillation).
     pub outcome_weight: f32,
@@ -503,7 +543,7 @@ impl Default for TrainOptions {
             lr_min: 0.0,
             weight_decay: 1e-4,
             validation_fraction: 0.1,
-            augment: true,
+            augment: Augment::All,
             outcome_weight: 1.0,
             search_value_weight: 0.5,
             workers: 0,
@@ -632,6 +672,10 @@ pub fn train<M: Trainable>(
     ad_device.seed(opts.seed);
 
     let (train_data, valid_data) = data.split(opts.validation_fraction, opts.seed);
+    let train_data = match opts.augment {
+        Augment::All => train_data.augmented(),
+        Augment::None | Augment::Random => train_data,
+    };
     let report_base = TrainReport {
         train_positions: train_data.len(),
         validation_positions: valid_data.len(),
@@ -644,8 +688,11 @@ pub fn train<M: Trainable>(
     };
     let batch = opts.batch_size.max(1);
     let steps_per_epoch = train_data.len().div_ceil(batch);
-    let batcher =
-        ModelBatcher::<M>::new(opts.outcome_weight, opts.search_value_weight, opts.augment);
+    let batcher = ModelBatcher::<M>::new(
+        opts.outcome_weight,
+        opts.search_value_weight,
+        opts.augment == Augment::Random,
+    );
     let loader_train = DataLoaderBuilder::<Sample, Batch<M>>::new(batcher)
         .batch_size(batch)
         .shuffle(opts.seed)
@@ -814,7 +861,7 @@ pub(crate) mod tests {
         TrainOptions {
             epochs,
             tui: false,
-            augment: false,
+            augment: Augment::None,
             workers: 1,
             artifact_dir: temp_artifact_dir(&format!("{kind}-{tag}")),
             ..Default::default()
@@ -940,6 +987,9 @@ pub(crate) mod tests {
             |_| {},
         )
         .unwrap();
+        let aug = data.augmented();
+        assert_eq!(aug.len(), 8 * data.len());
+        assert_eq!(&aug.samples[..data.len()], &data.samples[..], "identity first");
         for original in &data.samples {
             for sym in Symmetry::ALL {
                 let s = original.transform(sym);
@@ -1048,7 +1098,7 @@ pub(crate) mod tests {
         let data = generate(&AgentSpec::Greedy { seed: 1 }, 300, |_| {}).unwrap();
         let first = data.samples[0].state;
         let options = TrainOptions {
-            augment: true,
+            augment: Augment::All,
             ..opts(kind, "linear-selfplay", 8)
         };
         let (model, report) = train(
