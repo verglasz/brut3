@@ -58,6 +58,6 @@ exec target/release/ultimate-ttt-burn loop \
     --baseline random \
     --baseline greedy \
     --baseline "mcts 200" \
-    --baseline-games 10 \
+    --baseline-games 30 \
     --tui \
     "$@"
