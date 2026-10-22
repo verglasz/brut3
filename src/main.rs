@@ -175,6 +175,10 @@ struct SelfplayArgs {
     dirichlet_alpha: f32,
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Independent self-play runs in parallel, each playing its share of the games with its
+    /// own evaluator and seed (0 = one per core).
+    #[arg(long, default_value_t = 1)]
+    threads: usize,
     /// Games file to write.
     #[arg(long)]
     out: std::path::PathBuf,
@@ -416,18 +420,66 @@ fn selfplay(args: &SelfplayArgs) -> Result<(), String> {
         seed: args.seed,
         ..Default::default()
     };
+    let threads = match args.threads {
+        0 => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+        n => n,
+    }
+    .clamp(1, args.games.max(1));
     println!(
-        "self-play: {} games, {} simulations/move, {} concurrent x {} leaves, evaluator {evaluator}",
+        "self-play: {} games, {} simulations/move, {} concurrent x {} leaves, evaluator {evaluator}, {threads} thread(s)",
         args.games, cfg.simulations, cfg.concurrent, cfg.tree_batch
     );
     let start = Instant::now();
-    let progress = |n: usize| {
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let report = |n: usize| {
         if n.is_multiple_of(100) || n == args.games {
             print!("\r  {n}/{} games", args.games);
             let _ = io::stdout().flush();
         }
     };
-    let (data, stats) = generate_parallel(&evaluator, args.games, &cfg, progress)?;
+    // Each thread plays a contiguous share of the games with its own seed; the datasets are
+    // concatenated with distinct game ids and the statistics summed.
+    let runs: Vec<Result<_, String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let games = args.games / threads + usize::from(t < args.games % threads);
+                let cfg = SelfPlayConfig {
+                    seed: cfg.seed.wrapping_add(t as u64),
+                    ..cfg.clone()
+                };
+                let (evaluator, done, report) = (&evaluator, &done, &report);
+                scope.spawn(move || {
+                    generate_parallel(evaluator, games, &cfg, |_| {
+                        report(1 + done.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+                    })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("self-play thread panicked"))
+            .collect()
+    });
+    let mut data = ultimate_ttt_burn::nn::Dataset::default();
+    let mut stats = ultimate_ttt_burn::selfplay::SelfPlayStats::default();
+    for run in runs {
+        let (part, part_stats) = run?;
+        let offset = data.games();
+        data.samples.extend(part.samples.into_iter().map(|s| {
+            ultimate_ttt_burn::nn::Sample {
+                game: s.game + offset,
+                ..s
+            }
+        }));
+        stats.games += part_stats.games;
+        stats.positions += part_stats.positions;
+        stats.simulations += part_stats.simulations;
+        stats.evaluator_calls += part_stats.evaluator_calls;
+        stats.leaves += part_stats.leaves;
+    }
+    stats.seconds = start.elapsed().as_secs_f32();
     games::save(&args.out, &data)?;
     let [wins, draws, losses] = data.verdict_counts();
     println!(

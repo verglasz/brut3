@@ -213,7 +213,8 @@ The search is generic over the agent that evaluates leaves:
   markdown table `<dir>/history.md`. Each generation's
   games are saved to `<dir>/games/gen-<n>.games` (a compact binary, `nn::games`), and
   `--initial-games` seeds the buffer from such files, e.g. games played by random-playout
-  MCTS with `selfplay --evaluator random --games 4000 --out models/mcts-200.games`; a fresh
+  MCTS with `selfplay --evaluator random --games 4000 --threads 0 --out models/mcts-200.games`
+  (`--threads` runs independent self-play runs in parallel, `0` = one per core); a fresh
   start then trains on them alone first, as generation 0, before the first self-play. `--resume` continues from `<dir>/best` and refills the buffer from the
   saved games; `--init <model>` starts a fresh run from saved weights of the same shape; `--max-minutes` stops the loop between generations once a wall-clock budget is
   spent.
