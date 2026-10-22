@@ -49,6 +49,27 @@ enum Command {
     /// List the backends compiled into this binary.
     #[cfg(feature = "nn")]
     Backends,
+    /// Build or deepen an opening book by searching the positions of the first plies with a
+    /// search agent, e.g. `book --search "mcts-nn models/big cuda 100000 16" --out models/book.txt`.
+    /// An existing book file is extended.
+    Book {
+        /// The search that evaluates each position: `mcts [simulations] [seed]` or
+        /// `mcts-nn <weights> [backend] [simulations] [batch] [seed]`.
+        #[arg(long)]
+        search: String,
+        /// Book file to extend (if it exists) and write.
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Deepest ply to hold entries for (the initial position is ply 0).
+        #[arg(long, default_value_t = 8)]
+        plies: usize,
+        /// Smallest share of a position's visits for an opponent reply to be covered.
+        #[arg(long, default_value_t = 0.01)]
+        min_prior: f32,
+        /// Positions searched at once (the evaluator batch is concurrent / 2 x the search's batch).
+        #[arg(long, default_value_t = 256)]
+        concurrent: usize,
+    },
     /// Round-robin tournament between agents, e.g. `benchmark "mcts 400" "nn models/value" random`.
     Benchmark {
         /// Games per pair of agents (colours alternate; game g uses each agent's seed + g).
@@ -322,6 +343,13 @@ fn main() -> ExitCode {
             dirichlet_alpha,
             specs,
         } => benchmark(games, temperature_moves, dirichlet_alpha, &specs),
+        Command::Book {
+            search,
+            out,
+            plies,
+            min_prior,
+            concurrent,
+        } => book(&search, &out, plies, min_prior, concurrent),
         #[cfg(feature = "nn")]
         Command::ImportUtttai { paths, out } => import_utttai(&paths, &out),
         #[cfg(feature = "nn")]
@@ -350,6 +378,75 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn book(
+    search: &str,
+    out: &std::path::Path,
+    plies: usize,
+    min_prior: f32,
+    concurrent: usize,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::time::Instant;
+    use ultimate_ttt_burn::book::{Book, BookConfig};
+
+    let words: Vec<&str> = search.split_whitespace().collect();
+    let spec = AgentSpec::parse(&words)?;
+    let (mut evaluator, search_cfg) = spec
+        .search_parts()?
+        .ok_or_else(|| format!("{spec} is not a search; use mcts or mcts-nn"))?;
+    let mut book = if out.exists() {
+        let book = Book::load(out)?;
+        println!("extending {} ({} entries)", out.display(), book.len());
+        book
+    } else {
+        Book::default()
+    };
+    let cfg = BookConfig {
+        plies,
+        min_prior,
+        concurrent,
+    };
+    println!(
+        "book to ply {plies}, replies covered from {min_prior} of the visits, searched by {spec}"
+    );
+    let start = Instant::now();
+    let round_start = std::cell::Cell::new(Instant::now());
+    let added = book.extend(
+        &mut evaluator,
+        &search_cfg,
+        &cfg,
+        |line| {
+            round_start.set(Instant::now());
+            println!("{line}");
+        },
+        |done, total| {
+            if done.is_multiple_of(50) || done == total {
+                print!(
+                    "
+  {done}/{total} ({:.0}s)",
+                    round_start.get().elapsed().as_secs_f32()
+                );
+                let _ = io::stdout().flush();
+                if done == total {
+                    println!();
+                }
+            }
+        },
+    );
+    let header = vec![
+        format!("ultimate-ttt opening book: {} entries to ply {plies}", book.len()),
+        format!("searched by {spec}; replies covered from {min_prior} of the visits"),
+    ];
+    book.save(out, &header)?;
+    println!(
+        "added {added} entries in {:.0}s; {} entries saved to {}",
+        start.elapsed().as_secs_f32(),
+        book.len(),
+        out.display()
+    );
+    Ok(())
 }
 
 fn benchmark(

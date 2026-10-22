@@ -273,6 +273,109 @@ pub fn self_play<A: UtttAgent<State = BitState>>(
     (records, stats)
 }
 
+/// Searches every position of `states` with `search`'s settings over `evaluator`, up to
+/// `concurrent` at once in two alternating groups as in [`self_play`], and returns their
+/// root results in order. `on_done` is called after each finished search with the count so
+/// far.
+pub fn search_positions<A: UtttAgent<State = BitState>>(
+    evaluator: &mut A,
+    states: &[BitState],
+    search: &MctsConfig,
+    concurrent: usize,
+    mut on_done: impl FnMut(usize),
+) -> Vec<crate::mcts::SearchResult> {
+    struct Pending {
+        index: usize,
+        tree: SearchTree<BitState>,
+    }
+    #[derive(Default)]
+    struct Trees {
+        active: Vec<Pending>,
+        states: Vec<BitState>,
+        spans: Vec<(usize, usize)>,
+        evals: Evaluations,
+        in_flight: bool,
+    }
+    impl Trees {
+        fn claim(&mut self, batch: usize) {
+            self.states.clear();
+            self.spans.clear();
+            for p in &mut self.active {
+                let from = self.states.len();
+                p.tree.claim(batch, &mut self.states);
+                self.spans.push((from, self.states.len()));
+            }
+        }
+        fn begin<A: UtttAgent<State = BitState>>(&mut self, evaluator: &mut A) {
+            if !self.states.is_empty() {
+                evaluator.begin_batch(&self.states);
+                self.in_flight = true;
+            }
+        }
+        fn finish<A: UtttAgent<State = BitState>>(&mut self, evaluator: &mut A) {
+            if !self.in_flight {
+                return;
+            }
+            self.in_flight = false;
+            self.evals.clear();
+            evaluator.finish_batch(&self.states, &mut self.evals);
+            for (p, &(from, to)) in self.active.iter_mut().zip(&self.spans) {
+                if to > from {
+                    p.tree.resolve(&self.evals, from);
+                }
+            }
+        }
+    }
+
+    let new_tree = |index: usize| Pending {
+        index,
+        tree: SearchTree::new(
+            states[index],
+            search.simulations,
+            search.c_puct,
+            search.virtual_loss,
+        ),
+    };
+    let mut results: Vec<Option<crate::mcts::SearchResult>> = vec![None; states.len()];
+    let mut done = 0;
+    let in_flight = concurrent.max(1).min(states.len());
+    let mut groups = [Trees::default(), Trees::default()];
+    for i in 0..in_flight {
+        groups[i % 2].active.push(new_tree(i));
+    }
+    let mut started = in_flight;
+    let mut current = 0;
+    groups[current].claim(search.batch_size);
+    groups[current].begin(evaluator);
+    while !(groups[0].active.is_empty() && groups[1].active.is_empty()) {
+        let other = 1 - current;
+        groups[other].claim(search.batch_size);
+        groups[current].finish(evaluator);
+        groups[other].begin(evaluator);
+        let group = &mut groups[current];
+        for i in (0..group.active.len()).rev() {
+            if !group.active[i].tree.is_done() {
+                continue;
+            }
+            let p = &group.active[i];
+            results[p.index] = Some(p.tree.result());
+            done += 1;
+            on_done(done);
+            if started < states.len() {
+                group.active[i] = new_tree(started);
+                started += 1;
+            } else {
+                group.active.swap_remove(i);
+            }
+        }
+        current = other;
+    }
+    results
+        .into_iter()
+        .map(|r| r.expect("every position was searched"))
+        .collect()
+}
+
 /// One side of a [`lockstep_match`]: a search with `search`'s simulations, per-tree batch,
 /// exploration constant, virtual loss and move temperature, over `evaluator`'s leaf
 /// evaluations. This is what an `mcts` or `mcts-nn` agent is, taken apart so that many of
