@@ -56,7 +56,9 @@ impl Default for SelfPlayConfig {
 /// the game ended.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GameRecord {
-    pub positions: Vec<(BitState, Vec<(Move, f32)>)>,
+    /// Each position with the search's move distribution and its root value for the side to
+    /// move (the mean of the backed-up results).
+    pub positions: Vec<(BitState, Vec<(Move, f32)>, f32)>,
     pub outcome: Outcome,
 }
 
@@ -84,7 +86,7 @@ impl SelfPlayStats {
 
 struct Active {
     state: BitState,
-    positions: Vec<(BitState, Vec<(Move, f32)>)>,
+    positions: Vec<(BitState, Vec<(Move, f32)>, f32)>,
     tree: SearchTree<BitState>,
     plies: usize,
 }
@@ -197,7 +199,8 @@ fn advance(
         let mv = result
             .sample_move(temperature, rng)
             .expect("non-terminal position has moves");
-        game.positions.push((game.state, result.policy()));
+        game.positions
+            .push((game.state, result.policy(), result.root_value));
         game.state.apply(mv);
         game.plies += 1;
         match game.state.outcome() {
@@ -559,7 +562,8 @@ mod tests {
             assert!(record.positions.len() >= 17);
             // Each position follows the previous by a legal move, and ends in the outcome.
             let mut last: Option<BitState> = None;
-            for (state, policy) in &record.positions {
+            for (state, policy, value) in &record.positions {
+                assert!((-1.0..=1.0).contains(value), "{value}");
                 if let Some(prev) = last {
                     assert!(prev.legal_moves().iter().any(|mv| {
                         let mut next = prev;
@@ -572,7 +576,7 @@ mod tests {
                 assert!(policy.iter().all(|(mv, _)| state.is_legal(*mv)));
                 last = Some(*state);
             }
-            let (final_state, policy) = record.positions.last().unwrap();
+            let (final_state, policy, _) = record.positions.last().unwrap();
             let mut end = *final_state;
             let played = policy
                 .iter()

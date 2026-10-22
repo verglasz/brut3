@@ -114,6 +114,14 @@ struct LoopArgs {
     weight_decay: f32,
     #[arg(long)]
     no_augment: bool,
+    /// Weight of the outcome cross-entropy in the loss (0 with --search-value-weight trains
+    /// the value head on the search's values only).
+    #[arg(long, default_value_t = 1.0)]
+    outcome_weight: f32,
+    /// Weight of the squared error against the self-play search's root value in the loss
+    /// (0 ignores the search values).
+    #[arg(long, default_value_t = 0.5)]
+    search_value_weight: f32,
     /// Show the Learner dashboard while training each generation.
     #[arg(long)]
     tui: bool,
@@ -252,6 +260,14 @@ struct TrainArgs {
     /// Train only on the positions as played, without the eight board symmetries.
     #[arg(long)]
     no_augment: bool,
+    /// Weight of the outcome cross-entropy in the loss (0 with --search-value-weight is
+    /// distillation: the value head learns the generating search's values only).
+    #[arg(long, default_value_t = 1.0)]
+    outcome_weight: f32,
+    /// Weight of the squared error against the generating search's root value in the loss
+    /// (0 ignores them; positions without a search value use the outcome).
+    #[arg(long, default_value_t = 0.5)]
+    search_value_weight: f32,
 }
 
 fn main() -> ExitCode {
@@ -372,6 +388,8 @@ fn run_loop(args: &LoopArgs) -> Result<(), String> {
             learning_rate: args.lr,
             weight_decay: args.weight_decay,
             augment: !args.no_augment,
+            outcome_weight: args.outcome_weight,
+            search_value_weight: args.search_value_weight,
             tui: args.tui,
             seed: args.seed,
             ..Default::default()
@@ -581,6 +599,8 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         artifact_dir: args.artifact_dir.clone(),
         tui: !args.no_tui,
         augment: !args.no_augment,
+        outcome_weight: args.outcome_weight,
+        search_value_weight: args.search_value_weight,
         ..Default::default()
     };
     let (model, report) =

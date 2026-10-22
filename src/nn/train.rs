@@ -8,7 +8,7 @@ use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataset::InMemDataset;
 use burn::optim::AdamWConfig;
 use burn::prelude::*;
-use burn::tensor::activation::log_softmax;
+use burn::tensor::activation::{log_softmax, softmax};
 use burn::train::logger::{EvaluationProgressLogger, TrainingProgressLogger};
 use burn::train::metric::{AccuracyMetric, LossMetric, MetricDefinition};
 use burn::train::renderer::{
@@ -39,6 +39,9 @@ pub struct Sample {
     /// Which game the position came from. Splits keep a game's positions together, since they
     /// share the outcome and a model could otherwise memorise trajectories.
     pub game: usize,
+    /// The generating search's root value for the side to move, in `[-1, 1]`, when the
+    /// generator was a search: a lower-variance value target than the game outcome alone.
+    pub search_value: Option<f32>,
 }
 
 impl Sample {
@@ -54,7 +57,13 @@ impl Sample {
                 .map(|(mv, p)| (symmetry.apply_move(*mv), *p))
                 .collect(),
             game: self.game,
+            search_value: self.search_value,
         }
+    }
+
+    /// The scalar value target: the search's root value when there is one, else the outcome.
+    pub fn value_target(&self) -> f32 {
+        self.search_value.unwrap_or_else(|| self.verdict.value())
     }
 
     /// The target move: the most probable one.
@@ -195,6 +204,8 @@ pub fn generate(
                 state,
                 policy,
                 game,
+                search_value: None,
+                search_value: None,
             });
         }
         on_game(game + 1);
@@ -215,12 +226,14 @@ pub fn generate_parallel(
     let (records, stats) = self_play(&mut evaluator, games, cfg, on_game);
     let mut data = Dataset::default();
     for (game, record) in records.into_iter().enumerate() {
-        for (state, policy) in record.positions {
+        for (state, policy, value) in record.positions {
             data.samples.push(Sample {
                 verdict: Verdict::from_outcome(record.outcome, state.to_move()),
                 state,
                 policy,
                 game,
+                search_value: None,
+                search_value: Some(value),
             });
         }
     }
@@ -230,8 +243,14 @@ pub fn generate_parallel(
 /// A minibatch on a device, encoded for model `M`.
 pub struct Batch<M: Model> {
     pub input: M::Input,
-    /// `[batch]` verdict class indices.
+    /// `[batch]` verdict class indices (the game outcomes).
     pub verdicts: Tensor<1, Int>,
+    /// `[batch, 1]` scalar value targets (see [`Sample::value_target`]).
+    pub values: Tensor<2>,
+    /// Weight of the outcome cross-entropy in the loss.
+    pub outcome_weight: f32,
+    /// Weight of the squared error against `values` in the loss.
+    pub search_value_weight: f32,
     /// `[batch, MOVES]` target move probabilities.
     pub policy: Tensor<2>,
     /// `[batch, MOVES]` legal moves.
@@ -243,6 +262,7 @@ impl<M: Model> std::fmt::Debug for Batch<M> {
         f.debug_struct("Batch")
             .field("input", &self.input)
             .field("verdicts", &self.verdicts)
+            .field("values", &self.values)
             .field("policy", &self.policy)
             .field("legal", &self.legal)
             .finish()
@@ -260,18 +280,32 @@ impl<M: Model> Clone for Batch<M> {
     }
 }
 
-/// Turns samples into a [`Batch`] for model `M`.
-pub struct ModelBatcher<M>(PhantomData<fn() -> M>);
+/// Turns samples into a [`Batch`] for model `M`, carrying the loss weights.
+pub struct ModelBatcher<M> {
+    pub outcome_weight: f32,
+    pub search_value_weight: f32,
+    _model: PhantomData<fn() -> M>,
+}
+
+impl<M> ModelBatcher<M> {
+    pub fn new(outcome_weight: f32, search_value_weight: f32) -> Self {
+        Self {
+            outcome_weight,
+            search_value_weight,
+            _model: PhantomData,
+        }
+    }
+}
 
 impl<M> Default for ModelBatcher<M> {
     fn default() -> Self {
-        Self(PhantomData)
+        Self::new(1.0, 0.0)
     }
 }
 
 impl<M> Clone for ModelBatcher<M> {
     fn clone(&self) -> Self {
-        Self(PhantomData)
+        Self::new(self.outcome_weight, self.search_value_weight)
     }
 }
 
@@ -280,6 +314,7 @@ impl<M: Model> Batcher<Sample, Batch<M>> for ModelBatcher<M> {
         let n = items.len();
         let states: Vec<BitState> = items.iter().map(|s| s.state).collect();
         let verdicts: Vec<i32> = items.iter().map(|s| s.verdict.index() as i32).collect();
+        let values: Vec<f32> = items.iter().map(Sample::value_target).collect();
         let mut policy = vec![0.0f32; n * MOVES];
         for (i, item) in items.iter().enumerate() {
             for (mv, p) in &item.policy {
@@ -289,6 +324,9 @@ impl<M: Model> Batcher<Sample, Batch<M>> for ModelBatcher<M> {
         Batch {
             input: M::encode(&states, device),
             verdicts: Tensor::from_data(TensorData::new(verdicts, [n]), device),
+            values: Tensor::from_data(TensorData::new(values, [n, 1]), device),
+            outcome_weight: self.outcome_weight,
+            search_value_weight: self.search_value_weight,
             policy: Tensor::from_data(TensorData::new(policy, [n, MOVES]), device),
             legal: legal_mask(&states, device),
         }
@@ -299,18 +337,27 @@ impl<M: Model> Batcher<Sample, Batch<M>> for ModelBatcher<M> {
 /// logits and the `[batch]` verdict targets, which burn's loss and accuracy metrics read.
 pub type StepOutput = ClassificationOutput;
 
-/// Forward pass plus the loss: cross-entropy of the verdict and cross-entropy between the
-/// target move distribution and the legal-masked policy.
+/// Forward pass plus the loss: the weighted cross-entropy of the verdict, the weighted squared
+/// error of the expected value (`p_win - p_loss`) against the scalar value target, and
+/// cross-entropy between the target move distribution and the legal-masked policy. Outcome
+/// weight 0 with a search-value weight is distillation from the generating search.
 pub fn forward_step<M: Model>(model: &M, batch: Batch<M>) -> StepOutput {
     let prediction = model.predict(batch.input);
     let n = batch.verdicts.dims()[0];
     let wdl_loss = -log_softmax(prediction.wdl.clone(), 1)
         .gather(1, batch.verdicts.clone().reshape([n, 1]))
-        .mean();
+        .mean()
+        .mul_scalar(batch.outcome_weight);
+    let probabilities = softmax(prediction.wdl.clone(), 1);
+    let expected = probabilities.clone().slice([0..n, 0..1]) - probabilities.slice([0..n, 2..3]);
+    let value_loss = (expected - batch.values)
+        .powf_scalar(2.0)
+        .mean()
+        .mul_scalar(batch.search_value_weight);
     let policy_loss = -(prediction.policy_log_probabilities(batch.legal) * batch.policy)
         .sum_dim(1)
         .mean();
-    let loss = wdl_loss + policy_loss;
+    let loss = wdl_loss + value_loss + policy_loss;
     ClassificationOutput::new(loss, prediction.wdl, batch.verdicts)
 }
 
@@ -355,6 +402,12 @@ pub struct TrainOptions {
     pub validation_fraction: f32,
     /// Train on every sample under all eight board symmetries. Validation is never augmented.
     pub augment: bool,
+    /// Weight of the outcome cross-entropy in the loss; `0` with a search-value weight trains
+    /// the value head purely on the search's values (distillation).
+    pub outcome_weight: f32,
+    /// Weight of the squared error between the expected value and the generating search's
+    /// root value (the outcome where there was no search) in the loss; `0` ignores it.
+    pub search_value_weight: f32,
     pub seed: u64,
     /// Where the Learner writes its logs and checkpoints.
     pub artifact_dir: PathBuf,
@@ -371,6 +424,8 @@ impl Default for TrainOptions {
             weight_decay: 1e-4,
             validation_fraction: 0.1,
             augment: true,
+            outcome_weight: 1.0,
+            search_value_weight: 0.5,
             seed: 0,
             artifact_dir: PathBuf::from("artifacts/train"),
             tui: true,
@@ -500,13 +555,14 @@ pub fn train<M: Trainable>(
         ..Default::default()
     };
     let batch = opts.batch_size.max(1);
-    let loader_train = DataLoaderBuilder::<Sample, Batch<M>>::new(ModelBatcher::<M>::default())
+    let batcher = ModelBatcher::<M>::new(opts.outcome_weight, opts.search_value_weight);
+    let loader_train = DataLoaderBuilder::<Sample, Batch<M>>::new(batcher.clone())
         .batch_size(batch)
         .shuffle(opts.seed)
         .set_device(ad_device.clone())
         .build(InMemDataset::new(train_data.samples));
     let valid_samples = valid_data.samples;
-    let loader_valid = DataLoaderBuilder::<Sample, Batch<M>>::new(ModelBatcher::<M>::default())
+    let loader_valid = DataLoaderBuilder::<Sample, Batch<M>>::new(batcher)
         .batch_size(1024)
         .set_device(device.clone())
         .build(InMemDataset::new(valid_samples.clone()));
@@ -698,6 +754,7 @@ pub(crate) mod tests {
                     verdict: Verdict::from_index(verdict),
                     policy: vec![(best, 1.0)],
                     game,
+                    search_value: None,
                 });
                 let k = rng.random_range(0..legal.len());
                 state.apply(legal.iter().nth(k).unwrap());

@@ -212,6 +212,9 @@ The search is generic over the agent that evaluates leaves:
   `--baseline-games`, and appends a JSON line to `<dir>/history.jsonl` and a row to the
   markdown table `<dir>/history.md`. Each generation's
   games are saved to `<dir>/games/gen-<n>.games` (a compact binary, `nn::games`), and
+  Each position carries the search's root value next to the game outcome; training adds a
+  weighted squared error against it (`--search-value-weight`) to the weighted outcome
+  cross-entropy (`--outcome-weight`), so `--outcome-weight 0` distills the search's values.
   `--initial-games` seeds the buffer from such files, e.g. games played by random-playout
   MCTS with `selfplay --evaluator random --games 4000 --threads 0 --out models/mcts-200.games`
   (`--threads` runs independent self-play runs in parallel, `0` = one per core); a fresh
