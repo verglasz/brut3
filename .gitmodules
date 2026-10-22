@@ -1,0 +1,3 @@
+[submodule "utttai"]
+	path = utttai
+	url = git@github.com:arnowaczynski/utttai.git
