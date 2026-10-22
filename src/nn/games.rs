@@ -1,12 +1,10 @@
 //! Self-play games on disk, so that a generation's games can be reloaded instead of replayed.
 //!
-//! Little-endian binary: the magic `UTTTGAMES\x02`, a `u32` game count, then per game a `u16`
+//! Little-endian binary: the magic `UTTTGAMES\x01`, a `u32` game count, then per game a `u16`
 //! position count and per position 21 bytes of 2-bit cells by move index (0 empty, 1 X, 2 O),
 //! one byte for the side to move (0 X, 1 O), one byte for the last move index (255 for none),
-//! one byte for the verdict index, one byte saying whether a search win/draw/loss follows
-//! (then three `u16` probabilities in units of 1/65535), one byte for the policy length, and
-//! per policy entry one byte of move index and a `u16` probability. Version 1 files (magic
-//! `\x01`) have no search win/draw/loss and still load.
+//! one byte for the verdict index, one byte for the policy length, and per policy entry one
+//! byte of move index and a `u16` probability in units of 1/65535.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -15,8 +13,7 @@ use super::model::Verdict;
 use super::train::{Dataset, Sample};
 use crate::game::{BitState, GameState, Move, Player, Position};
 
-const MAGIC: &[u8; 10] = b"UTTTGAMES\x02";
-const MAGIC_V1: &[u8; 10] = b"UTTTGAMES\x01";
+const MAGIC: &[u8; 10] = b"UTTTGAMES\x01";
 const NO_MOVE: u8 = 255;
 const CELL_BYTES: usize = 21;
 const PROBABILITY_SCALE: f32 = 65535.0;
@@ -63,16 +60,6 @@ fn write_sample(out: &mut Vec<u8>, s: &Sample) -> Result<(), String> {
     });
     out.push(position.last_move().map_or(NO_MOVE, |m| m.index() as u8));
     out.push(s.verdict.index() as u8);
-    match s.search_wdl {
-        None => out.push(0),
-        Some(wdl) => {
-            out.push(1);
-            for p in wdl {
-                let q = (p.clamp(0.0, 1.0) * PROBABILITY_SCALE).round() as u16;
-                out.extend_from_slice(&q.to_le_bytes());
-            }
-        }
-    }
     let n = u8::try_from(s.policy.len())
         .map_err(|_| format!("a policy over {} moves does not fit", s.policy.len()))?;
     out.push(n);
@@ -138,17 +125,15 @@ impl<'a> Reader<'a> {
 
 fn parse(bytes: &[u8]) -> Result<Dataset, String> {
     let mut r = Reader { bytes, at: 0 };
-    let with_search = match r.take(MAGIC.len())? {
-        m if m == MAGIC => true,
-        m if m == MAGIC_V1 => false,
-        _ => return Err("not a games file".into()),
-    };
+    if r.take(MAGIC.len())? != MAGIC {
+        return Err("not a games file".into());
+    }
     let games = r.u32()? as usize;
     let mut data = Dataset::default();
     for game in 0..games {
         let positions = r.u16()? as usize;
         for _ in 0..positions {
-            data.samples.push(read_sample(&mut r, game, with_search)?);
+            data.samples.push(read_sample(&mut r, game)?);
         }
     }
     if r.at != bytes.len() {
@@ -157,7 +142,7 @@ fn parse(bytes: &[u8]) -> Result<Dataset, String> {
     Ok(data)
 }
 
-fn read_sample(r: &mut Reader, game: usize, with_search: bool) -> Result<Sample, String> {
+fn read_sample(r: &mut Reader, game: usize) -> Result<Sample, String> {
     let cells = r.take(CELL_BYTES)?;
     let mut position = Position::initial();
     for i in 0..Move::COUNT {
@@ -182,21 +167,6 @@ fn read_sample(r: &mut Reader, game: usize, with_search: bool) -> Result<Sample,
         v @ 0..=2 => Verdict::from_index(v as usize),
         other => return Err(format!("bad verdict {other}")),
     };
-    let search_wdl = if !with_search {
-        None
-    } else {
-        match r.u8()? {
-            0 => None,
-            1 => {
-                let mut wdl = [0.0; 3];
-                for p in &mut wdl {
-                    *p = r.u16()? as f32 / PROBABILITY_SCALE;
-                }
-                Some(wdl)
-            }
-            other => return Err(format!("bad search flag {other}")),
-        }
-    };
     let n = r.u8()? as usize;
     let mut policy = Vec::with_capacity(n);
     for _ in 0..n {
@@ -208,7 +178,6 @@ fn read_sample(r: &mut Reader, game: usize, with_search: bool) -> Result<Sample,
         verdict,
         policy,
         game,
-        search_wdl,
     })
 }
 
@@ -237,10 +206,6 @@ mod tests {
         assert_eq!(back.len(), data.len());
         for (a, b) in data.samples.iter().zip(&back.samples) {
             assert_eq!((a.state, a.verdict, a.game), (b.state, b.verdict, b.game));
-            assert_eq!(a.search_wdl.is_some(), b.search_wdl.is_some());
-            if let (Some(x), Some(y)) = (a.search_wdl, b.search_wdl) {
-                assert!(x.iter().zip(y).all(|(p, q)| (p - q).abs() < 1e-4), "{x:?} {y:?}");
-            }
             assert_eq!(a.policy.len(), b.policy.len());
             for ((ma, pa), (mb, pb)) in a.policy.iter().zip(&b.policy) {
                 assert_eq!(ma, mb);

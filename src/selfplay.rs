@@ -56,9 +56,7 @@ impl Default for SelfPlayConfig {
 /// the game ended.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GameRecord {
-    /// Each position with the search's move distribution and its root win/draw/loss for the
-    /// side to move.
-    pub positions: Vec<(BitState, Vec<(Move, f32)>, [f32; 3])>,
+    pub positions: Vec<(BitState, Vec<(Move, f32)>)>,
     pub outcome: Outcome,
 }
 
@@ -86,7 +84,7 @@ impl SelfPlayStats {
 
 struct Active {
     state: BitState,
-    positions: Vec<(BitState, Vec<(Move, f32)>, [f32; 3])>,
+    positions: Vec<(BitState, Vec<(Move, f32)>)>,
     tree: SearchTree<BitState>,
     plies: usize,
 }
@@ -199,8 +197,7 @@ fn advance(
         let mv = result
             .sample_move(temperature, rng)
             .expect("non-terminal position has moves");
-        game.positions
-            .push((game.state, result.policy(), result.root_wdl));
+        game.positions.push((game.state, result.policy()));
         game.state.apply(mv);
         game.plies += 1;
         match game.state.outcome() {
@@ -562,8 +559,7 @@ mod tests {
             assert!(record.positions.len() >= 17);
             // Each position follows the previous by a legal move, and ends in the outcome.
             let mut last: Option<BitState> = None;
-            for (state, policy, wdl) in &record.positions {
-                assert!((wdl.iter().sum::<f32>() - 1.0).abs() < 1e-4, "{wdl:?}");
+            for (state, policy) in &record.positions {
                 if let Some(prev) = last {
                     assert!(prev.legal_moves().iter().any(|mv| {
                         let mut next = prev;
@@ -576,7 +572,7 @@ mod tests {
                 assert!(policy.iter().all(|(mv, _)| state.is_legal(*mv)));
                 last = Some(*state);
             }
-            let (final_state, policy, _) = record.positions.last().unwrap();
+            let (final_state, policy) = record.positions.last().unwrap();
             let mut end = *final_state;
             let played = policy
                 .iter()

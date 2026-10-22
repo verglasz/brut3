@@ -198,15 +198,6 @@ impl Outcome {
             Outcome::Draw => 0.0,
         }
     }
-
-    /// The outcome as a one-hot `[win, draw, loss]` for `player`.
-    pub fn wdl_for(self, player: Player) -> [f32; 3] {
-        match self {
-            Outcome::Win(p) if p == player => [1.0, 0.0, 0.0],
-            Outcome::Win(_) => [0.0, 0.0, 1.0],
-            Outcome::Draw => [0.0, 1.0, 0.0],
-        }
-    }
 }
 
 /// Status of a single small board.

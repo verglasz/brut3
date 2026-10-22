@@ -731,7 +731,6 @@ mod tests {
                     verdict: super::super::model::Verdict::Draw,
                     policy: vec![],
                     game,
-                    search_wdl: None,
                 });
             }
         }

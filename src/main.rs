@@ -114,10 +114,6 @@ struct LoopArgs {
     weight_decay: f32,
     #[arg(long)]
     no_augment: bool,
-    /// Weight of the self-play search's root win/draw/loss in the value target, against the
-    /// game outcome (0 = outcomes only).
-    #[arg(long, default_value_t = 0.5)]
-    search_value_weight: f32,
     /// Show the Learner dashboard while training each generation.
     #[arg(long)]
     tui: bool,
@@ -252,10 +248,6 @@ struct TrainArgs {
     /// Train only on the positions as played, without the eight board symmetries.
     #[arg(long)]
     no_augment: bool,
-    /// Weight of the generating search's root win/draw/loss in the value target, against the
-    /// game outcome (0 = outcomes only; positions without a search use the outcome).
-    #[arg(long, default_value_t = 0.5)]
-    search_value_weight: f32,
 }
 
 fn main() -> ExitCode {
@@ -376,7 +368,6 @@ fn run_loop(args: &LoopArgs) -> Result<(), String> {
             learning_rate: args.lr,
             weight_decay: args.weight_decay,
             augment: !args.no_augment,
-            search_value_weight: args.search_value_weight,
             tui: args.tui,
             seed: args.seed,
             ..Default::default()
@@ -538,7 +529,6 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         artifact_dir: args.artifact_dir.clone(),
         tui: !args.no_tui,
         augment: !args.no_augment,
-        search_value_weight: args.search_value_weight,
         ..Default::default()
     };
     let (model, report) =

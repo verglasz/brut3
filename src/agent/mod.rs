@@ -17,43 +17,17 @@ use crate::game::{GameState, Move};
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Evaluation {
     /// Expected result in `[-1, 1]` for the side to move: `1` = certain win, `-1` = certain loss.
-    /// Always `wdl[0] - wdl[2]`.
     pub value: f32,
-    /// Probabilities of a win, a draw and a loss for the side to move: a one-hot for a
-    /// finished game or a playout result, the network's distribution, or a split of a bare
-    /// value (see [`wdl_from_value`]).
-    pub wdl: [f32; 3],
     /// Prior probability per move. Empty means "uniform over legal moves". Moves not listed get
     /// prior 0; listed moves that are illegal are ignored by the search.
     pub priors: Vec<(Move, f32)>,
-}
-
-/// A bare value as a win/draw/loss distribution: `(1 + v) / 2` win, `(1 - v) / 2` loss, no
-/// draw mass. Used by evaluators that only know a scalar (the heuristic agents).
-pub fn wdl_from_value(value: f32) -> [f32; 3] {
-    let v = value.clamp(-1.0, 1.0);
-    [(1.0 + v) / 2.0, 0.0, (1.0 - v) / 2.0]
-}
-
-/// The expected value `win - loss` of a win/draw/loss distribution.
-pub fn wdl_value(wdl: &[f32; 3]) -> f32 {
-    wdl[0] - wdl[2]
 }
 
 impl Evaluation {
     pub fn value_only(value: f32) -> Self {
         Self {
             value,
-            wdl: wdl_from_value(value),
             priors: Vec::new(),
-        }
-    }
-
-    pub fn new(wdl: [f32; 3], priors: Vec<(Move, f32)>) -> Self {
-        Self {
-            value: wdl_value(&wdl),
-            wdl,
-            priors,
         }
     }
 }
@@ -65,24 +39,23 @@ impl Evaluation {
 /// them gets an all-zero row, which the search treats as uniform.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Evaluations {
-    /// One `[win, draw, loss]` per position.
-    wdl: Vec<[f32; 3]>,
-    /// Empty while no position has priors, otherwise `wdl.len() * Move::COUNT`.
+    values: Vec<f32>,
+    /// Empty while no position has priors, otherwise `values.len() * Move::COUNT`.
     priors: Vec<f32>,
 }
 
 impl Evaluations {
     pub fn clear(&mut self) {
-        self.wdl.clear();
+        self.values.clear();
         self.priors.clear();
     }
 
     pub fn len(&self) -> usize {
-        self.wdl.len()
+        self.values.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.wdl.is_empty()
+        self.values.is_empty()
     }
 
     pub fn has_priors(&self) -> bool {
@@ -90,18 +63,18 @@ impl Evaluations {
     }
 
     /// Appends a position with no priors.
-    pub fn push_value(&mut self, wdl: [f32; 3]) {
-        self.wdl.push(wdl);
+    pub fn push_value(&mut self, value: f32) {
+        self.values.push(value);
         if self.has_priors() {
-            self.priors.resize(self.wdl.len() * Move::COUNT, 0.0);
+            self.priors.resize(self.values.len() * Move::COUNT, 0.0);
         }
     }
 
     /// Appends a position and returns its zeroed prior row to fill in.
-    pub fn push_row(&mut self, wdl: [f32; 3]) -> &mut [f32; Move::COUNT] {
-        self.wdl.push(wdl);
-        self.priors.resize(self.wdl.len() * Move::COUNT, 0.0);
-        let start = (self.wdl.len() - 1) * Move::COUNT;
+    pub fn push_row(&mut self, value: f32) -> &mut [f32; Move::COUNT] {
+        self.values.push(value);
+        self.priors.resize(self.values.len() * Move::COUNT, 0.0);
+        let start = (self.values.len() - 1) * Move::COUNT;
         (&mut self.priors[start..start + Move::COUNT])
             .try_into()
             .expect("row of Move::COUNT entries")
@@ -110,22 +83,17 @@ impl Evaluations {
     /// Appends a single evaluation, scattering its priors into a row.
     pub fn push(&mut self, eval: &Evaluation) {
         if eval.priors.is_empty() {
-            self.push_value(eval.wdl);
+            self.push_value(eval.value);
         } else {
-            let row = self.push_row(eval.wdl);
+            let row = self.push_row(eval.value);
             for (mv, p) in &eval.priors {
                 row[mv.index()] += p;
             }
         }
     }
 
-    /// Expected value `win - loss` of position `i`.
     pub fn value(&self, i: usize) -> f32 {
-        wdl_value(&self.wdl[i])
-    }
-
-    pub fn wdl(&self, i: usize) -> [f32; 3] {
-        self.wdl[i]
+        self.values[i]
     }
 
     /// Prior row of position `i`, or `None` if the batch carries no priors at all.
@@ -171,7 +139,7 @@ pub trait UtttAgent {
         let mut s = state.clone();
         loop {
             if let Some(outcome) = s.outcome() {
-                return Evaluation::new(outcome.wdl_for(me), Vec::new());
+                return Evaluation::value_only(outcome.value_for(me));
             }
             let mv = self.choose_move(&s);
             s.apply(mv);
@@ -241,14 +209,13 @@ mod tests {
     #[test]
     fn evaluations_mix_rows_and_values() {
         let mut out = Evaluations::default();
-        out.push_value([0.75, 0.0, 0.25]);
-        let row = out.push_row([0.0, 0.75, 0.25]);
+        out.push_value(0.5);
+        let row = out.push_row(-0.25);
         row[Move::from_index(3).index()] = 1.0;
-        out.push(&Evaluation::new(
-            [0.2, 0.6, 0.2],
-            vec![(Move::from_index(80), 0.5), (Move::from_index(80), 0.5)],
-        ));
-        assert_eq!(out.wdl(1), [0.0, 0.75, 0.25]);
+        out.push(&Evaluation {
+            value: 0.0,
+            priors: vec![(Move::from_index(80), 0.5), (Move::from_index(80), 0.5)],
+        });
         assert_eq!(out.len(), 3);
         assert_eq!(
             (out.value(0), out.value(1), out.value(2)),
