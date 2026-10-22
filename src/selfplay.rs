@@ -311,6 +311,10 @@ struct MatchGame {
     /// The search of the side to move.
     tree: SearchTree<BitState>,
     a_plays: Player,
+    /// Each side's randomness in this game (move sampling, root noise): `[a, b]`, seeded
+    /// with the side's seed plus the game number, so that game `g` of a match is
+    /// reproducible on its own.
+    rngs: [SmallRng; 2],
     plies: usize,
     /// Finished games stay in place (a batch in flight refers to games by index) and are
     /// skipped.
@@ -320,6 +324,10 @@ struct MatchGame {
 impl MatchGame {
     fn a_to_move(&self) -> bool {
         self.state.to_move() == self.a_plays
+    }
+
+    fn rng(&mut self, side_a: bool) -> &mut SmallRng {
+        &mut self.rngs[usize::from(!side_a)]
     }
 }
 
@@ -404,7 +412,6 @@ fn advance_match(
     side_a: bool,
     searches: (&MctsConfig, &MctsConfig),
     exploration: &MatchExploration,
-    rng: &mut SmallRng,
     tally: &mut MatchTally,
     on_game: &mut impl FnMut(usize),
 ) {
@@ -421,7 +428,7 @@ fn advance_match(
         let mv = game
             .tree
             .result()
-            .sample_move(temperature, rng)
+            .sample_move(temperature, &mut game.rngs[usize::from(!side_a)])
             .expect("non-terminal position has moves");
         game.state.apply(mv);
         game.plies += 1;
@@ -445,19 +452,18 @@ fn advance_match(
                 on_game(tally.games);
             }
             None => {
-                let next = if game.a_to_move() {
-                    searches.0
-                } else {
-                    searches.1
-                };
-                game.tree = search_tree(game.state, next, exploration.root_noise, rng);
+                let a_next = game.a_to_move();
+                let next = if a_next { searches.0 } else { searches.1 };
+                game.tree =
+                    search_tree(game.state, next, exploration.root_noise, game.rng(a_next));
             }
         }
     }
 }
 
 /// Plays `games` games between two searches, all at once: `a` takes X in even-numbered games
-/// and O in odd-numbered ones. Every round, the leaves claimed by all trees of one side go to
+/// and O in odd-numbered ones. Game `g` seeds each side's randomness with the side's seed
+/// plus `g`. Every round, the leaves claimed by all trees of one side go to
 /// that side's evaluator in one call, and as in [`self_play`] the two sides take turns so one
 /// side's tree work overlaps the other's evaluation. Moves follow `exploration` for the
 /// opening plies and each side's `temperature` after that (argmax at `0`). `on_game` is
@@ -470,20 +476,24 @@ pub fn lockstep_match<A: UtttAgent<State = BitState>, B: UtttAgent<State = BitSt
     mut on_game: impl FnMut(usize),
 ) -> MatchTally {
     let mut tally = MatchTally::default();
-    let mut rng_a = SmallRng::seed_from_u64(a.search.seed);
-    let mut rng_b = SmallRng::seed_from_u64(b.search.seed);
     let mut active: Vec<MatchGame> = Vec::with_capacity(games);
     for g in 0..games {
         let a_plays = if g % 2 == 0 { Player::X } else { Player::O };
+        let mut rngs = [
+            SmallRng::seed_from_u64(a.search.seed.wrapping_add(g as u64)),
+            SmallRng::seed_from_u64(b.search.seed.wrapping_add(g as u64)),
+        ];
         let (opener, rng) = if a_plays == Player::X {
-            (&a.search, &mut rng_a)
+            (&a.search, &mut rngs[0])
         } else {
-            (&b.search, &mut rng_b)
+            (&b.search, &mut rngs[1])
         };
+        let tree = search_tree(BitState::initial(), opener, exploration.root_noise, rng);
         active.push(MatchGame {
             state: BitState::initial(),
-            tree: search_tree(BitState::initial(), opener, exploration.root_noise, rng),
+            tree,
             a_plays,
+            rngs,
             plies: 0,
             finished: false,
         });
@@ -505,7 +515,6 @@ pub fn lockstep_match<A: UtttAgent<State = BitState>, B: UtttAgent<State = BitSt
                 true,
                 searches,
                 exploration,
-                &mut rng_a,
                 &mut tally,
                 &mut on_game,
             );
@@ -518,7 +527,6 @@ pub fn lockstep_match<A: UtttAgent<State = BitState>, B: UtttAgent<State = BitSt
                 false,
                 searches,
                 exploration,
-                &mut rng_b,
                 &mut tally,
                 &mut on_game,
             );

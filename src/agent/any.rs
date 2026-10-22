@@ -50,6 +50,25 @@ pub enum AgentSpec {
     },
 }
 
+impl AgentSpec {
+    /// The same agent with its seed moved by `by` (agents without a seed are unchanged), so
+    /// that successive games of a match can each get their own seed.
+    pub fn offset_seed(&self, by: u64) -> AgentSpec {
+        let mut spec = self.clone();
+        match &mut spec {
+            AgentSpec::Random { seed }
+            | AgentSpec::Greedy { seed }
+            | AgentSpec::Minimax { seed, .. }
+            | AgentSpec::Mcts { seed, .. } => *seed = seed.wrapping_add(by),
+            #[cfg(feature = "nn")]
+            AgentSpec::MctsNn { seed, .. } => *seed = seed.wrapping_add(by),
+            #[cfg(feature = "nn")]
+            AgentSpec::Nn { .. } => {}
+        }
+        spec
+    }
+}
+
 #[cfg(not(feature = "nn"))]
 const NAMES: &str = "`random`, `greedy`, `minimax` or `mcts`";
 #[cfg(feature = "nn")]

@@ -57,11 +57,12 @@ impl fmt::Display for MatchResult {
 }
 
 /// Plays `games` games between `a` and `b`, `a` taking X in even-numbered games and O in
-/// odd-numbered ones. When both are searches (`mcts`, `mcts-nn`) the games are played in
-/// lockstep, all at once with each side's leaves batched to its evaluator
-/// ([`lockstep_match`]); otherwise one game at a time. Both agents are built once, so their
-/// internal state (search RNGs) carries across games. `on_game` is called after each game
-/// with the number played so far.
+/// odd-numbered ones. Game `g` uses each agent's seed plus `g`, so that any game of a match
+/// can be replayed on its own. When both are searches (`mcts`, `mcts-nn`) the games are
+/// played in lockstep, all at once with each side's leaves batched to its evaluator
+/// ([`lockstep_match`]), where only a search's own randomness is seeded per game (a shared
+/// playout evaluator keeps one stream); otherwise one game at a time with the agents rebuilt
+/// for each game's seed. `on_game` is called after each game with the number played so far.
 pub fn play_match(
     a: &AgentSpec,
     b: &AgentSpec,
@@ -118,9 +119,9 @@ pub fn play_match_with(
         result.seconds = start.elapsed().as_secs_f32();
         return Ok(result);
     }
-    let mut agent_a = a.build()?;
-    let mut agent_b = b.build()?;
     for game in 0..games {
+        let mut agent_a = a.offset_seed(game as u64).build()?;
+        let mut agent_b = b.offset_seed(game as u64).build()?;
         let a_plays = if game % 2 == 0 { Player::X } else { Player::O };
         let mut state = BitState::initial();
         let outcome = loop {
@@ -240,6 +241,17 @@ impl Tournament {
 pub fn round_robin(
     specs: &[AgentSpec],
     games_per_pair: usize,
+    on_match: impl FnMut(&MatchResult),
+) -> Result<Tournament, String> {
+    round_robin_with(specs, games_per_pair, &MatchExploration::default(), on_match)
+}
+
+/// [`round_robin`] with opening exploration for the lockstep matches
+/// ([`play_match_with`]).
+pub fn round_robin_with(
+    specs: &[AgentSpec],
+    games_per_pair: usize,
+    exploration: &MatchExploration,
     mut on_match: impl FnMut(&MatchResult),
 ) -> Result<Tournament, String> {
     let mut tournament = Tournament {
@@ -248,7 +260,8 @@ pub fn round_robin(
     };
     for i in 0..specs.len() {
         for j in i + 1..specs.len() {
-            let result = play_match(&specs[i], &specs[j], games_per_pair, |_| {})?;
+            let result =
+                play_match_with(&specs[i], &specs[j], games_per_pair, exploration, |_| {})?;
             on_match(&result);
             tournament.matches.push(result);
         }

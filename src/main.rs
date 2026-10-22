@@ -51,9 +51,16 @@ enum Command {
     Backends,
     /// Round-robin tournament between agents, e.g. `benchmark "mcts 400" "nn models/value" random`.
     Benchmark {
-        /// Games per pair of agents (colours alternate).
+        /// Games per pair of agents (colours alternate; game g uses each agent's seed + g).
         #[arg(long, default_value_t = 20)]
         games: usize,
+        /// Search vs search: plies per game sampled by visit count before argmax, so that
+        /// games with the same seed differ (0 plays every move greedily).
+        #[arg(long, default_value_t = 0)]
+        temperature_moves: usize,
+        /// Search vs search: Dirichlet alpha of the root noise (0 disables it).
+        #[arg(long, default_value_t = 0.0)]
+        dirichlet_alpha: f32,
         /// Agent specs, one per argument, quoted when they contain spaces.
         #[arg(required = true, num_args = 2..)]
         specs: Vec<String>,
@@ -308,7 +315,12 @@ fn main() -> ExitCode {
         Command::Selfplay(args) => selfplay(&args),
         #[cfg(feature = "nn")]
         Command::Loop(args) => run_loop(&args),
-        Command::Benchmark { games, specs } => benchmark(games, &specs),
+        Command::Benchmark {
+            games,
+            temperature_moves,
+            dirichlet_alpha,
+            specs,
+        } => benchmark(games, temperature_moves, dirichlet_alpha, &specs),
         #[cfg(feature = "nn")]
         Command::ImportUtttai { paths, out } => import_utttai(&paths, &out),
         #[cfg(feature = "nn")]
@@ -339,8 +351,18 @@ fn main() -> ExitCode {
     }
 }
 
-fn benchmark(games: usize, specs: &[String]) -> Result<(), String> {
-    use ultimate_ttt_burn::benchmark::round_robin;
+fn benchmark(
+    games: usize,
+    temperature_moves: usize,
+    dirichlet_alpha: f32,
+    specs: &[String],
+) -> Result<(), String> {
+    use ultimate_ttt_burn::benchmark::round_robin_with;
+    use ultimate_ttt_burn::selfplay::MatchExploration;
+    let exploration = MatchExploration {
+        temperature_moves,
+        root_noise: (dirichlet_alpha > 0.0).then_some((dirichlet_alpha, 0.25)),
+    };
     let specs = specs
         .iter()
         .map(|s| {
@@ -349,7 +371,7 @@ fn benchmark(games: usize, specs: &[String]) -> Result<(), String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     println!("round robin, {games} games per pair:");
-    let tournament = round_robin(&specs, games, |m| println!("  {m}"))?;
+    let tournament = round_robin_with(&specs, games, &exploration, |m| println!("  {m}"))?;
     print!("\n{}", tournament.table());
     Ok(())
 }
