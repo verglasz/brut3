@@ -65,6 +65,7 @@ pub fn train_model(
         ModelSpec::CellTransformer(cfg) => run!(CellTransformer, |d| cfg.init(d)),
         ModelSpec::BoardTransformerV2(cfg) => run!(BoardTransformerV2, |d| cfg.init(d)),
         ModelSpec::CellTransformerV2(cfg) => run!(CellTransformerV2, |d| cfg.init(d)),
+        ModelSpec::Nnue(cfg) => run!(Nnue, |d| cfg.init(d)),
     }
 }
 
