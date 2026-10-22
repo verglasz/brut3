@@ -54,6 +54,9 @@ impl Default for MctsConfig {
 pub struct SearchResult {
     /// Mean value of the root, from the perspective of the side to move.
     pub root_value: f32,
+    /// Mean win/draw/loss of the root for the side to move: the fractions of the backed-up
+    /// results (one-hot playout outcomes, network distributions), exact for a decided root.
+    pub root_wdl: [f32; 3],
     pub visits: Vec<(Move, u32)>,
 }
 
@@ -134,6 +137,10 @@ struct Stats {
     /// Sum of backed-up values, from the perspective of the side to move *at this node*.
     value_sum: f32,
     prior: f32,
+    /// Sums of the backed-up win and draw probabilities for the side to move at this node;
+    /// the loss sum is `visits - wins - draws`.
+    wins: f32,
+    draws: f32,
 }
 
 impl<S: GameState> Node<S> {
@@ -163,6 +170,8 @@ impl Stats {
             virtual_losses: 0,
             value_sum: 0.0,
             prior,
+            wins: 0.0,
+            draws: 0.0,
         }
     }
 
@@ -197,8 +206,8 @@ pub struct RootNoise {
 enum Selection {
     /// An unexpanded, unclaimed leaf.
     Leaf(u32),
-    /// A terminal node and its value for the side to move there.
-    Terminal(u32, f32),
+    /// A decided node and its exact win/draw/loss for the side to move there.
+    Terminal(u32, [f32; 3]),
     /// Selection ran into a leaf already claimed in this round.
     Blocked,
 }
@@ -268,8 +277,8 @@ impl<S: GameState> SearchTree<S> {
         let want = max.max(1).min((self.budget - self.completed) as usize);
         for _ in 0..want {
             match self.select_leaf() {
-                Selection::Terminal(idx, value) => {
-                    self.backup(idx, value);
+                Selection::Terminal(idx, wdl) => {
+                    self.backup(idx, wdl);
                     self.completed += 1;
                     if self.completed >= self.budget {
                         break;
@@ -299,12 +308,12 @@ impl<S: GameState> SearchTree<S> {
         for (i, &idx) in claimed.iter().enumerate() {
             self.remove_virtual_loss(idx);
             self.nodes[idx as usize].pending = false;
-            let value = self.expand(
+            let wdl = self.expand(
                 idx,
-                evaluations.value(offset + i),
+                evaluations.wdl(offset + i),
                 evaluations.priors(offset + i),
             );
-            self.backup(idx, value);
+            self.backup(idx, wdl);
             self.completed += 1;
         }
         self.claimed = claimed;
@@ -321,6 +330,7 @@ impl<S: GameState> SearchTree<S> {
             if !root.expanded {
                 return SearchResult {
                     root_value: outcome.value_for(to_move),
+                    root_wdl: outcome.wdl_for(to_move),
                     visits: Vec::new(),
                 };
             }
@@ -344,11 +354,20 @@ impl<S: GameState> SearchTree<S> {
             })
             .collect();
         let root_stats = &self.stats[0];
-        let root_value = match root.outcome {
-            Some(outcome) => outcome.value_for(to_move),
-            None => root_stats.value_sum / root_stats.visits.max(1) as f32,
+        let (root_value, root_wdl) = match root.outcome {
+            Some(outcome) => (outcome.value_for(to_move), outcome.wdl_for(to_move)),
+            None if root_stats.visits == 0 => (0.0, [0.0; 3]),
+            None => {
+                let n = root_stats.visits as f32;
+                let (w, d) = (root_stats.wins / n, root_stats.draws / n);
+                (root_stats.value_sum / n, [w, d, (1.0 - w - d).max(0.0)])
+            }
         };
-        SearchResult { root_value, visits }
+        SearchResult {
+            root_value,
+            root_wdl,
+            visits,
+        }
     }
 
     fn select_leaf(&self) -> Selection {
@@ -356,7 +375,7 @@ impl<S: GameState> SearchTree<S> {
         loop {
             let node = &self.nodes[idx as usize];
             if let Some(outcome) = node.outcome {
-                return Selection::Terminal(idx, outcome.value_for(node.state.to_move()));
+                return Selection::Terminal(idx, outcome.wdl_for(node.state.to_move()));
             }
             if !node.expanded {
                 return if node.pending {
@@ -401,21 +420,29 @@ impl<S: GameState> SearchTree<S> {
         }
     }
 
-    /// Adds `value` (for the side to move at `idx`) along the path to the root, flipping sign
-    /// at each step.
-    fn backup(&mut self, mut idx: u32, mut value: f32) {
+    /// Adds a `[win, draw, loss]` result (for the side to move at `idx`) along the path to the
+    /// root, swapping win and loss at each step.
+    fn backup(&mut self, mut idx: u32, mut wdl: [f32; 3]) {
         while idx != NO_NODE {
             let stats = &mut self.stats[idx as usize];
             stats.visits += 1;
-            stats.value_sum += value;
-            value = -value;
+            stats.wins += wdl[0];
+            stats.draws += wdl[1];
+            stats.value_sum += wdl[0] - wdl[2];
+            wdl.swap(0, 2);
             idx = self.nodes[idx as usize].parent;
         }
     }
 
     /// Creates the children of `idx` from the prior row (indexed by `Move::index`; only legal
-    /// moves' entries are read, and an unusable row means uniform); returns the clamped value.
-    fn expand(&mut self, idx: u32, value: f32, priors: Option<&[f32; Move::COUNT]>) -> f32 {
+    /// moves' entries are read, and an unusable row means uniform); returns the win/draw/loss
+    /// to back up: exact if the node got decided, else `wdl` clamped to a distribution.
+    fn expand(
+        &mut self,
+        idx: u32,
+        wdl: [f32; 3],
+        priors: Option<&[f32; Move::COUNT]>,
+    ) -> [f32; 3] {
         let state = self.nodes[idx as usize].state.clone();
         let moves = state.legal_moves();
         debug_assert!(!moves.is_empty(), "non-terminal state without legal moves");
@@ -449,8 +476,8 @@ impl<S: GameState> SearchTree<S> {
             self.propagate_proof(idx);
         }
         match self.nodes[idx as usize].outcome {
-            Some(outcome) => outcome.value_for(self.nodes[idx as usize].state.to_move()),
-            None => value.clamp(-1.0, 1.0),
+            Some(outcome) => outcome.wdl_for(self.nodes[idx as usize].state.to_move()),
+            None => clamp_wdl(wdl),
         }
     }
 
@@ -563,6 +590,18 @@ impl<S: GameState> SearchTree<S> {
 
 /// A sample from a symmetric Dirichlet distribution with concentration `alpha`, as
 /// normalised gamma variates (Marsaglia and Tsang, with the `alpha < 1` boost).
+/// `wdl` with every entry in `[0, 1]` and the three summing to 1 (all-draw when nothing is
+/// left after clamping), so that a careless evaluator cannot bias the tree.
+fn clamp_wdl(wdl: [f32; 3]) -> [f32; 3] {
+    let c = wdl.map(|p| if p.is_finite() { p.clamp(0.0, 1.0) } else { 0.0 });
+    let sum = c[0] + c[1] + c[2];
+    if sum <= 1e-12 {
+        [0.0, 1.0, 0.0]
+    } else {
+        c.map(|p| p / sum)
+    }
+}
+
 pub fn dirichlet(rng: &mut impl Rng, alpha: f32, n: usize) -> Vec<f32> {
     let mut sample: Vec<f32> = (0..n).map(|_| gamma(rng, alpha)).collect();
     let total: f32 = sample.iter().sum();
@@ -697,6 +736,7 @@ impl<A: UtttAgent> UtttAgent for Mcts<A> {
         let result = self.search(state);
         Evaluation {
             value: result.root_value,
+            wdl: result.root_wdl,
             priors: result.policy(),
         }
     }
@@ -971,6 +1011,7 @@ mod tests {
         fn evaluate(&mut self, _state: &BitState) -> Evaluation {
             Evaluation {
                 value: 7.0, // out of range; must be clamped
+                wdl: [4.0, 0.0, -3.0],
                 priors: vec![
                     (Move::new(sq(1, 1), sq(0, 0)), 3.0),
                     (Move::new(sq(1, 1), sq(0, 1)), 1.0),

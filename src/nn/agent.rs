@@ -7,9 +7,7 @@ use burn::prelude::Tensor;
 
 use super::any_model::AnyModel;
 use super::backend::BackendKind;
-use super::model::{
-    HostPrediction, LOGITS, expected_value, host_policy_into, host_wdl, logits_to_host,
-};
+use super::model::{HostPrediction, LOGITS, host_policy_into, host_wdl, logits_to_host};
 use crate::agent::{Evaluation, Evaluations, UtttAgent};
 use crate::game::{BitState, GameState, Move};
 
@@ -64,9 +62,9 @@ impl NetAgent {
         debug_assert_eq!(logits.len(), states.len() * LOGITS);
         for (state, row) in states.iter().zip(logits.chunks_exact(LOGITS)) {
             match state.outcome() {
-                Some(outcome) => out.push_value(outcome.value_for(state.to_move())),
+                Some(outcome) => out.push_value(outcome.wdl_for(state.to_move())),
                 None => {
-                    let priors = out.push_row(expected_value(&host_wdl(row)));
+                    let priors = out.push_row(host_wdl(row));
                     host_policy_into(row, &state.legal_moves(), priors);
                 }
             }
@@ -76,11 +74,8 @@ impl NetAgent {
     /// Exact value for terminal states, the network's otherwise.
     fn evaluation(state: &BitState, wdl: &[f32; 3], policy: Vec<(Move, f32)>) -> Evaluation {
         match state.outcome() {
-            Some(outcome) => Evaluation::value_only(outcome.value_for(state.to_move())),
-            None => Evaluation {
-                value: expected_value(wdl),
-                priors: policy,
-            },
+            Some(outcome) => Evaluation::new(outcome.wdl_for(state.to_move()), Vec::new()),
+            None => Evaluation::new(*wdl, policy),
         }
     }
 }

@@ -50,6 +50,13 @@ pub enum AgentSpec {
     },
 }
 
+/// Leaves per round for a random-playout search: enough to keep every core busy on big
+/// searches, while a small search keeps a small batch so that it is not reduced to
+/// breadth-first exploration under virtual loss.
+fn rollout_batch(simulations: u32) -> usize {
+    (simulations as usize / 32).clamp(1, 16 * crate::agent::random::rollout_threads())
+}
+
 #[cfg(not(feature = "nn"))]
 const NAMES: &str = "`random`, `greedy`, `minimax` or `mcts`";
 #[cfg(feature = "nn")]
@@ -126,6 +133,7 @@ impl AgentSpec {
                 AnyAgent::Random(RandomAgent::new(seed ^ 0x9E37_79B9_7F4A_7C15)),
                 MctsConfig {
                     simulations: *simulations,
+                    batch_size: rollout_batch(*simulations),
                     seed: *seed,
                     ..Default::default()
                 },
@@ -162,6 +170,7 @@ impl AgentSpec {
                 RandomAgent::new(seed ^ 0x9E37_79B9_7F4A_7C15),
                 MctsConfig {
                     simulations: *simulations,
+                    batch_size: rollout_batch(*simulations),
                     seed: *seed,
                     ..Default::default()
                 },

@@ -155,7 +155,11 @@ The search is generic over the agent that evaluates leaves:
 - `mcts::SearchTree` is a PUCT search over an arena tree written as a resumable state machine:
   it hands out leaves to evaluate (`claim`) and takes their evaluations back (`resolve`), with
   virtual loss within a round and optional Dirichlet noise on the root priors. With no priors it
-  behaves as plain UCT with rollouts; with network priors it is the AlphaZero search. It is also
+  behaves as plain UCT with rollouts, played out on every core; with network priors it is the
+  AlphaZero search. Every backed-up result is a win/draw/loss distribution (a one-hot playout
+  result, the network's distribution), so a search reports its root win/draw/loss and self-play
+  records it per position as a value target next to the game outcome (`--search-value-weight`
+  mixes the two). It is also
   an MCTS-solver: terminal outcomes propagate up as proofs (a node with a winning child is won,
   one whose children are all decided is drawn or lost), proven nodes are backed up exactly and
   never evaluated, moves into proven-lost positions get a zero prior, and a proven root ends
