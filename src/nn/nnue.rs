@@ -238,6 +238,19 @@ fn write_token(token: &mut [i32], content: usize, mine: u16, theirs: u16) {
     }
 }
 
+/// Rows `ids` (`[n, k]`) of an embedding table, as `[n, k, d]`.
+///
+/// Not `Embedding::forward`: on the CubeCL backends its gradient goes through `select_assign`,
+/// a kernel with one thread per table column that loops over every index in the batch, which
+/// made the embedding gradients most of a training step. `gather` on indices broadcast across
+/// the row has an atomic scatter-add gradient that is parallel over every element.
+fn lookup(table: &Embedding, ids: Tensor<2, Int>) -> Tensor<3> {
+    let [n, k] = ids.dims();
+    let [_, d] = table.weight.dims();
+    let indices = ids.reshape([n * k, 1]).expand([n * k, d]);
+    table.weight.val().gather(0, indices).reshape([n, k, d])
+}
+
 /// Encodes `states` as `[batch, IDS]` ids.
 pub fn nnue_input(states: &[BitState], device: &Device) -> NnueInput {
     let n = states.len();
@@ -358,9 +371,7 @@ impl Model for Nnue {
         let d_acc = self.config.d_acc;
         let token_ids = ids.clone().slice([0..n, 0..TOKENS * IDS_PER_BOARD]);
         // Every token is the sum of its content row and its nine cell rows.
-        let tokens = self
-            .content
-            .forward(token_ids)
+        let tokens = lookup(&self.content, token_ids)
             .reshape([n, TOKENS, IDS_PER_BOARD, d_e])
             .sum_dim(2)
             .reshape([n, TOKENS, d_e]);
@@ -369,10 +380,11 @@ impl Model for Nnue {
             .slice([0..n, 0..BOARDS])
             .reshape([n, BOARDS * d_e]);
         let forced = tokens.slice([0..n, BOARDS..TOKENS]).reshape([n, d_e]);
-        let features = self
-            .features
-            .forward(ids.clone().slice([0..n, TOKENS * IDS_PER_BOARD..IDS]))
-            .sum_dim(1)
+        let features = lookup(
+            &self.features,
+            ids.clone().slice([0..n, TOKENS * IDS_PER_BOARD..IDS]),
+        )
+        .sum_dim(1)
             .reshape([n, d_acc]);
         let acc = relu(self.mix.forward(boards) + self.forced_mix.forward(forced) + features);
 
@@ -390,8 +402,8 @@ impl Model for Nnue {
             .slice([0..n, 0..BOARDS, 0..1])
             .reshape([n, BOARDS]);
         // Board-major `[n, 9, 9]` is `Move::index` order (`board * 9 + square`).
-        let local = self.local_policy.forward(contents.clone());
-        let send = self.send_policy.forward(contents).reshape([n, 1, CELLS]);
+        let local = lookup(&self.local_policy, contents.clone());
+        let send = lookup(&self.send_policy, contents).reshape([n, 1, CELLS]);
         let policy = self.policy.forward(h).reshape([n, BOARDS, CELLS]) + local + send;
         Prediction {
             wdl,
