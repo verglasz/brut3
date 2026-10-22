@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::data::dataloader::batcher::Batcher;
-use burn::data::dataset::InMemDataset;
+use burn::data::dataset::{Dataset as BurnDataset, DatasetError, InMemDataset};
 use burn::lr_scheduler::cosine::CosineAnnealingLrSchedulerConfig;
 use burn::optim::AdamWConfig;
 use burn::prelude::*;
@@ -34,8 +34,8 @@ use crate::game::{BitState, GameState, Move, Outcome, Symmetry};
 pub enum Augment {
     /// Positions as played only.
     None,
-    /// Every sample under all eight symmetries, materialised: an epoch sees each eight
-    /// times. Right for small datasets (self-play generations).
+    /// Every sample under all eight symmetries: an epoch sees each eight times, transformed
+    /// on access. Right for small datasets (self-play generations).
     #[default]
     All,
     /// Each sample under one symmetry drawn at random every time it is batched: an epoch
@@ -224,16 +224,6 @@ impl Dataset {
             / self.len() as f32
     }
 
-    /// Every sample under all eight board symmetries (the identity first): eight times the
-    /// data, with the same game ids.
-    pub fn augmented(&self) -> Dataset {
-        let mut samples = Vec::with_capacity(self.len() * Symmetry::ALL.len());
-        for sym in Symmetry::ALL {
-            samples.extend(self.samples.iter().map(|s| s.transform(sym)));
-        }
-        Dataset { samples }
-    }
-
     /// Splits off about `fraction` of the positions as validation data, whole games at a
     /// time (games are shuffled with `seed`). When there are at least two games, each part
     /// gets at least one.
@@ -311,6 +301,36 @@ pub fn generate_parallel(
         }
     }
     Ok((data, stats))
+}
+
+/// Every sample of a [`Dataset`] under all eight board symmetries, as a burn dataset eight
+/// times as long ([`Augment::All`]): with `n` samples, item `i` is sample `i % n` under
+/// symmetry `i / n` (the identity first), transformed on access, so the memory is that of
+/// one copy.
+pub struct Augmented {
+    samples: Vec<Sample>,
+}
+
+impl Augmented {
+    pub fn new(data: Dataset) -> Self {
+        Self {
+            samples: data.samples,
+        }
+    }
+}
+
+impl BurnDataset<Sample> for Augmented {
+    fn get(&self, index: usize) -> Result<Sample, DatasetError> {
+        let n = self.samples.len();
+        match Symmetry::ALL.get(index / n.max(1)) {
+            Some(&symmetry) => Ok(self.samples[index % n].transform(symmetry)),
+            None => panic!("index out of bounds for Augmented: {index} >= {}", self.len()),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.samples.len() * Symmetry::ALL.len()
+    }
 }
 
 /// A minibatch on a device, encoded for model `M`.
@@ -672,12 +692,12 @@ pub fn train<M: Trainable>(
     ad_device.seed(opts.seed);
 
     let (train_data, valid_data) = data.split(opts.validation_fraction, opts.seed);
-    let train_data = match opts.augment {
-        Augment::All => train_data.augmented(),
-        Augment::None | Augment::Random => train_data,
+    let train_positions = match opts.augment {
+        Augment::All => train_data.len() * Symmetry::ALL.len(),
+        Augment::None | Augment::Random => train_data.len(),
     };
     let report_base = TrainReport {
-        train_positions: train_data.len(),
+        train_positions,
         validation_positions: valid_data.len(),
         baseline: Evaluation {
             verdict_accuracy: valid_data.baseline_accuracy(),
@@ -687,7 +707,7 @@ pub fn train<M: Trainable>(
         ..Default::default()
     };
     let batch = opts.batch_size.max(1);
-    let steps_per_epoch = train_data.len().div_ceil(batch);
+    let steps_per_epoch = train_positions.div_ceil(batch);
     let batcher = ModelBatcher::<M>::new(
         opts.outcome_weight,
         opts.search_value_weight,
@@ -697,8 +717,11 @@ pub fn train<M: Trainable>(
         .batch_size(batch)
         .shuffle(opts.seed)
         .num_workers(opts.workers())
-        .set_device(ad_device.clone())
-        .build(InMemDataset::new(train_data.samples));
+        .set_device(ad_device.clone());
+    let loader_train = match opts.augment {
+        Augment::All => loader_train.build(Augmented::new(train_data)),
+        Augment::None | Augment::Random => loader_train.build(InMemDataset::new(train_data.samples)),
+    };
     let valid_samples = valid_data.samples;
     let valid_batcher =
         ModelBatcher::<M>::new(opts.outcome_weight, opts.search_value_weight, false);
@@ -987,10 +1010,12 @@ pub(crate) mod tests {
             |_| {},
         )
         .unwrap();
-        let aug = data.augmented();
+        let aug = Augmented::new(data.clone());
         assert_eq!(aug.len(), 8 * data.len());
-        assert_eq!(&aug.samples[..data.len()], &data.samples[..], "identity first");
-        for original in &data.samples {
+        let n = data.len();
+        for (i, original) in data.samples.iter().enumerate() {
+            assert_eq!(aug.get(i).as_ref().ok(), Some(original), "identity first");
+            assert_eq!(aug.get(n + i).ok(), Some(original.transform(Symmetry::ALL[1])));
             for sym in Symmetry::ALL {
                 let s = original.transform(sym);
                 assert_eq!(s.wdl, original.wdl);
