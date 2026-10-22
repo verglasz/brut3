@@ -471,15 +471,19 @@ impl<M: Model> Batcher<Sample, Batch<M>> for ModelBatcher<M> {
 pub type StepOutput = ClassificationOutput;
 
 /// Forward pass plus the loss: the weighted cross-entropy between the win/draw/loss target
-/// and the verdict logits (over the samples that have a target), the weighted squared error
+/// and the verdict logits (averaged over the samples that have a target), the weighted squared error
 /// of the expected value (`p_win - p_loss`) against the scalar value target, and the
 /// cross-entropy between the target move distribution and the legal-masked policy.
 pub fn forward_step<M: Model>(model: &M, batch: Batch<M>) -> StepOutput {
     let prediction = model.predict(batch.input);
     let n = batch.verdicts.dims()[0];
+    // Averaged over the positions that have a win/draw/loss target, so that the term keeps
+    // its weight when only some of a batch carry one.
+    let labelled = batch.wdl_mask.clone().sum().clamp_min(1.0);
     let wdl_loss = (-(log_softmax(prediction.wdl.clone(), 1) * batch.wdl).sum_dim(1)
         * batch.wdl_mask)
-        .mean()
+        .sum()
+        .div(labelled)
         .mul_scalar(batch.outcome_weight);
     let probabilities = softmax(prediction.wdl.clone(), 1);
     let expected = probabilities.clone().slice([0..n, 0..1]) - probabilities.slice([0..n, 2..3]);
