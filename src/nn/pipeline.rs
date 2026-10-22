@@ -728,9 +728,9 @@ mod tests {
             for _ in 0..4 {
                 data.samples.push(Sample {
                     state: crate::game::BitState::initial(),
-                    verdict: super::super::model::Verdict::Draw,
                     policy: vec![],
                     game,
+                    wdl: Some(super::super::model::Verdict::Draw.one_hot()),
                     search_value: None,
                 });
             }

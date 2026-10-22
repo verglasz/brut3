@@ -43,6 +43,13 @@ impl Verdict {
         Self::ALL[index]
     }
 
+    /// The verdict as a win/draw/loss distribution.
+    pub const fn one_hot(self) -> [f32; 3] {
+        let mut p = [0.0; 3];
+        p[self as usize] = 1.0;
+        p
+    }
+
     /// `1` for a win, `0` for a draw, `-1` for a loss.
     pub const fn value(self) -> f32 {
         match self {
@@ -56,6 +63,17 @@ impl Verdict {
 /// Expected value of a win/draw/loss distribution: `p_win - p_loss`.
 pub fn expected_value(probabilities: &[f32; 3]) -> f32 {
     probabilities[Verdict::Win.index()] - probabilities[Verdict::Loss.index()]
+}
+
+/// The most probable verdict of a win/draw/loss distribution.
+pub fn most_likely(probabilities: &[f32; 3]) -> Verdict {
+    let mut best = 0;
+    for c in 1..3 {
+        if probabilities[c] > probabilities[best] {
+            best = c;
+        }
+    }
+    Verdict::from_index(best)
 }
 
 /// A network's raw outputs for a batch of positions.

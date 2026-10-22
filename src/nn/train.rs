@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataset::InMemDataset;
+use burn::lr_scheduler::cosine::CosineAnnealingLrSchedulerConfig;
 use burn::optim::AdamWConfig;
 use burn::prelude::*;
 use burn::tensor::activation::{log_softmax, softmax};
@@ -19,51 +20,97 @@ use burn::train::{
     ClassificationOutput, ExecutionStrategy, InferenceStep, Learner, SupervisedTraining, TrainStep,
 };
 use rand::seq::SliceRandom;
-use rand::{SeedableRng, rngs::SmallRng};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use super::linear::LinearNet;
-use super::model::{MOVES, Model, Verdict, expected_value, legal_mask, predict_host};
+use super::model::{
+    MOVES, Model, Verdict, expected_value, legal_mask, most_likely, predict_host,
+};
 use crate::agent::{AgentSpec, UtttAgent};
-use crate::game::{BitState, GameState, Move, Symmetry};
+use crate::game::{BitState, GameState, Move, Outcome, Symmetry};
 use crate::selfplay::{SelfPlayConfig, SelfPlayStats, self_play};
 
-/// One position with how its game ended (side to move's view) and the move distribution the
-/// generating agent played from it.
+/// One position with its targets, all from the side to move's view: a move distribution, and
+/// a win/draw/loss distribution and/or a scalar value.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sample {
     pub state: BitState,
-    pub verdict: Verdict,
     /// Probabilities over the legal moves; a search agent's visit distribution, or a single
     /// move with probability 1.
     pub policy: Vec<(Move, f32)>,
     /// Which game the position came from. Splits keep a game's positions together, since they
     /// share the outcome and a model could otherwise memorise trajectories.
     pub game: usize,
-    /// The generating search's root value for the side to move, in `[-1, 1]`, when the
-    /// generator was a search: a lower-variance value target than the game outcome alone.
+    /// Win/draw/loss target: the game's outcome as a one-hot, or a search's win/draw/loss
+    /// frequencies. `None` when only a scalar value is known.
+    pub wdl: Option<[f32; 3]>,
+    /// A search's root value in `[-1, 1]`: a lower-variance value target than the outcome
+    /// alone. At least one of `wdl` and `search_value` is set.
     pub search_value: Option<f32>,
 }
 
 impl Sample {
+    /// A position of a finished game: the outcome as the win/draw/loss target.
+    pub fn from_outcome(
+        state: BitState,
+        policy: Vec<(Move, f32)>,
+        game: usize,
+        outcome: Outcome,
+        search_value: Option<f32>,
+    ) -> Self {
+        Self {
+            wdl: Some(Verdict::from_outcome(outcome, state.to_move()).one_hot()),
+            state,
+            policy,
+            game,
+            search_value,
+        }
+    }
+
     /// The same sample seen through a board symmetry: the position and every move of the
-    /// policy move with it, the verdict and game id stay.
+    /// policy move with it, the targets and game id stay.
     pub fn transform(&self, symmetry: Symmetry) -> Sample {
         Sample {
             state: self.state.transform(symmetry),
-            verdict: self.verdict,
             policy: self
                 .policy
                 .iter()
                 .map(|(mv, p)| (symmetry.apply_move(*mv), *p))
                 .collect(),
             game: self.game,
+            wdl: self.wdl,
             search_value: self.search_value,
         }
     }
 
-    /// The scalar value target: the search's root value when there is one, else the outcome.
+    /// The most likely verdict of the win/draw/loss target, if there is one.
+    pub fn verdict(&self) -> Option<Verdict> {
+        self.wdl.as_ref().map(most_likely)
+    }
+
+    /// The scalar value target: the search's root value when there is one, else the
+    /// expectation of the win/draw/loss target.
     pub fn value_target(&self) -> f32 {
-        self.search_value.unwrap_or_else(|| self.verdict.value())
+        match (self.search_value, &self.wdl) {
+            (Some(v), _) => v,
+            (None, Some(wdl)) => expected_value(wdl),
+            (None, None) => panic!("a sample needs a win/draw/loss or a scalar value target"),
+        }
+    }
+
+    /// The verdict class for the accuracy metric: the win/draw/loss argmax, else the scalar
+    /// value's sign with a dead zone.
+    fn verdict_class(&self) -> Verdict {
+        self.verdict().unwrap_or_else(|| {
+            let v = self.value_target();
+            if v > 1.0 / 3.0 {
+                Verdict::Win
+            } else if v < -1.0 / 3.0 {
+                Verdict::Loss
+            } else {
+                Verdict::Draw
+            }
+        })
     }
 
     /// The target move: the most probable one.
@@ -100,34 +147,39 @@ impl Dataset {
         self.samples.is_empty()
     }
 
-    /// How many samples ended in each [`Verdict`], in `Verdict::ALL` order.
+    /// How many samples with a win/draw/loss target have each [`Verdict`] as the most likely,
+    /// in `Verdict::ALL` order.
     pub fn verdict_counts(&self) -> [usize; 3] {
         let mut counts = [0; 3];
         for s in &self.samples {
-            counts[s.verdict.index()] += 1;
+            if let Some(v) = s.verdict() {
+                counts[v.index()] += 1;
+            }
         }
         counts
     }
 
-    /// Accuracy of always predicting the most common verdict.
+    /// Accuracy of always predicting the most common verdict, over the samples that have one.
     pub fn baseline_accuracy(&self) -> f32 {
-        if self.is_empty() {
+        let counts = self.verdict_counts();
+        let total: usize = counts.iter().sum();
+        if total == 0 {
             return 0.0;
         }
-        let counts = self.verdict_counts();
-        *counts.iter().max().unwrap() as f32 / self.len() as f32
+        *counts.iter().max().unwrap() as f32 / total as f32
     }
 
-    /// Mean squared error (on the `1 / 0 / -1` value scale) of always predicting the mean.
+    /// Mean squared error (on the `1 / 0 / -1` value scale) of always predicting the mean
+    /// value target.
     pub fn baseline_mse(&self) -> f32 {
         if self.is_empty() {
             return 0.0;
         }
         let n = self.len() as f32;
-        let mean = self.samples.iter().map(|s| s.verdict.value()).sum::<f32>() / n;
+        let mean = self.samples.iter().map(Sample::value_target).sum::<f32>() / n;
         self.samples
             .iter()
-            .map(|s| (s.verdict.value() - mean).powi(2))
+            .map(|s| (s.value_target() - mean).powi(2))
             .sum::<f32>()
             / n
     }
@@ -142,16 +194,6 @@ impl Dataset {
             .map(|s| 1.0 / s.state.legal_moves_vec().len() as f32)
             .sum::<f32>()
             / self.len() as f32
-    }
-
-    /// Every sample under all eight board symmetries (the identity first): eight times the
-    /// data, with the same game ids.
-    pub fn augmented(&self) -> Dataset {
-        let mut samples = Vec::with_capacity(self.len() * Symmetry::ALL.len());
-        for sym in Symmetry::ALL {
-            samples.extend(self.samples.iter().map(|s| s.transform(sym)));
-        }
-        Dataset { samples }
     }
 
     /// Splits off about `fraction` of the positions as validation data, whole games at a
@@ -199,13 +241,8 @@ pub fn generate(
             state.apply(mv);
         };
         for (state, policy) in positions.drain(..) {
-            data.samples.push(Sample {
-                verdict: Verdict::from_outcome(outcome, state.to_move()),
-                state,
-                policy,
-                game,
-                search_value: None,
-            });
+            data.samples
+                .push(Sample::from_outcome(state, policy, game, outcome, None));
         }
         on_game(game + 1);
     }
@@ -226,13 +263,13 @@ pub fn generate_parallel(
     let mut data = Dataset::default();
     for (game, record) in records.into_iter().enumerate() {
         for (state, policy, value) in record.positions {
-            data.samples.push(Sample {
-                verdict: Verdict::from_outcome(record.outcome, state.to_move()),
+            data.samples.push(Sample::from_outcome(
                 state,
                 policy,
                 game,
-                search_value: Some(value),
-            });
+                record.outcome,
+                Some(value),
+            ));
         }
     }
     Ok((data, stats))
@@ -241,11 +278,15 @@ pub fn generate_parallel(
 /// A minibatch on a device, encoded for model `M`.
 pub struct Batch<M: Model> {
     pub input: M::Input,
-    /// `[batch]` verdict class indices (the game outcomes).
+    /// `[batch, 3]` win/draw/loss targets; zeros where the sample has none.
+    pub wdl: Tensor<2>,
+    /// `[batch, 1]` one where the sample has a win/draw/loss target, else zero.
+    pub wdl_mask: Tensor<2>,
+    /// `[batch]` verdict classes, for the accuracy metric (see [`Sample::verdict_class`]).
     pub verdicts: Tensor<1, Int>,
     /// `[batch, 1]` scalar value targets (see [`Sample::value_target`]).
     pub values: Tensor<2>,
-    /// Weight of the outcome cross-entropy in the loss.
+    /// Weight of the win/draw/loss cross-entropy in the loss.
     pub outcome_weight: f32,
     /// Weight of the squared error against `values` in the loss.
     pub search_value_weight: f32,
@@ -259,7 +300,7 @@ impl<M: Model> std::fmt::Debug for Batch<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Batch")
             .field("input", &self.input)
-            .field("verdicts", &self.verdicts)
+            .field("wdl", &self.wdl)
             .field("values", &self.values)
             .field("policy", &self.policy)
             .field("legal", &self.legal)
@@ -271,6 +312,8 @@ impl<M: Model> Clone for Batch<M> {
     fn clone(&self) -> Self {
         Self {
             input: self.input.clone(),
+            wdl: self.wdl.clone(),
+            wdl_mask: self.wdl_mask.clone(),
             verdicts: self.verdicts.clone(),
             values: self.values.clone(),
             outcome_weight: self.outcome_weight,
@@ -281,18 +324,23 @@ impl<M: Model> Clone for Batch<M> {
     }
 }
 
-/// Turns samples into a [`Batch`] for model `M`, carrying the loss weights.
+/// Turns samples into a [`Batch`] for model `M`, carrying the loss weights. With `augment`
+/// each sample is seen through a board symmetry drawn at random every time it is batched, so
+/// an epoch covers the data once and the symmetries over the epochs, without eight copies of
+/// the data in memory.
 pub struct ModelBatcher<M> {
     pub outcome_weight: f32,
     pub search_value_weight: f32,
+    pub augment: bool,
     _model: PhantomData<fn() -> M>,
 }
 
 impl<M> ModelBatcher<M> {
-    pub fn new(outcome_weight: f32, search_value_weight: f32) -> Self {
+    pub fn new(outcome_weight: f32, search_value_weight: f32, augment: bool) -> Self {
         Self {
             outcome_weight,
             search_value_weight,
+            augment,
             _model: PhantomData,
         }
     }
@@ -300,30 +348,53 @@ impl<M> ModelBatcher<M> {
 
 impl<M> Default for ModelBatcher<M> {
     fn default() -> Self {
-        Self::new(1.0, 0.0)
+        Self::new(1.0, 0.0, false)
     }
 }
 
 impl<M> Clone for ModelBatcher<M> {
     fn clone(&self) -> Self {
-        Self::new(self.outcome_weight, self.search_value_weight)
+        Self::new(self.outcome_weight, self.search_value_weight, self.augment)
     }
 }
 
 impl<M: Model> Batcher<Sample, Batch<M>> for ModelBatcher<M> {
     fn batch(&self, items: Vec<Sample>, device: &Device) -> Batch<M> {
+        let items: Vec<Sample> = if self.augment {
+            let mut rng = rand::rng();
+            items
+                .into_iter()
+                .map(|s| {
+                    let sym = Symmetry::ALL[rng.random_range(0..Symmetry::ALL.len())];
+                    s.transform(sym)
+                })
+                .collect()
+        } else {
+            items
+        };
         let n = items.len();
         let states: Vec<BitState> = items.iter().map(|s| s.state).collect();
-        let verdicts: Vec<i32> = items.iter().map(|s| s.verdict.index() as i32).collect();
-        let values: Vec<f32> = items.iter().map(Sample::value_target).collect();
+        let mut wdl = vec![0.0f32; n * 3];
+        let mut wdl_mask = vec![0.0f32; n];
         let mut policy = vec![0.0f32; n * MOVES];
         for (i, item) in items.iter().enumerate() {
+            if let Some(target) = &item.wdl {
+                wdl[i * 3..i * 3 + 3].copy_from_slice(target);
+                wdl_mask[i] = 1.0;
+            }
             for (mv, p) in &item.policy {
                 policy[i * MOVES + mv.index()] = *p;
             }
         }
+        let verdicts: Vec<i32> = items
+            .iter()
+            .map(|s| s.verdict_class().index() as i32)
+            .collect();
+        let values: Vec<f32> = items.iter().map(Sample::value_target).collect();
         Batch {
             input: M::encode(&states, device),
+            wdl: Tensor::from_data(TensorData::new(wdl, [n, 3]), device),
+            wdl_mask: Tensor::from_data(TensorData::new(wdl_mask, [n, 1]), device),
             verdicts: Tensor::from_data(TensorData::new(verdicts, [n]), device),
             values: Tensor::from_data(TensorData::new(values, [n, 1]), device),
             outcome_weight: self.outcome_weight,
@@ -338,15 +409,15 @@ impl<M: Model> Batcher<Sample, Batch<M>> for ModelBatcher<M> {
 /// logits and the `[batch]` verdict targets, which burn's loss and accuracy metrics read.
 pub type StepOutput = ClassificationOutput;
 
-/// Forward pass plus the loss: the weighted cross-entropy of the verdict, the weighted squared
-/// error of the expected value (`p_win - p_loss`) against the scalar value target, and
-/// cross-entropy between the target move distribution and the legal-masked policy. Outcome
-/// weight 0 with a search-value weight is distillation from the generating search.
+/// Forward pass plus the loss: the weighted cross-entropy between the win/draw/loss target
+/// and the verdict logits (over the samples that have a target), the weighted squared error
+/// of the expected value (`p_win - p_loss`) against the scalar value target, and the
+/// cross-entropy between the target move distribution and the legal-masked policy.
 pub fn forward_step<M: Model>(model: &M, batch: Batch<M>) -> StepOutput {
     let prediction = model.predict(batch.input);
     let n = batch.verdicts.dims()[0];
-    let wdl_loss = -log_softmax(prediction.wdl.clone(), 1)
-        .gather(1, batch.verdicts.clone().reshape([n, 1]))
+    let wdl_loss = (-(log_softmax(prediction.wdl.clone(), 1) * batch.wdl).sum_dim(1)
+        * batch.wdl_mask)
         .mean()
         .mul_scalar(batch.outcome_weight);
     let probabilities = softmax(prediction.wdl.clone(), 1);
@@ -397,18 +468,25 @@ pub struct TrainOptions {
     pub epochs: usize,
     pub batch_size: usize,
     pub learning_rate: f64,
+    /// Cosine-anneal the learning rate from `learning_rate` down to this over the whole run
+    /// (every step of every epoch); `0` keeps it constant.
+    pub lr_min: f64,
     /// AdamW weight decay.
     pub weight_decay: f32,
     /// Fraction of positions held out for validation.
     pub validation_fraction: f32,
-    /// Train on every sample under all eight board symmetries. Validation is never augmented.
+    /// See each sample through a random board symmetry each time it is batched. Validation
+    /// is never augmented.
     pub augment: bool,
-    /// Weight of the outcome cross-entropy in the loss; `0` with a search-value weight trains
-    /// the value head purely on the search's values (distillation).
+    /// Weight of the win/draw/loss cross-entropy in the loss; `0` with a search-value weight
+    /// trains the value head purely on scalar values (distillation).
     pub outcome_weight: f32,
-    /// Weight of the squared error between the expected value and the generating search's
-    /// root value (the outcome where there was no search) in the loss; `0` ignores it.
+    /// Weight of the squared error between the expected value and the scalar value target
+    /// (a search's root value, or the outcome's value where there was no search) in the
+    /// loss; `0` ignores it.
     pub search_value_weight: f32,
+    /// Data loader threads that encode batches; `0` means one per core.
+    pub workers: usize,
     pub seed: u64,
     /// Where the Learner writes its logs and checkpoints.
     pub artifact_dir: PathBuf,
@@ -422,11 +500,13 @@ impl Default for TrainOptions {
             epochs: 10,
             batch_size: 1024,
             learning_rate: 1e-3,
+            lr_min: 0.0,
             weight_decay: 1e-4,
             validation_fraction: 0.1,
             augment: true,
             outcome_weight: 1.0,
             search_value_weight: 0.5,
+            workers: 0,
             seed: 0,
             artifact_dir: PathBuf::from("artifacts/train"),
             tui: true,
@@ -434,12 +514,24 @@ impl Default for TrainOptions {
     }
 }
 
+impl TrainOptions {
+    fn workers(&self) -> usize {
+        match self.workers {
+            0 => std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+            n => n,
+        }
+    }
+}
+
 /// Quality of a model over a set of samples.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Evaluation {
-    /// Fraction of positions whose most likely verdict is the true one.
+    /// Fraction of positions with a win/draw/loss target whose most likely verdict is the
+    /// target's.
     pub verdict_accuracy: f32,
-    /// MSE of `p_win - p_loss` against the `1 / 0 / -1` outcome.
+    /// MSE of `p_win - p_loss` against the scalar value target.
     pub value_mse: f32,
     /// Fraction of positions whose most likely move is the target's most likely move.
     pub policy_accuracy: f32,
@@ -540,11 +632,6 @@ pub fn train<M: Trainable>(
     ad_device.seed(opts.seed);
 
     let (train_data, valid_data) = data.split(opts.validation_fraction, opts.seed);
-    let train_data = if opts.augment {
-        train_data.augmented()
-    } else {
-        train_data
-    };
     let report_base = TrainReport {
         train_positions: train_data.len(),
         validation_positions: valid_data.len(),
@@ -556,15 +643,21 @@ pub fn train<M: Trainable>(
         ..Default::default()
     };
     let batch = opts.batch_size.max(1);
-    let batcher = ModelBatcher::<M>::new(opts.outcome_weight, opts.search_value_weight);
-    let loader_train = DataLoaderBuilder::<Sample, Batch<M>>::new(batcher.clone())
+    let steps_per_epoch = train_data.len().div_ceil(batch);
+    let batcher =
+        ModelBatcher::<M>::new(opts.outcome_weight, opts.search_value_weight, opts.augment);
+    let loader_train = DataLoaderBuilder::<Sample, Batch<M>>::new(batcher)
         .batch_size(batch)
         .shuffle(opts.seed)
+        .num_workers(opts.workers())
         .set_device(ad_device.clone())
         .build(InMemDataset::new(train_data.samples));
     let valid_samples = valid_data.samples;
-    let loader_valid = DataLoaderBuilder::<Sample, Batch<M>>::new(batcher)
+    let valid_batcher =
+        ModelBatcher::<M>::new(opts.outcome_weight, opts.search_value_weight, false);
+    let loader_valid = DataLoaderBuilder::<Sample, Batch<M>>::new(valid_batcher)
         .batch_size(1024)
+        .num_workers(opts.workers())
         .set_device(device.clone())
         .build(InMemDataset::new(valid_samples.clone()));
 
@@ -572,7 +665,18 @@ pub fn train<M: Trainable>(
     let optim = AdamWConfig::new()
         .with_weight_decay(opts.weight_decay)
         .init();
-    let learner = Learner::new(model, optim, opts.learning_rate);
+    let learner = if opts.lr_min > 0.0 && opts.lr_min < opts.learning_rate {
+        let schedule = CosineAnnealingLrSchedulerConfig::new(
+            opts.learning_rate,
+            (steps_per_epoch * opts.epochs).max(1),
+        )
+        .with_min_lr(opts.lr_min)
+        .init()
+        .expect("valid cosine schedule");
+        Learner::new(model, optim, schedule)
+    } else {
+        Learner::new(model, optim, opts.learning_rate)
+    };
 
     let training = SupervisedTraining::new(&opts.artifact_dir, loader_train, loader_valid)
         .num_epochs(opts.epochs)
@@ -657,6 +761,7 @@ pub fn evaluate<M: Model>(model: &M, device: &Device, samples: &[Sample]) -> Eva
         return Evaluation::default();
     }
     let mut verdict_hits = 0usize;
+    let mut verdict_total = 0usize;
     let mut policy_hits = 0usize;
     let mut value_err = 0.0f64;
     let mut states = Vec::new();
@@ -667,15 +772,21 @@ pub fn evaluate<M: Model>(model: &M, device: &Device, samples: &[Sample]) -> Eva
         let best_moves = prediction.best_moves();
         for (i, s) in chunk.iter().enumerate() {
             let p = &prediction.wdl[i];
-            let predicted = (0..3).max_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap();
-            verdict_hits += usize::from(predicted == s.verdict.index());
+            if let Some(target) = s.verdict() {
+                verdict_total += 1;
+                verdict_hits += usize::from(most_likely(p) == target);
+            }
             policy_hits += usize::from(best_moves[i] == s.best_move());
-            value_err += (expected_value(p) - s.verdict.value()).powi(2) as f64;
+            value_err += (expected_value(p) - s.value_target()).powi(2) as f64;
         }
     }
     let n = samples.len();
     Evaluation {
-        verdict_accuracy: verdict_hits as f32 / n as f32,
+        verdict_accuracy: if verdict_total == 0 {
+            0.0
+        } else {
+            verdict_hits as f32 / verdict_total as f32
+        },
         value_mse: (value_err / n as f64) as f32,
         policy_accuracy: policy_hits as f32 / n as f32,
     }
@@ -690,8 +801,6 @@ pub fn temp_artifact_dir(tag: &str) -> PathBuf {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use rand::Rng;
-
     use super::*;
     use crate::game::MoveSet;
     use crate::nn::BackendKind;
@@ -706,6 +815,7 @@ pub(crate) mod tests {
             epochs,
             tui: false,
             augment: false,
+            workers: 1,
             artifact_dir: temp_artifact_dir(&format!("{kind}-{tag}")),
             ..Default::default()
         }
@@ -752,9 +862,9 @@ pub(crate) mod tests {
                     .unwrap();
                 data.samples.push(Sample {
                     state,
-                    verdict: Verdict::from_index(verdict),
                     policy: vec![(best, 1.0)],
                     game,
+                    wdl: Some(Verdict::from_index(verdict).one_hot()),
                     search_value: None,
                 });
                 let k = rng.random_range(0..legal.len());
@@ -780,11 +890,12 @@ pub(crate) mod tests {
             let sum: f32 = s.policy.iter().map(|(_, p)| p).sum();
             assert!((sum - 1.0).abs() < 1e-4);
             assert!(s.policy.iter().all(|(mv, _)| s.state.is_legal(*mv)));
+            assert!(s.wdl.is_some());
         }
-        // Consecutive positions of one game alternate perspective, so verdicts alternate
-        // (or are all draws).
-        let (a, b) = (data.samples[0].verdict, data.samples[1].verdict);
-        assert!(a.value() == -b.value());
+        // Consecutive positions of one game alternate perspective, so values alternate (or
+        // are all draws).
+        let (a, b) = (data.samples[0].value_target(), data.samples[1].value_target());
+        assert!(a == -b);
         assert_eq!(data.verdict_counts().iter().sum::<usize>(), data.len());
         assert!(data.baseline_policy_accuracy() > 0.0);
         assert_eq!(data.samples.first().unwrap().game, 0);
@@ -792,7 +903,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn augmentation_maps_positions_and_policies_together() {
+    fn value_targets_and_verdict_classes() {
+        let s = Sample {
+            state: BitState::initial(),
+            policy: vec![(Move::from_index(40), 1.0)],
+            game: 0,
+            wdl: Some([0.6, 0.3, 0.1]),
+            search_value: None,
+        };
+        assert_eq!(s.verdict(), Some(Verdict::Win));
+        assert!((s.value_target() - 0.5).abs() < 1e-6);
+        let scalar = Sample {
+            wdl: None,
+            search_value: Some(-0.8),
+            ..s.clone()
+        };
+        assert_eq!(scalar.verdict(), None);
+        assert_eq!(scalar.verdict_class(), Verdict::Loss);
+        assert_eq!(scalar.value_target(), -0.8);
+        let both = Sample {
+            search_value: Some(0.1),
+            ..s
+        };
+        assert_eq!(both.value_target(), 0.1);
+        assert_eq!(both.verdict_class(), Verdict::Win);
+    }
+
+    #[test]
+    fn symmetries_map_positions_and_policies_together() {
         let data = generate(
             &AgentSpec::Mcts {
                 simulations: 8,
@@ -802,36 +940,31 @@ pub(crate) mod tests {
             |_| {},
         )
         .unwrap();
-        let aug = data.augmented();
-        assert_eq!(aug.len(), 8 * data.len());
-        assert_eq!(
-            &aug.samples[..data.len()],
-            &data.samples[..],
-            "identity first"
-        );
-        for (i, s) in aug.samples.iter().enumerate() {
-            let original = &data.samples[i % data.len()];
-            assert_eq!(s.verdict, original.verdict);
-            assert_eq!(s.game, original.game);
-            assert_eq!(s.policy.len(), original.policy.len());
-            for (mv, p) in &s.policy {
-                assert!(
-                    s.state.is_legal(*mv),
-                    "policy move {mv} legal after transform"
-                );
-                assert!(original.policy.iter().any(|(_, q)| q == p));
+        for original in &data.samples {
+            for sym in Symmetry::ALL {
+                let s = original.transform(sym);
+                assert_eq!(s.wdl, original.wdl);
+                assert_eq!(s.game, original.game);
+                assert_eq!(s.policy.len(), original.policy.len());
+                for (mv, p) in &s.policy {
+                    assert!(
+                        s.state.is_legal(*mv),
+                        "policy move {mv} legal after transform"
+                    );
+                    assert!(original.policy.iter().any(|(_, q)| q == p));
+                }
+                assert_eq!(s.transform(sym.inverse()), *original);
             }
         }
         // A symmetric position is its own image.
-        let mut d = Dataset::default();
-        d.samples.push(Sample {
+        let s = Sample {
             state: BitState::initial(),
-            verdict: Verdict::Draw,
             policy: vec![(Move::new(crate::game::sq(1, 1), crate::game::sq(1, 1)), 1.0)],
             game: 0,
+            wdl: Some(Verdict::Draw.one_hot()),
             search_value: None,
-        });
-        assert!(d.augmented().samples.iter().all(|s| *s == d.samples[0]));
+        };
+        assert!(Symmetry::ALL.iter().all(|&sym| s.transform(sym) == s));
     }
 
     #[test]
@@ -849,6 +982,7 @@ pub(crate) mod tests {
         assert_eq!(data.samples.last().unwrap().game, 2);
         for s in &data.samples {
             assert!(s.policy.iter().all(|(mv, _)| s.state.is_legal(*mv)));
+            assert!(s.wdl.is_some() && s.search_value.is_some());
         }
     }
 
@@ -858,9 +992,9 @@ pub(crate) mod tests {
         for i in 0..20 {
             data.samples.push(Sample {
                 state: BitState::initial(),
-                verdict: Verdict::from_index(i % 3),
                 policy: vec![(Move::from_index(i), 1.0)],
                 game: i / 4, // 5 games of 4 positions
+                wdl: Some(Verdict::from_index(i % 3).one_hot()),
                 search_value: None,
             });
         }

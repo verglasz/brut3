@@ -1,12 +1,13 @@
 //! Self-play games on disk, so that a generation's games can be reloaded instead of replayed.
 //!
-//! Little-endian binary: the magic `UTTTGAMES\x02`, a `u32` game count, then per game a `u16`
+//! Little-endian binary: the magic `UTTTGAMES\x03`, a `u32` game count, then per game a `u16`
 //! position count and per position 21 bytes of 2-bit cells by move index (0 empty, 1 X, 2 O),
 //! one byte for the side to move (0 X, 1 O), one byte for the last move index (255 for none),
-//! one byte for the verdict index, one byte saying whether a search value follows (then an
-//! `i16` in units of 1/32767), one byte for the policy length, and per policy entry one byte
-//! of move index and a `u16` probability in units of 1/65535. Version 1 files (magic `\x01`)
-//! have no search values and still load.
+//! a flags byte (bit 0: a win/draw/loss target follows as three `u16` in units of 1/65535;
+//! bit 1: a search value follows as an `i16` in units of 1/32767), one byte for the policy
+//! length, and per policy entry one byte of move index and a `u16` probability in units of
+//! 1/65535. Older files still load: version 2 (magic `\x02`) has a verdict byte and a
+//! search-value flag byte in place of the flags, version 1 only the verdict byte.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -15,8 +16,11 @@ use super::model::Verdict;
 use super::train::{Dataset, Sample};
 use crate::game::{BitState, GameState, Move, Player, Position};
 
-const MAGIC: &[u8; 10] = b"UTTTGAMES\x02";
+const MAGIC: &[u8; 10] = b"UTTTGAMES\x03";
+const MAGIC_V2: &[u8; 10] = b"UTTTGAMES\x02";
 const MAGIC_V1: &[u8; 10] = b"UTTTGAMES\x01";
+const HAS_WDL: u8 = 1;
+const HAS_VALUE: u8 = 2;
 const VALUE_SCALE: f32 = 32767.0;
 const NO_MOVE: u8 = 255;
 const CELL_BYTES: usize = 21;
@@ -63,14 +67,17 @@ fn write_sample(out: &mut Vec<u8>, s: &Sample) -> Result<(), String> {
         Player::O => 1,
     });
     out.push(position.last_move().map_or(NO_MOVE, |m| m.index() as u8));
-    out.push(s.verdict.index() as u8);
-    match s.search_value {
-        None => out.push(0),
-        Some(v) => {
-            out.push(1);
-            let q = (v.clamp(-1.0, 1.0) * VALUE_SCALE).round() as i16;
+    let flags = s.wdl.map_or(0, |_| HAS_WDL) | s.search_value.map_or(0, |_| HAS_VALUE);
+    out.push(flags);
+    if let Some(wdl) = &s.wdl {
+        for p in wdl {
+            let q = (p.clamp(0.0, 1.0) * PROBABILITY_SCALE).round() as u16;
             out.extend_from_slice(&q.to_le_bytes());
         }
+    }
+    if let Some(v) = s.search_value {
+        let q = (v.clamp(-1.0, 1.0) * VALUE_SCALE).round() as i16;
+        out.extend_from_slice(&q.to_le_bytes());
     }
     let n = u8::try_from(s.policy.len())
         .map_err(|_| format!("a policy over {} moves does not fit", s.policy.len()))?;
@@ -135,11 +142,19 @@ impl<'a> Reader<'a> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Version {
+    V1,
+    V2,
+    V3,
+}
+
 fn parse(bytes: &[u8]) -> Result<Dataset, String> {
     let mut r = Reader { bytes, at: 0 };
-    let with_search = match r.take(MAGIC.len())? {
-        m if m == MAGIC => true,
-        m if m == MAGIC_V1 => false,
+    let version = match r.take(MAGIC.len())? {
+        m if m == MAGIC => Version::V3,
+        m if m == MAGIC_V2 => Version::V2,
+        m if m == MAGIC_V1 => Version::V1,
         _ => return Err("not a games file".into()),
     };
     let games = r.u32()? as usize;
@@ -147,7 +162,7 @@ fn parse(bytes: &[u8]) -> Result<Dataset, String> {
     for game in 0..games {
         let positions = r.u16()? as usize;
         for _ in 0..positions {
-            data.samples.push(read_sample(&mut r, game, with_search)?);
+            data.samples.push(read_sample(&mut r, game, version)?);
         }
     }
     if r.at != bytes.len() {
@@ -156,7 +171,7 @@ fn parse(bytes: &[u8]) -> Result<Dataset, String> {
     Ok(data)
 }
 
-fn read_sample(r: &mut Reader, game: usize, with_search: bool) -> Result<Sample, String> {
+fn read_sample(r: &mut Reader, game: usize, version: Version) -> Result<Sample, String> {
     let cells = r.take(CELL_BYTES)?;
     let mut position = Position::initial();
     for i in 0..Move::COUNT {
@@ -177,20 +192,50 @@ fn read_sample(r: &mut Reader, game: usize, with_search: bool) -> Result<Sample,
         NO_MOVE => None,
         index => Some(move_at(index)?),
     });
-    let verdict = match r.u8()? {
-        v @ 0..=2 => Verdict::from_index(v as usize),
-        other => return Err(format!("bad verdict {other}")),
-    };
-    let search_value = if !with_search {
-        None
-    } else {
-        match r.u8()? {
-            0 => None,
-            1 => {
+    let (wdl, search_value) = match version {
+        Version::V3 => {
+            let flags = r.u8()?;
+            if flags & !(HAS_WDL | HAS_VALUE) != 0 {
+                return Err(format!("bad target flags {flags}"));
+            }
+            let wdl = if flags & HAS_WDL != 0 {
+                let mut p = [0.0f32; 3];
+                for q in &mut p {
+                    *q = r.u16()? as f32 / PROBABILITY_SCALE;
+                }
+                Some(p)
+            } else {
+                None
+            };
+            let value = if flags & HAS_VALUE != 0 {
                 let b = r.take(2)?;
                 Some(i16::from_le_bytes([b[0], b[1]]) as f32 / VALUE_SCALE)
+            } else {
+                None
+            };
+            if wdl.is_none() && value.is_none() {
+                return Err("a position without any value target".into());
             }
-            other => return Err(format!("bad search value flag {other}")),
+            (wdl, value)
+        }
+        Version::V1 | Version::V2 => {
+            let verdict = match r.u8()? {
+                v @ 0..=2 => Verdict::from_index(v as usize),
+                other => return Err(format!("bad verdict {other}")),
+            };
+            let value = if version == Version::V1 {
+                None
+            } else {
+                match r.u8()? {
+                    0 => None,
+                    1 => {
+                        let b = r.take(2)?;
+                        Some(i16::from_le_bytes([b[0], b[1]]) as f32 / VALUE_SCALE)
+                    }
+                    other => return Err(format!("bad search value flag {other}")),
+                }
+            };
+            (Some(verdict.one_hot()), value)
         }
     };
     let n = r.u8()? as usize;
@@ -201,9 +246,9 @@ fn read_sample(r: &mut Reader, game: usize, with_search: bool) -> Result<Sample,
     }
     Ok(Sample {
         state: BitState::from_position(&position),
-        verdict,
         policy,
         game,
+        wdl,
         search_value,
     })
 }
@@ -232,7 +277,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.len(), data.len());
         for (a, b) in data.samples.iter().zip(&back.samples) {
-            assert_eq!((a.state, a.verdict, a.game), (b.state, b.verdict, b.game));
+            assert_eq!((a.state, a.wdl, a.game), (b.state, b.wdl, b.game));
             match (a.search_value, b.search_value) {
                 (Some(x), Some(y)) => assert!((x - y).abs() < 1e-4, "{x} vs {y}"),
                 (None, None) => {}
@@ -254,6 +299,42 @@ mod tests {
         let both = load_many(&[&path, &path]).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!((both.games(), both.len()), (6, 2 * data.len()));
+    }
+
+    #[test]
+    fn soft_targets_and_scalar_only_positions_round_trip() {
+        let mut data = Dataset::default();
+        let base = Sample {
+            state: BitState::initial(),
+            policy: vec![(Move::from_index(40), 0.75), (Move::from_index(0), 0.25)],
+            game: 0,
+            wdl: Some([0.5, 0.3, 0.2]),
+            search_value: None,
+        };
+        data.samples.push(base.clone());
+        data.samples.push(Sample {
+            wdl: None,
+            search_value: Some(-0.25),
+            game: 1,
+            ..base.clone()
+        });
+        data.samples.push(Sample {
+            search_value: Some(0.125),
+            game: 2,
+            ..base
+        });
+        let path = std::env::temp_dir().join(format!("uttt-games-soft-{}.games", std::process::id()));
+        save(&path, &data).unwrap();
+        let back = load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.len(), 3);
+        let w = back.samples[0].wdl.unwrap();
+        assert!((w[0] - 0.5).abs() < 1e-4 && (w[1] - 0.3).abs() < 1e-4 && (w[2] - 0.2).abs() < 1e-4);
+        assert_eq!(back.samples[0].search_value, None);
+        assert_eq!(back.samples[1].wdl, None);
+        assert!((back.samples[1].search_value.unwrap() + 0.25).abs() < 1e-4);
+        assert!(back.samples[2].wdl.is_some());
+        assert!((back.samples[2].search_value.unwrap() - 0.125).abs() < 1e-4);
     }
 
     #[test]
