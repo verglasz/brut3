@@ -184,7 +184,7 @@ export (~100 bytes per entry).
 - `Decode.hs`: base64 to signed 16-bit values; `decodeRows` for one array, which checks the
   value count.
 - `Net.hs`: the `Net` record decoded from the stream on first use (`net`), `foldRow`,
-  `accumulateRows`, `hiddenOf`, `wdlOf`, `policyLogit`, `tokenOf`. Imports `FixedVec` (the
+  `accumulateRows`, `hiddenOf`, `wdlOf`, `policyLogit`. Imports `FixedVec` (the
   Haskell project's `gen/vecgen.py` output: `VecN`, `RowsM_N`, `dotN`, `selM_N`,
   `linear/dense/residualM_N`, ...) and aliases `VecE`/`VecA`/`VecH`; the export prints the
   exact `vecgen.py` command line for the shapes it needs.
@@ -192,14 +192,16 @@ export (~100 bytes per entry).
   the input ids, accumulator, hidden layer, W/D/L logits and probabilities, and every legal
   move's logit and probability, as computed by the **int16-rounded** weights (so the port
   should match to Float rounding, not to quantisation error).
-- `SelfTest.hs`: `selfTest` replays the references from their ids through `Net` and checks
-  the deviations; `bench n` times accumulator + MLP + value head + nine policy logits.
+- `SelfTest.hs` (verification only): `tokenOf` (tokens by list lookup), `selfTest`, which
+  replays the references from their ids through `Net` and checks the deviations, and
+  `bench n`, which times accumulator + MLP + value head + nine policy logits.
 - `Book.hs` (with `--book models/book.txt`, with or without a model): the canonical entries
   as a sorted byte stream (25 bytes each: three little-endian `Word64` key words, then the
-  move index) in base64 literals; `bookKey`, the eight `squarePermutations`, a reference
-  `canonicalKey`/`lookupBook` (linear search: the engine should build a balanced tree from
-  `bookEntries`), and `bookRefs`/`bookTest`: book positions under random symmetries plus a
-  few off-book ones, with the move Rust's `Book::lookup` gives. Key words: the 81 cell
+  move index) in base64 literals, `bookKey` and the eight `squarePermutations`. The engine
+  should build a balanced tree from `bookEntries` and compute keys from its own bitboards.
+- `BookTest.hs` (verification only): a reference `canonicalKey`/`lookupBook` by linear
+  search, and `bookRefs`/`bookTest`: book positions under random symmetries plus a few
+  off-book ones, with the move Rust's `Book::lookup` gives. Key words: the 81 cell
   digits as three base-3 numbers of 27 digits, most significant first, the last times ten
   plus the forced digit, so word order is key-string order and "smallest image, first
   symmetry on ties" means the same on both sides. The 14k-entry book is 354 KB of bytes
@@ -218,5 +220,9 @@ Measured (GHC 9.10.3, `-O2 -XSafe`, one core), including `FixedVec`:
 
 The medium net's compile cost is the 512-wide `FixedVec` code (dense layers over `Vec512`
 rows), worth checking against the grader's limits; its evaluation is ~1.5x the 0.5 ns/MAC
-estimate. Startup (decode of the stream) is well under a second for both.
+estimate. Startup (decode of the stream) is well under a second for both. `Net.hs` carries
+`-fsimpl-tick-factor=400`: its accumulator sum inlines twenty `combineN`s of width A so
+that the result is one allocation, and at A = 512 that exceeds GHC's default tick budget
+(which scales with the module's size). A K-ary `reluSumK_N` in `FixedVec` would remove the
+need for it.
 

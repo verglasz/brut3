@@ -122,9 +122,10 @@ pub fn write_all(
         }
     }
     if let Some(book) = book {
-        let (text, stats) =
-            super::book::book_module(book, &opts.prefix, opts.chunk, opts.seed, opts.lookups);
+        let (text, test, stats) =
+            super::book::book_modules(book, &opts.prefix, opts.chunk, opts.seed, opts.lookups);
         emit("Book", text)?;
+        emit("BookTest", test)?;
         report.book = Some(stats);
     }
     Ok(report)
