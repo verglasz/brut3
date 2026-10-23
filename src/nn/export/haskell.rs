@@ -12,6 +12,7 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
 use super::Weights;
+use super::quant::base64;
 use crate::game::{BitState, GameState, LINES, Move};
 use crate::nn::model::MOVES;
 use crate::nn::nnue::{
@@ -28,6 +29,8 @@ pub struct ExportOptions {
     pub positions: usize,
     /// Seed of the random games the reference positions come from.
     pub seed: u64,
+    /// Characters per weight string literal.
+    pub chunk: usize,
 }
 
 impl Default for ExportOptions {
@@ -36,6 +39,7 @@ impl Default for ExportOptions {
             prefix: "Gen".into(),
             positions: 16,
             seed: 1,
+            chunk: 256 * 1024,
         }
     }
 }
@@ -44,6 +48,14 @@ impl Default for ExportOptions {
 #[derive(Clone, Debug, Default)]
 pub struct Report {
     pub files: Vec<(PathBuf, usize)>,
+    /// Bytes of the int16 weight stream and the base64 chunks it was cut into.
+    pub stream_bytes: usize,
+    pub chunks: usize,
+    /// Largest deviations of the dequantised weights from the exact ones over the reference
+    /// positions: win/draw/loss probability, `p_win - p_loss`, legal-move probability.
+    pub wdl_error: f32,
+    pub value_error: f32,
+    pub policy_error: f32,
 }
 
 /// Writes every generated module under `out`.
@@ -64,7 +76,77 @@ pub fn write_all(weights: &Weights, out: &Path, opts: &ExportOptions) -> Result<
         "Reference",
         reference_module(weights, &positions, &opts.prefix),
     )?;
+    let (text, stream_bytes, chunks) = weights_module(weights, &opts.prefix, opts.chunk);
+    emit("Weights", text)?;
+    report.stream_bytes = stream_bytes;
+    report.chunks = chunks;
+    let rounded = weights.dequantised();
+    for (_, state) in &positions {
+        let exact = weights.evaluate(state);
+        let other = rounded.evaluate(state);
+        for (a, b) in exact.wdl.iter().zip(&other.wdl) {
+            report.wdl_error = report.wdl_error.max((a - b).abs());
+        }
+        report.value_error = report
+            .value_error
+            .max((exact.value() - other.value()).abs());
+        for (a, b) in exact.policy.iter().zip(&other.policy) {
+            report.policy_error = report.policy_error.max((a.2 - b.2).abs());
+        }
+    }
     Ok(report)
+}
+
+/// `Weights.hs`: the manifest and the base64 chunks of the int16 stream. Returns the text,
+/// the stream's size in bytes and the number of chunks.
+pub fn weights_module(weights: &Weights, prefix: &str, chunk: usize) -> (String, usize, usize) {
+    let stream = weights.stream();
+    let encoded = base64(&stream.bytes);
+    let chunks: Vec<&str> = {
+        let mut out = Vec::new();
+        let mut rest = encoded.as_str();
+        while !rest.is_empty() {
+            let n = chunk.min(rest.len());
+            out.push(&rest[..n]);
+            rest = &rest[n..];
+        }
+        out
+    };
+    let mut s = String::with_capacity(encoded.len() + 4096);
+    banner(&mut s, &format!("{prefix}.Weights"), "(manifest, chunks)");
+    s.push_str(
+        "-- Every array in stream order as (name, rows, cols, scale): rows * cols little-endian\n\
+         -- Int16 values, each worth q * scale, matrices one row per output. The stream is the\n\
+         -- concatenation of the chunks, base64 with the standard alphabet and padding.\n",
+    );
+    let _ = writeln!(s, "manifest :: [(String, Int, Int, Float)]");
+    let _ = writeln!(s, "manifest =");
+    for (i, e) in stream.manifest.iter().enumerate() {
+        let _ = writeln!(
+            s,
+            "  {} ({:?}, {}, {}, {})",
+            if i == 0 { "[" } else { "," },
+            e.name,
+            e.rows,
+            e.cols,
+            hs_float(e.scale)
+        );
+    }
+    let _ = writeln!(s, "  ]\n");
+    let _ = writeln!(
+        s,
+        "-- {} bytes of int16 values in {} chunks.",
+        stream.bytes.len(),
+        chunks.len()
+    );
+    let _ = writeln!(s, "chunks :: [String]");
+    let names: Vec<String> = (0..chunks.len()).map(|i| format!("chunk{i}")).collect();
+    let _ = writeln!(s, "chunks = [{}]\n", names.join(", "));
+    for (name, text) in names.iter().zip(&chunks) {
+        let _ = writeln!(s, "{name} :: String");
+        let _ = writeln!(s, "{name} = \"{text}\"\n");
+    }
+    (s, stream.bytes.len(), chunks.len())
 }
 
 fn banner(out: &mut String, module: &str, exports: &str) {

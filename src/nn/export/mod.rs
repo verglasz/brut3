@@ -8,9 +8,11 @@
 //!   dense layers, and a softmax over the legal moves only. It is the executable
 //!   specification the generated Haskell is checked against, and the place where the
 //!   quantisation error of an export is measured without a GHC in the loop.
+//! - [`quant`]: int16 quantisation and the base64 stream the weights ship as.
 //! - [`haskell`]: the generated Haskell modules.
 
 pub mod haskell;
+pub mod quant;
 pub mod scalar;
 pub mod weights;
 

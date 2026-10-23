@@ -744,11 +744,17 @@ fn export(
         prefix: module,
         positions,
         seed,
+        ..ExportOptions::default()
     };
     let report = write_all(&weights, out, &opts)?;
     for (path, bytes) in &report.files {
         println!("wrote {} ({} bytes)", path.display(), bytes);
     }
+    println!(
+        "int16 stream: {} bytes in {} chunks; quantisation error over the reference positions: \
+         wdl {:.2e}, value {:.2e}, policy {:.2e}",
+        report.stream_bytes, report.chunks, report.wdl_error, report.value_error, report.policy_error
+    );
     Ok(())
 }
 
