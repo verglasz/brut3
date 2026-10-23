@@ -133,10 +133,18 @@ cargo run --release --no-default-features --example bench
 
 # Play against an agent in the terminal (default: mcts 400)
 cargo run --release --no-default-features -- mcts 800 3
+
+# Play in the browser at http://127.0.0.1:8080 against any of the listed agents
+cargo run --release --all-features -- serve "mcts 800" "mcts-nn models/x cuda 400 16 book models/book.txt"
 ```
 
 In the REPL, moves are entered as `r1c2/r0c0` (board, then square) or as four digits
 `1 2 0 0`; `help` lists the commands (`new o` to play O, `agent nn models/value`, `hint`, `undo`).
+
+On the `serve` page each side is a human or one of the agents (agents can play each other),
+and a hint agent can show its move probabilities and value on your turns. The game is kept in
+the URL fragment (`#40.36.4`, move indices), and `?x=human&o=1&hints=0` picks the players by
+agent index. The page reuses uttt.ai's board styles, colours and icons (Apache-2.0).
 
 ## Design
 
@@ -265,6 +273,7 @@ src/
   agent/minimax.rs  MinimaxAgent
   agent/any.rs      AgentSpec, AnyAgent (concrete enum over all agents)
   repl.rs           interactive play
+  serve/            `serve`: HTTP server (std only) and the play page it embeds
   benchmark.rs      matches and round-robin tournaments
   selfplay.rs       lockstep self-play over many games with one batched evaluator
   mcts.rs           Mcts, MctsConfig, SearchResult

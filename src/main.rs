@@ -125,6 +125,17 @@ enum Command {
         #[arg(required = true, num_args = 2..)]
         specs: Vec<String>,
     },
+    /// Serve a web page for playing against agents, e.g.
+    /// `serve "mcts 800" "mcts-nn models/x cuda 400 16 book models/book.txt"`. Each side of
+    /// the board is a human or one of the agents, chosen on the page.
+    Serve {
+        /// Address to listen on.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+        /// Agent specs, one per argument, quoted when they contain spaces.
+        #[arg(required = true, num_args = 1..)]
+        specs: Vec<String>,
+    },
 }
 
 #[cfg(feature = "nn")]
@@ -381,6 +392,7 @@ fn main() -> ExitCode {
             dirichlet_alpha,
             specs,
         } => benchmark(games, temperature_moves, dirichlet_alpha, &specs),
+        Command::Serve { addr, specs } => serve(&addr, &specs),
         Command::Book {
             search,
             out,
@@ -543,6 +555,17 @@ fn benchmark(
     let tournament = round_robin_with(&specs, games, &exploration, |m| println!("  {m}"))?;
     print!("\n{}", tournament.table());
     Ok(())
+}
+
+fn serve(addr: &str, specs: &[String]) -> Result<(), String> {
+    let specs = specs
+        .iter()
+        .map(|s| {
+            let words: Vec<&str> = s.split_whitespace().collect();
+            AgentSpec::parse(&words)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ultimate_ttt_burn::serve::run(&specs, addr).map_err(|e| e.to_string())
 }
 
 fn play(spec: &[String]) -> Result<(), String> {
@@ -825,7 +848,11 @@ fn export(
         println!(
             "int16 weights: {} bytes in {} literals; quantisation error over the reference positions: \
              wdl {:.2e}, value {:.2e}, policy {:.2e}",
-            report.stream_bytes, report.chunks, report.wdl_error, report.value_error, report.policy_error
+            report.stream_bytes,
+            report.chunks,
+            report.wdl_error,
+            report.value_error,
+            report.policy_error
         );
         println!("FixedVec: {}", report.vecgen);
     }

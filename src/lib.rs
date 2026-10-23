@@ -9,6 +9,7 @@
 //! - [`benchmark`]: matches and round-robin tournaments between agents.
 //! - [`book`]: an opening book built by searching the positions of the first plies.
 //! - [`selfplay`]: lockstep self-play over many games with one batched evaluator.
+//! - [`serve`]: a local web page for playing against agents.
 //! - [`nn`] (feature `nn`, on by default): the value network, its training, and backend selection.
 
 pub mod agent;
@@ -20,3 +21,4 @@ pub mod mcts;
 pub mod nn;
 pub mod repl;
 pub mod selfplay;
+pub mod serve;
