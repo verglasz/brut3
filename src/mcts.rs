@@ -17,7 +17,7 @@
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use crate::agent::{Evaluation, Evaluations, UtttAgent};
-use crate::game::{GameState, Move, MoveSet, Outcome};
+use crate::game::{GameState, Move, MoveSet, Outcome, Player};
 
 #[derive(Clone, Debug)]
 pub struct MctsConfig {
@@ -104,75 +104,73 @@ impl SearchResult {
 
 const NO_NODE: u32 = u32::MAX;
 
-/// What a node is: its position and its place in the tree. Read when a node is expanded or
-/// backed up, not while choosing among siblings.
-struct Node<S> {
-    state: S,
-    /// Move that led here; `None` for the root.
-    mv: Option<Move>,
+/// A node of the search: its place in the tree and what is known of its position. Positions
+/// are not stored; selection carries one down from the root by applying the edges' moves. A
+/// node is created when it is first selected, so a tree holds about one node per simulation
+/// rather than one per legal move of every expanded node.
+struct Node {
     parent: u32,
-    /// Children are contiguous: `first_child..first_child + n_children`.
-    first_child: u32,
-    n_children: u8,
+    /// Once expanded, the node's moves: `edges[first_edge..first_edge + n_edges]`.
+    first_edge: u32,
+    n_edges: u8,
     expanded: bool,
-    /// Claimed by the current round, awaiting evaluation.
     pending: bool,
-    /// The game's outcome here, or one proven from the children (MCTS-solver): a node with
-    /// a winning child is won, one whose children are all decided is drawn if any draws and
-    /// lost otherwise. Decided nodes are backed up exactly and never evaluated.
+    to_move: Player,
+    /// How the position ends: its result if the game is over there, or the result proven
+    /// from its children (see `try_prove`).
     outcome: Option<Outcome>,
 }
 
-/// The numbers PUCT selection reads for every child of a node, kept in their own array
-/// (parallel to the nodes, so siblings are contiguous) so that scanning the children of a
-/// node touches 16 bytes per child instead of the whole node.
+/// A legal move out of an expanded node.
+#[derive(Clone, Copy)]
+struct Edge {
+    mv: Move,
+    prior: f32,
+    /// The child node, `NO_NODE` until it is first selected.
+    child: u32,
+    /// The result of the position the move leads to when the game is over there, known at
+    /// expansion so that a win in one proves its parent without a visit.
+    terminal: Option<Outcome>,
+}
+
 #[derive(Clone, Copy)]
 struct Stats {
     visits: u32,
-    /// Virtual losses currently applied (paths through here claimed in the current round).
     virtual_losses: u32,
-    /// Sum of backed-up values, from the perspective of the side to move *at this node*.
     value_sum: f32,
-    prior: f32,
 }
 
-impl<S: GameState> Node<S> {
-    fn new(state: S, mv: Option<Move>, parent: u32) -> Self {
-        let outcome = state.outcome();
+impl Node {
+    fn new(parent: u32, to_move: Player, outcome: Option<Outcome>) -> Self {
         Self {
-            state,
-            mv,
             parent,
-            first_child: NO_NODE,
-            n_children: 0,
+            first_edge: NO_NODE,
+            n_edges: 0,
             expanded: false,
             pending: false,
+            to_move,
             outcome,
         }
     }
 
-    fn children(&self) -> std::ops::Range<u32> {
-        self.first_child..self.first_child + self.n_children as u32
+    fn edges(&self) -> std::ops::Range<usize> {
+        self.first_edge as usize..self.first_edge as usize + self.n_edges as usize
     }
 }
 
 impl Stats {
-    fn new(prior: f32) -> Self {
+    fn new() -> Self {
         Self {
             visits: 0,
             virtual_losses: 0,
             value_sum: 0.0,
-            prior,
         }
     }
 
-    /// Visits including virtual ones.
     fn effective_visits(&self) -> u32 {
         self.visits + self.virtual_losses
     }
 
-    /// Mean value from the perspective of the *parent's* side to move, with each virtual loss
-    /// counted as `virtual_loss` for this node's side (i.e. a loss for the parent).
     fn q_for_parent(&self, virtual_loss: f32) -> f32 {
         let n = self.effective_visits();
         if n == 0 {
@@ -183,20 +181,16 @@ impl Stats {
     }
 }
 
-/// Dirichlet noise mixed into the root priors once the root is expanded (AlphaZero's
-/// self-play exploration).
 #[derive(Clone, Debug)]
 pub struct RootNoise {
-    /// Dirichlet concentration; AlphaZero used `0.3` for chess, smaller for larger boards.
     pub alpha: f32,
-    /// Weight of the noise in the mixed prior, `0.25` in AlphaZero.
     pub fraction: f32,
     pub seed: u64,
 }
 
-enum Selection {
-    /// An unexpanded, unclaimed leaf.
-    Leaf(u32),
+enum Selection<S> {
+    /// An unexpanded, unclaimed node and its position.
+    Leaf(u32, S),
     /// A terminal node and its value for the side to move there.
     Terminal(u32, f32),
     /// Selection ran into a leaf already claimed in this round.
@@ -208,13 +202,15 @@ enum Selection {
 /// Call [`SearchTree::claim`] to get leaves to evaluate, evaluate them however you like, and
 /// hand the results to [`SearchTree::resolve`]; repeat until [`SearchTree::is_done`].
 pub struct SearchTree<S: GameState> {
-    nodes: Vec<Node<S>>,
+    root: S,
+    nodes: Vec<Node>,
     /// `stats[i]` belongs to `nodes[i]`.
     stats: Vec<Stats>,
+    edges: Vec<Edge>,
     c_puct: f32,
     virtual_loss: f32,
-    /// Leaves claimed in the current round, in claim order.
-    claimed: Vec<u32>,
+    /// Leaves claimed in the current round with their positions, in claim order.
+    claimed: Vec<(u32, S)>,
     /// Simulations completed (leaf evaluations plus terminal hits).
     completed: u32,
     budget: u32,
@@ -224,9 +220,12 @@ pub struct SearchTree<S: GameState> {
 impl<S: GameState> SearchTree<S> {
     /// A search from `root` of `simulations` leaf evaluations.
     pub fn new(root: S, simulations: u32, c_puct: f32, virtual_loss: f32) -> Self {
+        let node = Node::new(NO_NODE, root.to_move(), root.outcome());
         Self {
-            nodes: vec![Node::new(root, None, NO_NODE)],
-            stats: vec![Stats::new(1.0)],
+            root,
+            nodes: vec![node],
+            stats: vec![Stats::new()],
+            edges: Vec::new(),
             c_puct,
             virtual_loss,
             claimed: Vec::new(),
@@ -244,7 +243,7 @@ impl<S: GameState> SearchTree<S> {
     }
 
     pub fn root(&self) -> &S {
-        &self.nodes[0].state
+        &self.root
     }
 
     pub fn is_done(&self) -> bool {
@@ -275,11 +274,11 @@ impl<S: GameState> SearchTree<S> {
                         break;
                     }
                 }
-                Selection::Leaf(idx) => {
+                Selection::Leaf(idx, state) => {
                     self.nodes[idx as usize].pending = true;
                     self.add_virtual_loss(idx);
-                    self.claimed.push(idx);
-                    out.push(self.nodes[idx as usize].state.clone());
+                    out.push(state.clone());
+                    self.claimed.push((idx, state));
                 }
                 // Every path leads to an already-claimed leaf: evaluate what we have.
                 Selection::Blocked => break,
@@ -296,11 +295,13 @@ impl<S: GameState> SearchTree<S> {
             "one evaluation per claimed leaf"
         );
         let claimed = std::mem::take(&mut self.claimed);
-        for (i, &idx) in claimed.iter().enumerate() {
+        for (i, (idx, state)) in claimed.iter().enumerate() {
+            let idx = *idx;
             self.remove_virtual_loss(idx);
             self.nodes[idx as usize].pending = false;
             let value = self.expand(
                 idx,
+                state,
                 evaluations.value(offset + i),
                 evaluations.priors(offset + i),
             );
@@ -311,12 +312,28 @@ impl<S: GameState> SearchTree<S> {
         self.claimed.clear();
     }
 
+    /// The known result behind an edge: the child's (possibly proven) outcome if it exists,
+    /// else the terminal result recorded at expansion.
+    fn edge_outcome(&self, edge: &Edge) -> Option<Outcome> {
+        match edge.child {
+            NO_NODE => edge.terminal,
+            child => self.nodes[child as usize].outcome,
+        }
+    }
+
+    fn edge_visits(&self, edge: &Edge) -> u32 {
+        match edge.child {
+            NO_NODE => 0,
+            child => self.stats[child as usize].visits,
+        }
+    }
+
     /// Root statistics so far. A decided root reports the exact value; when it is proven
     /// (won or drawn) only the moves that keep that result keep their visits, so that the
     /// move choice and the policy target follow the proof.
     pub fn result(&self) -> SearchResult {
         let root = &self.nodes[0];
-        let to_move = root.state.to_move();
+        let to_move = root.to_move;
         if let Some(outcome) = root.outcome {
             if !root.expanded {
                 return SearchResult {
@@ -325,22 +342,22 @@ impl<S: GameState> SearchTree<S> {
                 };
             }
         }
-        let keeps_result = |child: &Node<S>| match root.outcome {
-            Some(Outcome::Win(p)) if p == to_move => child.outcome == Some(Outcome::Win(p)),
-            Some(Outcome::Draw) => child.outcome == Some(Outcome::Draw),
+        let keeps_result = |result: Option<Outcome>| match root.outcome {
+            Some(Outcome::Win(p)) if p == to_move => result == Some(Outcome::Win(p)),
+            Some(Outcome::Draw) => result == Some(Outcome::Draw),
             _ => true,
         };
-        let visits = root
-            .children()
-            .map(|c| {
-                let (child, stats) = (&self.nodes[c as usize], &self.stats[c as usize]);
-                let mv = child.mv.expect("child has a move");
+        let visits = self.edges[root.edges()]
+            .iter()
+            .map(|edge| {
                 let n = match root.outcome {
-                    Some(_) if keeps_result(child) => stats.visits.max(1),
+                    Some(_) if keeps_result(self.edge_outcome(edge)) => {
+                        self.edge_visits(edge).max(1)
+                    }
                     Some(_) => 0,
-                    None => stats.visits,
+                    None => self.edge_visits(edge),
                 };
-                (mv, n)
+                (edge.mv, n)
             })
             .collect();
         let root_stats = &self.stats[0];
@@ -351,37 +368,59 @@ impl<S: GameState> SearchTree<S> {
         SearchResult { root_value, visits }
     }
 
-    fn select_leaf(&self) -> Selection {
+    /// Walks down from the root by PUCT, carrying the position and creating child nodes as
+    /// they are first reached.
+    fn select_leaf(&mut self) -> Selection<S> {
         let mut idx = 0u32;
+        let mut state = self.root.clone();
         loop {
             let node = &self.nodes[idx as usize];
             if let Some(outcome) = node.outcome {
-                return Selection::Terminal(idx, outcome.value_for(node.state.to_move()));
+                return Selection::Terminal(idx, outcome.value_for(node.to_move));
             }
             if !node.expanded {
                 return if node.pending {
                     Selection::Blocked
                 } else {
-                    Selection::Leaf(idx)
+                    Selection::Leaf(idx, state)
                 };
             }
-            idx = self.select_child(idx);
+            let e = self.select_edge(idx);
+            let edge = self.edges[e];
+            state.apply(edge.mv);
+            idx = match edge.child {
+                NO_NODE => {
+                    let child = self.nodes.len() as u32;
+                    self.nodes
+                        .push(Node::new(idx, state.to_move(), edge.terminal));
+                    self.stats.push(Stats::new());
+                    self.edges[e].child = child;
+                    child
+                }
+                child => child,
+            };
         }
     }
 
-    fn select_child(&self, idx: u32) -> u32 {
-        let children = self.nodes[idx as usize].children();
+    /// The edge of `idx` with the best PUCT score; ties go to the first.
+    fn select_edge(&self, idx: u32) -> usize {
+        let edges = self.nodes[idx as usize].edges();
         let sqrt_n = (self.stats[idx as usize].effective_visits() as f32).sqrt();
-        let mut best = children.start;
+        let mut best = edges.start;
         let mut best_score = f32::NEG_INFINITY;
-        let first = children.start as usize;
-        for (i, child) in self.stats[first..children.end as usize].iter().enumerate() {
-            let exploration =
-                self.c_puct * child.prior * sqrt_n / (1.0 + child.effective_visits() as f32);
-            let score = child.q_for_parent(self.virtual_loss) + exploration;
+        for e in edges {
+            let edge = &self.edges[e];
+            let (q, n) = match edge.child {
+                NO_NODE => (0.0, 0),
+                child => {
+                    let stats = &self.stats[child as usize];
+                    (stats.q_for_parent(self.virtual_loss), stats.effective_visits())
+                }
+            };
+            let score = q + self.c_puct * edge.prior * sqrt_n / (1.0 + n as f32);
             if score > best_score {
                 best_score = score;
-                best = (first + i) as u32;
+                best = e;
             }
         }
         best
@@ -413,10 +452,10 @@ impl<S: GameState> SearchTree<S> {
         }
     }
 
-    /// Creates the children of `idx` from the prior row (indexed by `Move::index`; only legal
-    /// moves' entries are read, and an unusable row means uniform); returns the clamped value.
-    fn expand(&mut self, idx: u32, value: f32, priors: Option<&[f32; Move::COUNT]>) -> f32 {
-        let state = self.nodes[idx as usize].state.clone();
+    /// Creates the edges of `idx` (at position `state`) from the prior row (indexed by
+    /// `Move::index`; only legal moves' entries are read, and an unusable row means uniform);
+    /// returns the clamped value.
+    fn expand(&mut self, idx: u32, state: &S, value: f32, priors: Option<&[f32; Move::COUNT]>) -> f32 {
         let moves = state.legal_moves();
         debug_assert!(!moves.is_empty(), "non-terminal state without legal moves");
 
@@ -426,7 +465,7 @@ impl<S: GameState> SearchTree<S> {
         let uniform = total <= 1e-12;
         let n = moves.len();
 
-        let first_child = self.nodes.len() as u32;
+        let first_edge = self.edges.len() as u32;
         for mv in moves {
             let prior = match priors {
                 Some(p) if !uniform => p[mv.index()].max(0.0) / total,
@@ -434,13 +473,17 @@ impl<S: GameState> SearchTree<S> {
             };
             let mut child_state = state.clone();
             child_state.apply(mv);
-            self.nodes.push(Node::new(child_state, Some(mv), idx));
-            self.stats.push(Stats::new(prior));
+            self.edges.push(Edge {
+                mv,
+                prior,
+                child: NO_NODE,
+                terminal: child_state.outcome(),
+            });
         }
 
         let node = &mut self.nodes[idx as usize];
-        node.first_child = first_child;
-        node.n_children = n as u8;
+        node.first_edge = first_edge;
+        node.n_edges = n as u8;
         node.expanded = true;
         if idx == 0 {
             self.apply_root_noise();
@@ -449,7 +492,7 @@ impl<S: GameState> SearchTree<S> {
             self.propagate_proof(idx);
         }
         match self.nodes[idx as usize].outcome {
-            Some(outcome) => outcome.value_for(self.nodes[idx as usize].state.to_move()),
+            Some(outcome) => outcome.value_for(self.nodes[idx as usize].to_move),
             None => value.clamp(-1.0, 1.0),
         }
     }
@@ -461,12 +504,12 @@ impl<S: GameState> SearchTree<S> {
         if node.outcome.is_some() || !node.expanded {
             return false;
         }
-        let me = node.state.to_move();
+        let me = node.to_move;
         let mut all_decided = true;
         let mut any_draw = false;
         let mut proven = None;
-        for c in node.children() {
-            match self.nodes[c as usize].outcome {
+        for e in node.edges() {
+            match self.edge_outcome(&self.edges[e]) {
                 Some(Outcome::Win(p)) if p == me => {
                     proven = Some(Outcome::Win(me));
                     break;
@@ -502,12 +545,15 @@ impl<S: GameState> SearchTree<S> {
                 return;
             };
             let parent = node.parent;
-            let lost_by_mover = outcome == Outcome::Win(node.state.to_move());
+            let lost_by_mover = outcome == Outcome::Win(node.to_move);
             if parent == NO_NODE {
                 return;
             }
             if lost_by_mover {
-                self.stats[idx as usize].prior = 0.0;
+                let edges = self.nodes[parent as usize].edges();
+                if let Some(e) = edges.into_iter().find(|&e| self.edges[e].child == idx) {
+                    self.edges[e].prior = 0.0;
+                }
             }
             if !self.try_prove(parent) {
                 return;
@@ -520,22 +566,19 @@ impl<S: GameState> SearchTree<S> {
         let Some((noise, rng)) = self.noise.as_mut() else {
             return;
         };
-        let children = self.nodes[0].children();
-        let sample = dirichlet(rng, noise.alpha, children.len());
-        for (c, d) in children.zip(sample) {
-            let child = &mut self.stats[c as usize];
-            child.prior = (1.0 - noise.fraction) * child.prior + noise.fraction * d;
+        let edges = self.nodes[0].edges();
+        let sample = dirichlet(rng, noise.alpha, edges.len());
+        for (e, d) in edges.zip(sample) {
+            let edge = &mut self.edges[e];
+            edge.prior = (1.0 - noise.fraction) * edge.prior + noise.fraction * d;
         }
     }
 
     #[cfg(test)]
     pub(crate) fn root_children(&self) -> Vec<(Move, f32, u32)> {
-        self.nodes[0]
-            .children()
-            .map(|c| {
-                let (n, s) = (&self.nodes[c as usize], &self.stats[c as usize]);
-                (n.mv.unwrap(), s.prior, s.visits)
-            })
+        self.edges[self.nodes[0].edges()]
+            .iter()
+            .map(|edge| (edge.mv, edge.prior, self.edge_visits(edge)))
             .collect()
     }
 
@@ -548,8 +591,10 @@ impl<S: GameState> SearchTree<S> {
             assert_eq!(stats.virtual_losses, 0, "node {i} has virtual losses");
             assert!(!node.pending, "node {i} still pending");
             if node.expanded {
-                let child_visits: u32 =
-                    node.children().map(|c| self.stats[c as usize].visits).sum();
+                let child_visits: u32 = self.edges[node.edges()]
+                    .iter()
+                    .map(|edge| self.edge_visits(edge))
+                    .sum();
                 if node.outcome.is_some() {
                     // Proven nodes are backed up exactly without visiting their children.
                     assert!(stats.visits >= child_visits + 1, "node {i} visit mismatch");
