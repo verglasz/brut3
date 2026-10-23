@@ -413,6 +413,13 @@ fn book(
     );
     let start = Instant::now();
     let round_start = std::cell::Cell::new(Instant::now());
+    let save = |book: &Book| {
+        let header = vec![
+            format!("ultimate-ttt opening book: {} entries, plies up to {plies}", book.len()),
+            format!("searched by {spec}; replies covered from {min_prior} of the visits"),
+        ];
+        book.save(out, &header)
+    };
     let added = book.extend(
         &mut evaluator,
         &search_cfg,
@@ -424,8 +431,7 @@ fn book(
         |done, total| {
             if done.is_multiple_of(50) || done == total {
                 print!(
-                    "
-  {done}/{total} ({:.0}s)",
+                    "\r  {done}/{total} ({:.0}s)",
                     round_start.get().elapsed().as_secs_f32()
                 );
                 let _ = io::stdout().flush();
@@ -434,12 +440,12 @@ fn book(
                 }
             }
         },
-    );
-    let header = vec![
-        format!("ultimate-ttt opening book: {} entries to ply {plies}", book.len()),
-        format!("searched by {spec}; replies covered from {min_prior} of the visits"),
-    ];
-    book.save(out, &header)?;
+        |book| {
+            save(book)?;
+            println!("  saved {} entries to {}", book.len(), out.display());
+            Ok(())
+        },
+    )?;
     println!(
         "added {added} entries in {:.0}s; {} entries saved to {}",
         start.elapsed().as_secs_f32(),

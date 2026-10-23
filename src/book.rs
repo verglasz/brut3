@@ -216,8 +216,9 @@ impl Book {
 
     /// Searches the frontier under `cfg` with `search` over `evaluator`, round after round
     /// (each round one ply deeper), until the book is complete to `cfg.plies`. `log` gets a
-    /// line per round; `on_done` the count of positions searched so far in the round.
-    /// Returns the number of entries added.
+    /// line per round; `on_done` the count of positions searched so far in the round;
+    /// `after_round` the book after each round's entries are in (to save it provisionally),
+    /// and its error ends the run. Returns the number of entries added.
     pub fn extend<A: UtttAgent<State = BitState>>(
         &mut self,
         evaluator: &mut A,
@@ -225,7 +226,8 @@ impl Book {
         cfg: &BookConfig,
         mut log: impl FnMut(String),
         mut on_done: impl FnMut(usize, usize),
-    ) -> usize {
+        mut after_round: impl FnMut(&Book) -> Result<(), String>,
+    ) -> Result<usize, String> {
         let before = self.len();
         loop {
             let frontier = self.frontier(cfg);
@@ -255,8 +257,9 @@ impl Book {
                     self.entries.insert(key_of(state), entry);
                 }
             }
+            after_round(self)?;
         }
-        self.len() - before
+        Ok(self.len() - before)
     }
 }
 
@@ -458,8 +461,23 @@ mod tests {
         let mut evaluator = RandomAgent::<BitState>::new(1);
         let mut book = Book::default();
         let mut rounds = Vec::new();
-        let added = book.extend(&mut evaluator, &search, &cfg, |l| rounds.push(l), |_, _| {});
+        let mut saves = 0;
+        let added = book
+            .extend(
+                &mut evaluator,
+                &search,
+                &cfg,
+                |l| rounds.push(l),
+                |_, _| {},
+                |b| {
+                    saves += 1;
+                    assert!(!b.is_empty());
+                    Ok(())
+                },
+            )
+            .unwrap();
         assert_eq!(added, book.len());
+        assert_eq!(saves, 3);
         assert_eq!(rounds.len(), 3, "{rounds:?}");
         assert!(rounds[0].contains("1 positions at ply 0"));
         assert!(book.best_move(&BitState::initial()).is_some());
