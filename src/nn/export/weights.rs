@@ -161,6 +161,12 @@ impl Weights {
         debug_assert_eq!(IDS_PER_BOARD, 1 + CELLS);
     }
 
+    /// The spec string of the model, e.g. `nnue 64 128 32 2`.
+    pub fn config_display(&self) -> String {
+        let c = &self.config;
+        format!("nnue {} {} {} {}", c.d_embed, c.d_acc, c.d_hidden, c.layers)
+    }
+
     /// Number of trained parameters.
     pub fn parameters(&self) -> usize {
         self.arrays().iter().map(|a| a.data.len()).sum()

@@ -49,6 +49,28 @@ enum Command {
     /// List the backends compiled into this binary.
     #[cfg(feature = "nn")]
     Backends,
+    /// Export an nnue model as generated Haskell sources for the base-only engine.
+    #[cfg(feature = "nn")]
+    Export {
+        /// Model stem (`<stem>.bpk` + `<stem>.json`), an nnue model.
+        #[arg(long)]
+        model: std::path::PathBuf,
+        /// Directory to write `<module>/*.hs` under.
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Module prefix and directory name.
+        #[arg(long, default_value = "Gen")]
+        module: String,
+        /// Backend to load the model with (default: fastest compiled in).
+        #[arg(long)]
+        backend: Option<String>,
+        /// Reference positions to emit for the port's tests.
+        #[arg(long, default_value_t = 16)]
+        positions: usize,
+        /// Seed of the random games the reference positions come from.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
     /// Build or deepen an opening book by searching the positions of the first plies with a
     /// search agent, e.g. `book --search "mcts-nn models/big cuda 100000 16" --out models/book.txt`.
     /// An existing book file is extended.
@@ -352,6 +374,15 @@ fn main() -> ExitCode {
         } => book(&search, &out, plies, min_prior, concurrent),
         #[cfg(feature = "nn")]
         Command::ImportUtttai { paths, out } => import_utttai(&paths, &out),
+        #[cfg(feature = "nn")]
+        Command::Export {
+            model,
+            out,
+            module,
+            backend,
+            positions,
+            seed,
+        } => export(&model, &out, module, backend.as_deref(), positions, seed),
         #[cfg(feature = "nn")]
         Command::Backends => {
             use ultimate_ttt_burn::nn::BackendKind;
@@ -681,6 +712,43 @@ fn import_utttai(paths: &[std::path::PathBuf], out: &std::path::Path) -> Result<
     );
     games::save(out, &data)?;
     println!("saved to {}", out.display());
+    Ok(())
+}
+
+#[cfg(feature = "nn")]
+fn export(
+    model: &std::path::Path,
+    out: &std::path::Path,
+    module: String,
+    backend: Option<&str>,
+    positions: usize,
+    seed: u64,
+) -> Result<(), String> {
+    use ultimate_ttt_burn::nn::export::{ExportOptions, Weights, write_all};
+    use ultimate_ttt_burn::nn::{AnyModel, BackendKind};
+
+    let backend = match backend {
+        Some(name) => name.parse::<BackendKind>()?,
+        None => BackendKind::preferred(),
+    };
+    let weights = match AnyModel::load(model, &backend.device())? {
+        AnyModel::Nnue(m) => Weights::from_model(&m),
+        other => return Err(format!("{} is a {} model, not nnue", model.display(), other.spec())),
+    };
+    println!(
+        "{}: {} parameters",
+        weights.config_display(),
+        weights.parameters()
+    );
+    let opts = ExportOptions {
+        prefix: module,
+        positions,
+        seed,
+    };
+    let report = write_all(&weights, out, &opts)?;
+    for (path, bytes) in &report.files {
+        println!("wrote {} ({} bytes)", path.display(), bytes);
+    }
     Ok(())
 }
 

@@ -8,9 +8,12 @@
 //!   dense layers, and a softmax over the legal moves only. It is the executable
 //!   specification the generated Haskell is checked against, and the place where the
 //!   quantisation error of an export is measured without a GHC in the loop.
+//! - [`haskell`]: the generated Haskell modules.
 
+pub mod haskell;
 pub mod scalar;
 pub mod weights;
 
+pub use haskell::{ExportOptions, write_all};
 pub use scalar::Evaluation;
 pub use weights::{Array, Dense, Matrix, Weights};
