@@ -183,8 +183,12 @@ lockstep matches too, and the search starts at the first position outside the bo
   int16-quantised with one scale per array, little-endian, base64 in string literals of
   64 KB (lines of 1024 characters joined by string gaps). Matrices are one row per output
   (burn's `[d_in, d_out]` transposed), `W_mix` split into `mix0..mix8`.
-- `Decode.hs`: base64 to signed 16-bit values; `decodeRows` for one array, which checks the
-  value count.
+- The literal decoder is not generated: the Haskell project's hand-written `Decode` module
+  (`lib/Decode.hs`, streaming one pass over the pieces) provides `decodeRowsWith`,
+  `decodeFloats`, `decodeBytes`, `chunksOf`; `Net.hs` builds rows with `decodeRowsWith` and
+  `fromListRestN`. `Weights.hs` compiles at the project's `-O2` on purpose: at `-O0` its
+  literals are updatable CAFs whose unpacked characters stay alive during decoding (53 MB
+  peak residency instead of 18).
 - `Net.hs`: the `Net` record decoded from the stream on first use (`net`), `foldRow`,
   `accumulateRows`, `hiddenOf`, `wdlOf`, `policyLogit`. Imports `FixedVec` (the
   Haskell project's `gen/vecgen.py` output: `VecN`, `RowsM_N`, `dotN`, `selM_N`,

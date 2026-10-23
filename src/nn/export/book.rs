@@ -163,7 +163,7 @@ pub fn book_modules(
         "module {prefix}.Book (BookKey, bookKey, bookEntries, squarePermutations) where\n"
     );
     let _ = writeln!(s, "import Data.Word (Word64)");
-    let _ = writeln!(s, "import {prefix}.Decode (decodeBytes)\n");
+    let _ = writeln!(s, "import Decode (decodeBytes)\n");
     s.push_str(
         r#"-- | A position's key: the 81 cell digits (0 empty, 1 X, 2 O, by board * 9 + square) as
 -- three base-3 numbers of 27 digits, most significant first, the last times ten plus the

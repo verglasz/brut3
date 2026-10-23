@@ -67,8 +67,8 @@ pub struct Report {
     pub book: Option<super::book::BookStats>,
 }
 
-/// Writes every generated module under `out`: the network's modules for `weights`, the
-/// opening book's for `book`, and the decoder either way.
+/// Writes every generated module under `out`: the network's modules for `weights` and the
+/// opening book's for `book`. Both import the Haskell project's hand-written `Decode`.
 pub fn write_all(
     weights: Option<&Weights>,
     book: Option<&Book>,
@@ -85,7 +85,6 @@ pub fn write_all(
         report.files.push((path, text.len()));
         Ok(())
     };
-    emit("Decode", codegen::decode_module(&opts.prefix))?;
     if let Some(weights) = weights {
         let rounded = weights.dequantised();
         let names = codegen::Names::new(&weights.config);
@@ -143,10 +142,11 @@ pub fn weights_module(
     let bytes: usize = arrays.iter().map(|a| a.bytes.len()).sum();
     let mut s = String::with_capacity(bytes * 4 / 3 + 4096);
     banner(&mut s, &format!("{prefix}.Weights"), "(Array (..), arrays)");
-    // Nothing to optimise here, and the literals are large.
+    // Not -O0: at -O0 every literal is an updatable CAF whose unpacked characters stay
+    // alive while the network is built; at -O1 and above they are re-unpacked on demand.
     s = s.replacen(
         "{- FOURMOLU_DISABLE -}\n",
-        "{- FOURMOLU_DISABLE -}\n{-# LANGUAGE Safe #-}\n{-# OPTIONS_GHC -O0 #-}\n",
+        "{- FOURMOLU_DISABLE -}\n{-# LANGUAGE Safe #-}\n",
         1,
     );
     s.push_str(
