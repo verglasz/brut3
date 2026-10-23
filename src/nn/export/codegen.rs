@@ -2,19 +2,32 @@
 //! fixed-width vector family, plus the stream decoder and a self-test.
 //!
 //! The vector types are not generated here. The Haskell side owns a `FixedVec` module made by
-//! its `gen/vecgen.py` (strict records `VecN`, row containers `RowsM_N`, `dotN`, `selM_N`,
-//! `linearM_N`/`denseM_N`/`residualM_M`, `sumK_N`/`reluSumK_N`, ...); the generated modules
-//! import it and alias the role widths (`type VecA = Vec512`). [`vecgen_command`] lists the
-//! shapes a configuration needs, as the command line that generates them.
+//! its `gen/vecgen.py` (strict records `VecN`, wide ones nested as chunks of `Vec64`, row
+//! containers `RowsM_N`, `dotN`, `selM_N`, `linearM_N`/`denseM_N`/`residualM_M`, `concatK_N`,
+//! ...); the generated modules import it and alias the role widths (`type VecA = Vec512`).
+//! [`vecgen_command`] lists the shapes a configuration needs, as the command line that
+//! generates them. The layout follows the Haskell project's vector codegen notes: the fold
+//! runs in 64-row pieces, the feature table is split by row range into four tables indexed
+//! by local ids, the policy head is grouped per board, and sums are folds of binary adds.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
+use crate::game::LINES;
 use crate::nn::model::MOVES;
 use crate::nn::nnue::{
-    BOARDS, CELLS, CONTENT_ROWS, CONTENTS, FEATURE_IDS, FEATURE_ROWS, IDS_PER_BOARD, NnueConfig,
-    TOKENS,
+    BOARDS, CELLS, CONTENT_ROWS, CONTENTS, DECIDED_BASE, FEATURE_ROWS, FORCED_BASE, IDS_PER_BOARD,
+    LINE_BASE, LINE_STATES, NnueConfig, OPEN_MARKS_BASE,
 };
+
+/// Width of a chunk of a wide vector, and of the fold's row pieces.
+pub const CHUNK: usize = 64;
+
+/// Rows of the four feature tables, in row order: forced board, the eight lines, decided
+/// boards, marks on open boards.
+const FORCED_FEATURES: usize = LINE_BASE - FORCED_BASE;
+const DECIDED_FEATURES: usize = OPEN_MARKS_BASE - DECIDED_BASE;
+const MARKS_FEATURES: usize = FEATURE_ROWS - OPEN_MARKS_BASE;
 
 /// The widths a configuration's code is generated with.
 pub struct Names {
@@ -26,6 +39,14 @@ pub struct Names {
 
 impl Names {
     pub fn new(c: &NnueConfig) -> Self {
+        assert!(
+            c.d_acc % CHUNK == 0,
+            "d_acc must be a multiple of {CHUNK} for the chunked export"
+        );
+        assert!(
+            c.d_hidden <= CHUNK || c.d_hidden % CHUNK == 0,
+            "d_hidden must be at most {CHUNK} or a multiple of it"
+        );
         Self {
             e: c.d_embed,
             a: c.d_acc,
@@ -42,25 +63,35 @@ impl Names {
         format!("Rows{m}_{n}")
     }
 
-    /// `(m, n)` dense shapes: the fold, the hidden layers, the value head and the skip.
+    /// Chunks of the accumulator.
+    fn pieces(&self) -> usize {
+        self.a / CHUNK
+    }
+
+    /// `(m, n)` dense shapes: the fold pieces, the hidden layers, the value head, the skip
+    /// and the per-board policy.
     fn dense(&self) -> Vec<(usize, usize)> {
-        let mut shapes = vec![(self.a, self.e), (self.h, self.a)];
+        let mut shapes = vec![(CHUNK, self.e), (self.h, self.a)];
         if self.layers > 1 {
             shapes.push((self.h, self.h));
         }
-        shapes.extend([(3, self.h), (3, self.a)]);
+        shapes.extend([(3, self.h), (3, self.a), (CELLS, self.h)]);
         shapes
     }
 
-    /// Row containers read by index.
+    /// Row containers read by index: the feature tables.
     fn selected(&self) -> Vec<(usize, usize)> {
-        vec![(FEATURE_ROWS, self.a), (MOVES, self.h)]
+        vec![
+            (FORCED_FEATURES, self.a),
+            (LINE_STATES, self.a),
+            (MARKS_FEATURES, self.a),
+        ]
     }
 }
 
 /// The `gen/vecgen.py` command line that generates every shape the configuration needs.
 pub fn vecgen_command(names: &Names) -> String {
-    let widths: BTreeSet<usize> = [3, CELLS, MOVES, names.e, names.a, names.h].into();
+    let widths: BTreeSet<usize> = [3, CELLS, CHUNK, names.e, names.a, names.h].into();
     let pairs = |shapes: &[(usize, usize)]| {
         shapes
             .iter()
@@ -69,11 +100,17 @@ pub fn vecgen_command(names: &Names) -> String {
             .join(",")
     };
     let widths: Vec<String> = widths.iter().map(|w| w.to_string()).collect();
+    let mut nest = vec![format!("{}={}x{CHUNK}", names.a, names.pieces())];
+    if names.h > CHUNK {
+        nest.push(format!("{}={}x{CHUNK}", names.h, names.h / CHUNK));
+    }
     format!(
-        "python3 gen/vecgen.py --float {} --rows {} --dense {} --module FixedVec -o lib/FixedVec.hs",
+        "python3 gen/vecgen.py --float {} --nest {} --rows {} --dense {} --concat {}:{CHUNK} --module FixedVec -o lib/FixedVec.hs",
         widths.join(" "),
+        nest.join(","),
         pairs(&names.selected()),
-        pairs(&names.dense())
+        pairs(&names.dense()),
+        names.pieces()
     )
 }
 
@@ -105,7 +142,7 @@ pub fn decode_module(prefix: &str) -> String {
     header(
         &mut s,
         &format!("{prefix}.Decode"),
-        "(decodeBytes, decodeStream, decodeRows, only, single)",
+        "(decodeBytes, decodeStream, decodeRows, decodeFloats, chunksOf)",
         "-O2 -fobject-code",
     );
     s.push_str(
@@ -152,13 +189,18 @@ decodeRows name rows cols scale mk pieces = go rows (decodeStream (concat pieces
           v = if length row == cols then mk (map (\q -> fromIntegral q * scale) row) else error ("decodeRows: " ++ name ++ " has fewer values than rows * cols")
        in v `seq` (v : go (n - 1) rest)
 
--- | The one element of a one-element list (a bias row, a one-column value).
-only :: [a] -> a
-only [x] = x
-only xs = error ("only: " ++ show (length xs) ++ " elements")
+-- | Exactly @count@ scaled values from an array's base64 pieces.
+decodeFloats :: String -> Int -> Float -> [String] -> [Float]
+decodeFloats name count scale pieces =
+  let values = decodeStream (concat pieces)
+   in if length values == count
+        then map (\q -> fromIntegral q * scale) values
+        else error ("decodeFloats: " ++ name ++ " has " ++ show (length values) ++ " values, not " ++ show count)
 
-single :: [Float] -> Float
-single = only
+-- | Consecutive pieces of @n@ elements.
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf _ [] = []
+chunksOf n xs = let (piece, rest) = splitAt n xs in piece : chunksOf n rest
 "#,
     );
     s
@@ -167,15 +209,9 @@ single = only
 /// `Net.hs`: the decoded network and its forward pass.
 pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> String {
     let (e, a, h) = (names.e, names.a, names.h);
+    let k = names.pieces();
     let mut s = String::new();
-    // The accumulator sum inlines twenty `combineN`s of width A; the simplifier's default
-    // tick budget (which scales with the module's size) is not enough for that at A = 512.
-    header(
-        &mut s,
-        &format!("{prefix}.Net"),
-        "",
-        "-O2 -fobject-code -fsimpl-tick-factor=400",
-    );
+    header(&mut s, &format!("{prefix}.Net"), "", "-O2 -fobject-code");
     let _ = writeln!(
         s,
         "-- Needs the FixedVec module generated by:\n--   {}\n",
@@ -186,7 +222,12 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
     let _ = writeln!(s, "import {prefix}.Weights (Array (..), arrays)\n");
     let _ = writeln!(s, "type VecE = {}", Names::vec(e));
     let _ = writeln!(s, "type VecA = {}", Names::vec(a));
-    let _ = writeln!(s, "type VecH = {}\n", Names::vec(h));
+    let _ = writeln!(s, "type VecH = {}", Names::vec(h));
+    let _ = writeln!(
+        s,
+        "-- | {CHUNK} rows of the fold: a piece of a board's first-layer slice."
+    );
+    let _ = writeln!(s, "type FoldPiece = {}\n", Names::rows(CHUNK, e));
 
     // The record.
     let _ = writeln!(s, "data Net = Net");
@@ -198,21 +239,38 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
         ),
         (
             "netMix".into(),
-            format!("[{}]", Names::rows(a, e)),
-            "board k's first-layer slice, transposed",
+            "[[FoldPiece]]".into(),
+            "board k's first-layer slice, transposed, in pieces of 64 rows",
         ),
         ("netMixBias".into(), "VecA".into(), ""),
         (
             "netForced".into(),
-            Names::rows(a, e),
+            "[FoldPiece]".into(),
             "the forced board's slice",
         ),
         (
-            "netFeatures".into(),
-            Names::rows(FEATURE_ROWS, a),
-            "feature rows by id",
+            "netForcedFeature".into(),
+            Names::rows(FORCED_FEATURES, a),
+            "feature rows by forced board (9 = free)",
         ),
     ];
+    for l in 0..LINES.len() {
+        fields.push((
+            format!("netLineFeature{l}"),
+            Names::rows(LINE_STATES, a),
+            "feature rows of a big-board line by 16 a + 4 b + c (0 open, 1 mine, 2 theirs, 3 full)",
+        ));
+    }
+    fields.push((
+        "netDecidedFeature".into(),
+        Names::rows(DECIDED_FEATURES, a),
+        "feature rows by number of decided boards",
+    ));
+    fields.push((
+        "netMarksFeature".into(),
+        Names::rows(MARKS_FEATURES, a),
+        "feature rows by marks on open boards",
+    ));
     for i in 0..names.layers {
         let shape = if i == 0 {
             Names::rows(h, a)
@@ -226,12 +284,16 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
         ("netValue".into(), Names::rows(3, h), ""),
         ("netValueBias".into(), Names::vec(3), ""),
         ("netSkip".into(), Names::rows(3, a), ""),
-        (
-            "netPolicy".into(),
-            Names::rows(MOVES, h),
-            "global policy rows by move",
-        ),
-        ("netPolicyBias".into(), Names::vec(MOVES), ""),
+    ]);
+    for b in 0..BOARDS {
+        fields.push((
+            format!("netPolicy{b}"),
+            Names::rows(CELLS, h),
+            "global policy rows of board b's nine squares",
+        ));
+        fields.push((format!("netPolicyBias{b}"), Names::vec(CELLS), ""));
+    }
+    fields.extend([
         (
             "netLocal".into(),
             format!("[{}]", Names::vec(CELLS)),
@@ -255,6 +317,13 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
     let _ = writeln!(s, "  }}\n");
 
     // Decoding: every array from its own text, after checking names and shapes.
+    let position = |name: &str| {
+        manifest_names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("{name} array"))
+    };
+    let (features_index, policy_index) = (position("features"), position("policy"));
     let _ = writeln!(
         s,
         "-- | The network, decoded from the weight arrays on first use."
@@ -263,135 +332,192 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
     let _ = writeln!(s, "net =");
     let _ = writeln!(
         s,
-        "  let rows r c mk a = if arrayRows a == r && arrayCols a == c then decodeRows (arrayName a) r c (arrayScale a) mk (arrayText a) else error (\"weights: \" ++ arrayName a ++ \" is not \" ++ show r ++ \"x\" ++ show c)"
+        "  let shaped r c a = if arrayRows a == r && arrayCols a == c then a else error (\"weights: \" ++ arrayName a ++ \" is not \" ++ show r ++ \"x\" ++ show c)"
+    );
+    let _ = writeln!(
+        s,
+        "      rows r c mk a = let a' = shaped r c a in decodeRows (arrayName a') r c (arrayScale a') mk (arrayText a')"
+    );
+    let _ = writeln!(
+        s,
+        "      floats r c a = let a' = shaped r c a in decodeFloats (arrayName a') (r * c) (arrayScale a') (arrayText a')"
+    );
+    let _ = writeln!(
+        s,
+        "      pieces r = map fromListRows{CHUNK}_{e} (chunksOf {CHUNK} r)"
     );
     let _ = writeln!(s, "      expected = {}", hs_strings(manifest_names));
     let _ = writeln!(s, "   in case arrays of");
     let vars_: Vec<String> = (0..manifest_names.len()).map(|i| format!("a{i}")).collect();
     let _ = writeln!(
         s,
-        "        [{}] | map arrayName arrays == expected -> Net",
+        "        [{}] | map arrayName arrays == expected ->",
         vars_.join(", ")
     );
+    // The feature rows are split by range once; the policy rows are grouped per board.
+    let _ = writeln!(
+        s,
+        "          let features = rows {FEATURE_ROWS} {a} fromList{a} a{features_index}"
+    );
+    let _ = writeln!(
+        s,
+        "              (fForced, afterForced) = splitAt {FORCED_FEATURES} features"
+    );
+    let _ = writeln!(
+        s,
+        "              (fLines, afterLines) = splitAt {} afterForced",
+        LINES.len() * LINE_STATES
+    );
+    let _ = writeln!(
+        s,
+        "              (fDecided, fMarks) = splitAt {DECIDED_FEATURES} afterLines"
+    );
+    let _ = writeln!(
+        s,
+        "              lineTables = map fromListRows{LINE_STATES}_{a} (chunksOf {LINE_STATES} fLines)"
+    );
+    let _ = writeln!(
+        s,
+        "              policyTables = map fromListRows{CELLS}_{h} (chunksOf {CELLS} (rows {MOVES} {h} fromList{h} a{policy_index}))"
+    );
+    let _ = writeln!(
+        s,
+        "              policyBiases = map fromList{CELLS} (chunksOf {CELLS} (floats 1 {MOVES} a{}))",
+        policy_index + 1
+    );
+    let _ = writeln!(s, "           in Net");
     let mut step = 0usize;
-    let mut decode = |rows: usize, cols: usize, mk: &str| -> String {
-        let text = format!("rows {rows} {cols} {mk} a{step}");
+    let mut next = || {
+        let i = step;
         step += 1;
-        text
+        i
     };
     let mut inits = vec![format!(
-        "netContent = {}",
-        decode(CONTENT_ROWS, e, &format!("fromList{e}"))
+        "netContent = rows {CONTENT_ROWS} {e} fromList{e} a{}",
+        next()
     )];
     let mix_list: Vec<String> = (0..BOARDS)
-        .map(|_| {
-            format!(
-                "fromListRows{a}_{e} ({})",
-                decode(a, e, &format!("fromList{e}"))
-            )
-        })
+        .map(|_| format!("pieces (rows {a} {e} fromList{e} a{})", next()))
         .collect();
     inits.push(format!("netMix = [{}]", mix_list.join(", ")));
     inits.push(format!(
-        "netMixBias = only ({})",
-        decode(1, a, &format!("fromList{a}"))
+        "netMixBias = fromList{a} (floats 1 {a} a{})",
+        next()
     ));
     inits.push(format!(
-        "netForced = fromListRows{a}_{e} ({})",
-        decode(a, e, &format!("fromList{e}"))
+        "netForced = pieces (rows {a} {e} fromList{e} a{})",
+        next()
+    ));
+    assert_eq!(next(), features_index, "features array position");
+    inits.push(format!(
+        "netForcedFeature = fromListRows{FORCED_FEATURES}_{a} fForced"
+    ));
+    for l in 0..LINES.len() {
+        inits.push(format!("netLineFeature{l} = lineTables !! {l}"));
+    }
+    inits.push(format!(
+        "netDecidedFeature = fromListRows{DECIDED_FEATURES}_{a} fDecided"
     ));
     inits.push(format!(
-        "netFeatures = fromListRows{FEATURE_ROWS}_{a} ({})",
-        decode(FEATURE_ROWS, a, &format!("fromList{a}"))
+        "netMarksFeature = fromListRows{MARKS_FEATURES}_{a} fMarks"
     ));
     for i in 0..names.layers {
         let d_in = if i == 0 { a } else { h };
         inits.push(format!(
-            "netHidden{i} = fromListRows{h}_{d_in} ({})",
-            decode(h, d_in, &format!("fromList{d_in}"))
+            "netHidden{i} = fromListRows{h}_{d_in} (rows {h} {d_in} fromList{d_in} a{})",
+            next()
         ));
         inits.push(format!(
-            "netHidden{i}Bias = only ({})",
-            decode(1, h, &format!("fromList{h}"))
+            "netHidden{i}Bias = fromList{h} (floats 1 {h} a{})",
+            next()
         ));
     }
     inits.push(format!(
-        "netValue = fromListRows3_{h} ({})",
-        decode(3, h, &format!("fromList{h}"))
+        "netValue = fromListRows3_{h} (rows 3 {h} fromList{h} a{})",
+        next()
     ));
+    inits.push(format!("netValueBias = fromList3 (floats 1 3 a{})", next()));
     inits.push(format!(
-        "netValueBias = only ({})",
-        decode(1, 3, "fromList3")
+        "netSkip = fromListRows3_{a} (rows 3 {a} fromList{a} a{})",
+        next()
     ));
+    assert_eq!(next(), policy_index, "policy array position");
+    assert_eq!(next(), policy_index + 1, "policy bias array position");
+    for b in 0..BOARDS {
+        inits.push(format!("netPolicy{b} = policyTables !! {b}"));
+        inits.push(format!("netPolicyBias{b} = policyBiases !! {b}"));
+    }
     inits.push(format!(
-        "netSkip = fromListRows3_{a} ({})",
-        decode(3, a, &format!("fromList{a}"))
+        "netLocal = rows {CONTENTS} {CELLS} fromList{CELLS} a{}",
+        next()
     ));
-    inits.push(format!(
-        "netPolicy = fromListRows{MOVES}_{h} ({})",
-        decode(MOVES, h, &format!("fromList{h}"))
-    ));
-    inits.push(format!(
-        "netPolicyBias = only ({})",
-        decode(1, MOVES, &format!("fromList{MOVES}"))
-    ));
-    inits.push(format!(
-        "netLocal = {}",
-        decode(CONTENTS, CELLS, &format!("fromList{CELLS}"))
-    ));
-    inits.push(format!("netSend = {}", decode(CONTENTS, 1, "single")));
+    inits.push(format!("netSend = floats {CONTENTS} 1 a{}", next()));
     assert_eq!(step, manifest_names.len(), "one decode per array");
     for (i, init) in inits.iter().enumerate() {
         let sep = if i == 0 { "{" } else { "," };
-        let _ = writeln!(s, "          {sep} {init}");
+        let _ = writeln!(s, "                {sep} {init}");
     }
-    let _ = writeln!(s, "          }}");
+    let _ = writeln!(s, "                }}");
     let _ = writeln!(
         s,
         "        _ -> error \"weights: the arrays do not match the generated decoder\"\n"
     );
 
     // Forward pieces.
-    let _ = writeln!(s, "zeroA :: VecA");
-    let _ = writeln!(s, "zeroA = replicate{a} 0\n");
-    let _ = writeln!(s, "zero3 :: Vec3");
-    let _ = writeln!(s, "zero3 = replicate3 0\n");
+    let _ = writeln!(s, "zeroChunk :: Vec{CHUNK}");
+    let _ = writeln!(s, "zeroChunk = replicate{CHUNK} 0\n");
+    let _ = writeln!(s, "zero3' :: Vec3");
+    let _ = writeln!(s, "zero3' = replicate3 0\n");
     let _ = writeln!(
         s,
         "-- | The folded first-layer row of a board token at board k (k = {BOARDS} for the forced\n\
-         -- token): what a table of rows per content caches."
+         -- token): what a table of rows per content caches. {k} x {CHUNK} dot products of width {e}."
     );
     let _ = writeln!(s, "foldRow :: Net -> Int -> VecE -> VecA");
-    let _ = writeln!(
-        s,
-        "foldRow n k t = linear{a}_{e} (if k == {BOARDS} then netForced n else netMix n !! k) zeroA t\n"
-    );
-    let _ = writeln!(
-        s,
-        "-- | The accumulator from the ten folded rows and the eleven feature ids."
-    );
-    let _ = writeln!(s, "accumulateRows :: Net -> [VecA] -> [Int] -> VecA");
-    let rs = vars("r", TOKENS);
-    let fs = vars("f", FEATURE_IDS);
-    let feats: Vec<String> = fs
+    let ps = vars("p", k);
+    let parts: Vec<String> = ps
         .iter()
-        .map(|f| format!("(sel{FEATURE_ROWS}_{a} {f} (netFeatures n))"))
+        .map(|p| format!("(linear{CHUNK}_{e} {p} zeroChunk t)"))
         .collect();
-    let mut terms = vec!["(netMixBias n)".to_string()];
-    terms.extend(rs.iter().cloned());
-    terms.extend(feats);
     let _ = writeln!(
         s,
-        "accumulateRows n [{}] [{}] = relu{a} ({})",
-        rs.join(", "),
-        fs.join(", "),
-        nested_sum(&format!("add{a}"), &terms)
+        "foldRow n k t = case (if k == {BOARDS} then netForced n else netMix n !! k) of\n\
+         \x20 [{}] -> concat{k}_{CHUNK} {}\n\
+         \x20 _ -> error \"foldRow: {k} pieces\"\n",
+        ps.join(", "),
+        parts.join(" ")
     );
     let _ = writeln!(
         s,
-        "accumulateRows _ _ _ = error \"accumulateRows: {TOKENS} rows and {FEATURE_IDS} feature ids\""
+        "-- | The feature rows of big-board line l (0..{}).",
+        LINES.len() - 1
     );
-    let _ = writeln!(s, "{{-# NOINLINE accumulateRows #-}}\n");
+    let _ = writeln!(
+        s,
+        "lineFeature :: Net -> Int -> {}",
+        Names::rows(LINE_STATES, a)
+    );
+    let _ = writeln!(s, "lineFeature n l = case l of");
+    for l in 0..LINES.len() {
+        let _ = writeln!(s, "  {l} -> netLineFeature{l} n");
+    }
+    let _ = writeln!(s, "  _ -> error \"lineFeature: line out of range\"\n");
+    let _ = writeln!(
+        s,
+        "-- | The accumulator: the ReLU of the bias, the ten folded rows and the eleven feature\n\
+         -- rows (forced board 0..9, the eight lines' status codes 0..63 in bigLines order, decided\n\
+         -- boards 0..9, marks on open boards 0..72)."
+    );
+    let _ = writeln!(
+        s,
+        "accumulateRows :: Net -> [VecA] -> Int -> [Int] -> Int -> Int -> VecA"
+    );
+    let _ = writeln!(
+        s,
+        "accumulateRows n rows forced lineCodes decided marks =\n\
+         \x20 let features = sel{FORCED_FEATURES}_{a} forced (netForcedFeature n) : zipWith (\\l code -> sel{LINE_STATES}_{a} code (lineFeature n l)) [0 ..] lineCodes ++ [sel{DECIDED_FEATURES}_{a} decided (netDecidedFeature n), sel{MARKS_FEATURES}_{a} marks (netMarksFeature n)]\n\
+         \x20  in relu{a} (foldl add{a} (netMixBias n) (rows ++ features))\n"
+    );
     let _ = writeln!(s, "-- | The last hidden layer.");
     let _ = writeln!(s, "hiddenOf :: Net -> VecA -> VecH");
     let mut expr = format!("dense{h}_{a} (netHidden0 n) (netHidden0Bias n) acc");
@@ -403,38 +529,24 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
     let _ = writeln!(s, "wdlOf :: Net -> VecA -> VecH -> Vec3");
     let _ = writeln!(
         s,
-        "wdlOf n acc h = add3 (linear3_{h} (netValue n) (netValueBias n) h) (linear3_{a} (netSkip n) zero3 acc)\n"
+        "wdlOf n acc h = add3 (linear3_{h} (netValue n) (netValueBias n) h) (linear3_{a} (netSkip n) zero3' acc)\n"
     );
     let _ = writeln!(
         s,
-        "-- | The global part of a move's logit (move index = board * 9 + square); the full logit\n\
-         -- adds index{CELLS} square (netLocal n !! board content) + netSend n !! square content."
+        "-- | The global part of the nine move logits of board b; the full logits add the\n\
+         -- board's own cell logits (netLocal n !! content b) and, at square j, the send logit\n\
+         -- netSend n !! content j."
     );
-    let _ = writeln!(s, "policyLogit :: Net -> VecH -> Int -> Float");
-    let _ = writeln!(
-        s,
-        "policyLogit n h m = dot{h} (sel{MOVES}_{h} m (netPolicy n)) h + index{MOVES} m (netPolicyBias n)\n"
-    );
-    s
-}
-
-/// A sum of vectors as a balanced tree of binary adds, `(add (add a b) (add c d))`, which
-/// the INLINE `combineN` of FixedVec lets GHC collapse into one constructor application.
-/// Balanced rather than a chain: the simplifier's work grows with the nesting depth, and a
-/// 21-deep chain of 512-wide adds exhausts its tick budget.
-fn nested_sum(add: &str, terms: &[String]) -> String {
-    match terms {
-        [] => "0".to_string(),
-        [one] => one.clone(),
-        _ => {
-            let (left, right) = terms.split_at(terms.len() / 2);
-            format!(
-                "({add} {} {})",
-                nested_sum(add, left),
-                nested_sum(add, right)
-            )
-        }
+    let _ = writeln!(s, "policyLogits :: Net -> VecH -> Int -> Vec{CELLS}");
+    let _ = writeln!(s, "policyLogits n h b = case b of");
+    for b in 0..BOARDS {
+        let _ = writeln!(
+            s,
+            "  {b} -> linear{CELLS}_{h} (netPolicy{b} n) (netPolicyBias{b} n) h"
+        );
     }
+    let _ = writeln!(s, "  _ -> error \"policyLogits: board out of range\"\n");
+    s
 }
 
 fn hs_strings(items: &[String]) -> String {
@@ -444,7 +556,7 @@ fn hs_strings(items: &[String]) -> String {
 
 /// `SelfTest.hs`: evaluates the reference positions from their ids and compares.
 pub fn selftest_module(names: &Names, prefix: &str) -> String {
-    let (a, h) = (names.a, names.h);
+    let (e, a, h) = (names.e, names.a, names.h);
     let mut s = String::new();
     header(
         &mut s,
@@ -457,35 +569,47 @@ pub fn selftest_module(names: &Names, prefix: &str) -> String {
     let _ = writeln!(s, "import {prefix}.Net");
     let _ = writeln!(s, "import {prefix}.Reference");
     let _ = writeln!(s, "import {prefix}.Spec\n");
-    let e = names.e;
     let _ = writeln!(
         s,
         "-- | A board token from its {IDS_PER_BOARD} ids, looking the rows up in the content list\n\
          -- (slow: for tests and for building a table, not for the search)."
     );
     let _ = writeln!(s, "tokenOf :: Net -> [Int] -> VecE");
-    let ids = vars("i", IDS_PER_BOARD);
-    let rows: Vec<String> = ids
-        .iter()
-        .map(|i| format!("(netContent n !! {i})"))
-        .collect();
     let _ = writeln!(
         s,
-        "tokenOf n [{}] = {}",
-        ids.join(", "),
-        nested_sum(&format!("add{e}"), &rows)
+        "tokenOf n ids = foldl1 add{e} (map (netContent n !!) ids)"
     );
-    let _ = writeln!(s, "tokenOf _ _ = error \"tokenOf: {IDS_PER_BOARD} ids\"");
     let _ = writeln!(s, "{{-# NOINLINE tokenOf #-}}\n");
     let text = format!(
-        r#"-- | Accumulator, last hidden layer and the three logits from a position's ids.
+        r#"-- | The eleven global feature ids of a position's ids as the local indices the
+-- feature tables take: forced board, the eight line codes, decided boards, open marks.
+localFeatures :: [Int] -> (Int, [Int], Int, Int)
+localFeatures ids =
+  case drop (tokens * idsPerBoard) ids of
+    (forced : rest) ->
+      ( forced - forcedBase
+      , zipWith (\l f -> f - lineBase - l * lineStates) [0 ..] (take 8 rest)
+      , rest !! 8 - decidedBase
+      , rest !! 9 - openMarksBase
+      )
+    [] -> error "localFeatures: no feature ids"
+
+-- | The ten folded rows of a position's ids.
+foldedRows :: Net -> [Int] -> [VecA]
+foldedRows n ids =
+  let tokenIds = take (tokens * idsPerBoard) ids
+      toks = [tokenOf n (take idsPerBoard (drop (k * idsPerBoard) tokenIds)) | k <- [0 .. tokens - 1]]
+   in zipWith (foldRow n) [0 ..] toks
+
+accumulateIds :: Net -> [VecA] -> [Int] -> VecA
+accumulateIds n rows ids =
+  let (forced, lineCodes, decided, marks) = localFeatures ids
+   in accumulateRows n rows forced lineCodes decided marks
+
+-- | Accumulator, last hidden layer and the three logits from a position's ids.
 evalIds :: Net -> [Int] -> (VecA, VecH, Vec3)
 evalIds n ids =
-  let tokenIds = take (tokens * idsPerBoard) ids
-      featureIds' = drop (tokens * idsPerBoard) ids
-      toks = [tokenOf n (take idsPerBoard (drop (k * idsPerBoard) tokenIds)) | k <- [0 .. tokens - 1]]
-      rows = zipWith (foldRow n) [0 ..] toks
-      acc = accumulateRows n rows featureIds'
+  let acc = accumulateIds n (foldedRows n ids) ids
       hid = hiddenOf n acc
    in (acc, hid, wdlOf n acc hid)
 
@@ -495,7 +619,7 @@ moveLogit n ids hid m =
   let board = m `div` 9
       square = m `mod` 9
       content b = ids !! (b * idsPerBoard)
-   in policyLogit n hid m + index9 square (netLocal n !! content board) + netSend n !! content square
+   in index9 square (policyLogits n hid board) + index9 square (netLocal n !! content board) + netSend n !! content square
 
 softmax :: [Float] -> [Float]
 softmax zs = let m = maximum zs; es = map (\z -> exp (z - m)) zs; t = sum es in map (/ t) es
@@ -526,27 +650,20 @@ selfTest = do
   return ok
 
 -- | Times the per-evaluation work after the fold (accumulator, hidden layers, value head and
--- nine policy logits) over the reference positions, printing microseconds per evaluation.
+-- one board's policy logits) over the reference positions, printing microseconds per
+-- evaluation.
 bench :: Int -> IO ()
 bench iters = do
   let n = net
-      inputs =
-        [ (rows, featureIds')
-        | r <- refs
-        , let ids = refIds r
-        , let tokenIds = take (tokens * idsPerBoard) ids
-        , let featureIds' = drop (tokens * idsPerBoard) ids
-        , let toks = [tokenOf n (take idsPerBoard (drop (k * idsPerBoard) tokenIds)) | k <- [0 .. tokens - 1]]
-        , let rows = zipWith (foldRow n) [0 ..] toks
-        ]
+      inputs = [(foldedRows n (refIds r), refIds r) | r <- refs]
       count = length inputs
       step :: Int -> Float -> Float
       step i total =
-        let (rows, fids) = inputs !! (i `mod` count)
-            acc = accumulateRows n rows fids
+        let (rows, ids) = inputs !! (i `mod` count)
+            acc = accumulateIds n rows ids
             hid = hiddenOf n acc
             wdl = wdlOf n acc hid
-            pol = sum [policyLogit n hid (9 * (i `mod` 9) + sq) | sq <- [0 .. 8]]
+            pol = sum9 (policyLogits n hid (i `mod` 9))
          in total + index3 0 wdl + pol
       loop :: Int -> Float -> Float
       loop i total | i >= iters = total

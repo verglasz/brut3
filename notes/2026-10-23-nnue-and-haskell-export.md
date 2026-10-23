@@ -218,11 +218,7 @@ Measured (GHC 9.10.3, `-O2 -XSafe`, one core), including `FixedVec`:
 | `nnue 64 128 32 2` | 0.99M | 2.0 MB, 59 literals | 1.8e-4 / 3.6e-4 | 12 s, 0.35 GB | max dev 9e-6 | 7–10 |
 | `nnue 64 512 128 4` | 1.59M | 3.2 MB, 84 literals | 2.8e-4 / 1.5e-3 | 60 s, 1.8–2.3 GB | max dev 1e-5 | 100–140 |
 
-The medium net's compile cost is the 512-wide `FixedVec` code (dense layers over `Vec512`
-rows), worth checking against the grader's limits; its evaluation is ~1.5x the 0.5 ns/MAC
-estimate. Startup (decode of the stream) is well under a second for both. `Net.hs` carries
-`-fsimpl-tick-factor=400`: its accumulator sum inlines twenty `combineN`s of width A so
-that the result is one allocation, and at A = 512 that exceeds GHC's default tick budget
-(which scales with the module's size). A K-ary `reluSumK_N` in `FixedVec` would remove the
-need for it.
+The chunked layout (8 x `Vec64` for A 512) is what makes the medium net cheap to compile
+and fast to run: flat 512-wide functions were 60 s / 2.3 GB to compile and ~100 µs per
+evaluation. Startup (decode of the arrays) is well under a second for both.
 
