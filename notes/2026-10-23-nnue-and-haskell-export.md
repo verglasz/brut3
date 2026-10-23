@@ -63,8 +63,8 @@ legal moves only. Burn's `Linear` weight is `[d_in, d_out]`, applied as `x · W`
 Parameter tensors (burn record names in `Nnue`): `content.weight`, `mix.weight/bias`,
 `forced_mix.weight`, `features.weight`, `hidden[i].weight/bias`, `value.weight/bias`,
 `value_skip.weight`, `policy.weight/bias`, `local_policy.weight`, `send_policy.weight`.
-Saved as `<stem>.bpk` (burnpack) + `<stem>.json` (spec). **No exporter exists yet**: a
-`export` command dumping these to a flat text/binary form is the next step.
+Saved as `<stem>.bpk` (burnpack) + `<stem>.json` (spec); exported to Haskell by the `export`
+command (see "Haskell export" below).
 
 Sizes trained so far: `nnue 64 128 32 2`, `nnue 64 256 32 2`, lab `nnue 64 512 512 3`.
 
@@ -169,3 +169,43 @@ export (~100 bytes per entry).
   table lookups to `gather` (burn's `Embedding` gradient on CubeCL is a one-thread-per-column
   serial scatter; see commit d2a74c5). Keep batch 2048, spend speed on epochs (utttai used
   ~25 per stage); cosine `--lr-min`.
+
+## Haskell export (`export` command, `src/nn/export/`)
+
+`export --model <stem> --out <dir> [--module Gen] [--positions 16] [--seed 1]` writes, under
+`<dir>/Gen/`:
+
+- `Spec.hs`: widths, every id convention, the open-content checksum (`h <- (h * 1000003 +
+  code) mod 2^32` over open raw codes ascending), parameter count and folded MACs.
+- `Weights.hs`: every array int16-quantised with one scale per array, as a little-endian
+  stream, base64 in 256 KB string literals, plus the manifest `(name, rows, cols, scale)`
+  in stream order. Matrices are one row per output (burn's `[d_in, d_out]` transposed),
+  `W_mix` split into `mix0..mix8`.
+- `Decode.hs`: base64 to signed 16-bit values; `takeRows`.
+- `Net.hs`: the `Net` record decoded from the stream on first use (`net`), `foldRow`,
+  `accumulateRows`, `hiddenOf`, `wdlOf`, `policyLogit`, `tokenOf`. Imports `FixedVec` (the
+  Haskell project's `gen/vecgen.py` output: `VecN`, `RowsM_N`, `dotN`, `selM_N`,
+  `linear/dense/residualM_N`, ...) and aliases `VecE`/`VecA`/`VecH`; the export prints the
+  exact `vecgen.py` command line for the shapes it needs.
+- `Reference.hs`: positions with cells, side to move, last move, forced board, raw codes,
+  the input ids, accumulator, hidden layer, W/D/L logits and probabilities, and every legal
+  move's logit and probability, as computed by the **int16-rounded** weights (so the port
+  should match to Float rounding, not to quantisation error).
+- `SelfTest.hs`: `selfTest` replays the references from their ids through `Net` and checks
+  the deviations; `bench n` times accumulator + MLP + value head + nine policy logits.
+
+The Rust side of the same arithmetic is `export::scalar` (`Weights::evaluate`), checked
+against burn's forward pass; the export report prints the quantisation error of the
+rounded weights over the reference positions.
+
+Measured (GHC 9.10.3, `-O2 -XSafe`, one core), including `FixedVec`:
+
+| model | params | int16 stream | quantisation error (wdl / policy) | compile | self-test | µs per eval after the fold |
+|---|---|---|---|---|---|---|
+| `nnue 64 128 32 2` | 0.99M | 2.0 MB, 11 chunks | 1.8e-4 / 3.6e-4 | 12 s, 0.35 GB | max dev 9e-6 | 7–10 |
+| `nnue 64 512 128 4` | 1.59M | 3.2 MB, 17 chunks | 2.8e-4 / 1.5e-3 | 62 s, 2.3 GB | max dev 1e-5 | 100 |
+
+The medium net's compile cost is the 512-wide `FixedVec` code (dense layers over `Vec512`
+rows), worth checking against the grader's limits; its evaluation is ~1.5x the 0.5 ns/MAC
+estimate. Startup (decode of the stream) is well under a second for both.
+
