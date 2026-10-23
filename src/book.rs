@@ -100,6 +100,11 @@ impl Book {
         self.entries.is_empty()
     }
 
+    /// Every entry by canonical key, in no particular order.
+    pub fn entries(&self) -> impl Iterator<Item = (&Key, &Entry)> {
+        self.entries.iter()
+    }
+
     /// The book's entry for `state`, if any, with its moves mapped back to `state`'s frame.
     pub fn lookup(&self, state: &BitState) -> Option<Entry> {
         let (sym, _, key) = canonical(state);

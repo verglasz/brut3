@@ -105,7 +105,7 @@ pub fn decode_module(prefix: &str) -> String {
     header(
         &mut s,
         &format!("{prefix}.Decode"),
-        "(decodeStream, decodeRows, only, single)",
+        "(decodeBytes, decodeStream, decodeRows, only, single)",
         "-O2 -fobject-code",
     );
     s.push_str(
@@ -115,18 +115,23 @@ import Data.Char (ord)
 -- | Base64 text (standard alphabet, padded) as the signed 16-bit little-endian values it
 -- encodes.
 decodeStream :: String -> [Int]
-decodeStream = pairs . bytes
+decodeStream = pairs . decodeBytes
   where
     pairs (lo : hi : rest) =
       let v = lo .|. (hi `shiftL` 8)
        in (if v >= 32768 then v - 65536 else v) : pairs rest
     pairs _ = []
+
+-- | Base64 text as its bytes (0..255).
+decodeBytes :: String -> [Int]
+decodeBytes = bytes
+  where
     bytes (a : b : c : d : rest) =
       let n = (value a `shiftL` 18) .|. (value b `shiftL` 12) .|. (value c `shiftL` 6) .|. value d
           keep = if d == '=' then (if c == '=' then 1 else 2) else 3
        in take keep [(n `shiftR` 16) .&. 255, (n `shiftR` 8) .&. 255, n .&. 255] ++ bytes rest
     bytes [] = []
-    bytes _ = error "decodeStream: ragged base64"
+    bytes _ = error "decodeBytes: ragged base64"
     value ch
       | ch >= 'A' && ch <= 'Z' = ord ch - ord 'A'
       | ch >= 'a' && ch <= 'z' = ord ch - ord 'a' + 26

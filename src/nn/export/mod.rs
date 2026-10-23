@@ -9,8 +9,9 @@
 //!   specification the generated Haskell is checked against, and the place where the
 //!   quantisation error of an export is measured without a GHC in the loop.
 //! - [`quant`]: int16 quantisation and the base64 stream the weights ship as.
-//! - [`haskell`] and [`codegen`]: the generated Haskell modules.
+//! - [`haskell`] and [`codegen`]: the generated Haskell modules; [`book`]: the opening book.
 
+pub mod book;
 pub mod codegen;
 pub mod haskell;
 pub mod quant;

@@ -49,12 +49,16 @@ enum Command {
     /// List the backends compiled into this binary.
     #[cfg(feature = "nn")]
     Backends,
-    /// Export an nnue model as generated Haskell sources for the base-only engine.
+    /// Export an nnue model and/or an opening book as generated Haskell sources for the
+    /// base-only engine.
     #[cfg(feature = "nn")]
     Export {
         /// Model stem (`<stem>.bpk` + `<stem>.json`), an nnue model.
+        #[arg(long, required_unless_present = "book")]
+        model: Option<std::path::PathBuf>,
+        /// Opening book file (from `book`) to export as Gen/Book.hs.
         #[arg(long)]
-        model: std::path::PathBuf,
+        book: Option<std::path::PathBuf>,
         /// Directory to write `<module>/*.hs` under.
         #[arg(long)]
         out: std::path::PathBuf,
@@ -70,6 +74,9 @@ enum Command {
         /// Seed of the random games the reference positions come from.
         #[arg(long, default_value_t = 1)]
         seed: u64,
+        /// Reference book lookups to emit for the port's tests.
+        #[arg(long, default_value_t = 40)]
+        lookups: usize,
     },
     /// Build or deepen an opening book by searching the positions of the first plies with a
     /// search agent, e.g. `book --search "mcts-nn models/big cuda 100000 16" --out models/book.txt`.
@@ -377,12 +384,23 @@ fn main() -> ExitCode {
         #[cfg(feature = "nn")]
         Command::Export {
             model,
+            book,
             out,
             module,
             backend,
             positions,
             seed,
-        } => export(&model, &out, module, backend.as_deref(), positions, seed),
+            lookups,
+        } => export(
+            model.as_deref(),
+            book.as_deref(),
+            &out,
+            module,
+            backend.as_deref(),
+            positions,
+            seed,
+            lookups,
+        ),
         #[cfg(feature = "nn")]
         Command::Backends => {
             use ultimate_ttt_burn::nn::BackendKind;
@@ -721,56 +739,79 @@ fn import_utttai(paths: &[std::path::PathBuf], out: &std::path::Path) -> Result<
 }
 
 #[cfg(feature = "nn")]
+#[allow(clippy::too_many_arguments)]
 fn export(
-    model: &std::path::Path,
+    model: Option<&std::path::Path>,
+    book: Option<&std::path::Path>,
     out: &std::path::Path,
     module: String,
     backend: Option<&str>,
     positions: usize,
     seed: u64,
+    lookups: usize,
 ) -> Result<(), String> {
+    use ultimate_ttt_burn::book::Book;
     use ultimate_ttt_burn::nn::export::{ExportOptions, Weights, write_all};
     use ultimate_ttt_burn::nn::{AnyModel, BackendKind};
 
-    let backend = match backend {
-        Some(name) => name.parse::<BackendKind>()?,
-        None => BackendKind::preferred(),
-    };
-    let weights = match AnyModel::load(model, &backend.device())? {
-        AnyModel::Nnue(m) => Weights::from_model(&m),
-        other => {
-            return Err(format!(
-                "{} is a {} model, not nnue",
-                model.display(),
-                other.spec()
-            ));
+    let weights = match model {
+        Some(model) => {
+            let backend = match backend {
+                Some(name) => name.parse::<BackendKind>()?,
+                None => BackendKind::preferred(),
+            };
+            let weights = match AnyModel::load(model, &backend.device())? {
+                AnyModel::Nnue(m) => Weights::from_model(&m),
+                other => {
+                    return Err(format!(
+                        "{} is a {} model, not nnue",
+                        model.display(),
+                        other.spec()
+                    ));
+                }
+            };
+            println!(
+                "{}: {} parameters",
+                weights.config_display(),
+                weights.parameters()
+            );
+            Some(weights)
         }
+        None => None,
     };
-    println!(
-        "{}: {} parameters",
-        weights.config_display(),
-        weights.parameters()
-    );
+    let book = match book {
+        Some(path) => {
+            let book = Book::load(path)?;
+            println!("book {}: {} entries", path.display(), book.len());
+            Some(book)
+        }
+        None => None,
+    };
     let opts = ExportOptions {
         prefix: module,
         positions,
         seed,
+        lookups,
         ..ExportOptions::default()
     };
-    let report = write_all(&weights, out, &opts)?;
+    let report = write_all(weights.as_ref(), book.as_ref(), out, &opts)?;
     for (path, bytes) in &report.files {
         println!("wrote {} ({} bytes)", path.display(), bytes);
     }
-    println!(
-        "int16 stream: {} bytes in {} chunks; quantisation error over the reference positions: \
-         wdl {:.2e}, value {:.2e}, policy {:.2e}",
-        report.stream_bytes,
-        report.chunks,
-        report.wdl_error,
-        report.value_error,
-        report.policy_error
-    );
-    println!("FixedVec shapes: {}", report.vecgen);
+    if weights.is_some() {
+        println!(
+            "int16 weights: {} bytes in {} literals; quantisation error over the reference positions: \
+             wdl {:.2e}, value {:.2e}, policy {:.2e}",
+            report.stream_bytes, report.chunks, report.wdl_error, report.value_error, report.policy_error
+        );
+        println!("FixedVec shapes: {}", report.vecgen);
+    }
+    if let Some(stats) = &report.book {
+        println!(
+            "book: {} entries, {} bytes in {} literals, {} reference lookups",
+            stats.entries, stats.bytes, stats.literals, stats.lookups
+        );
+    }
     Ok(())
 }
 

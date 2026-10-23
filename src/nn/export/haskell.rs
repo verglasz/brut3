@@ -14,6 +14,7 @@ use rand::{Rng, SeedableRng};
 use super::Weights;
 use super::codegen;
 use super::quant::base64;
+use crate::book::Book;
 use crate::game::{BitState, GameState, LINES, Move};
 use crate::nn::model::MOVES;
 use crate::nn::nnue::{
@@ -32,6 +33,8 @@ pub struct ExportOptions {
     pub seed: u64,
     /// Characters of base64 per weight string literal.
     pub chunk: usize,
+    /// Reference book lookups to emit.
+    pub lookups: usize,
 }
 
 impl Default for ExportOptions {
@@ -41,6 +44,7 @@ impl Default for ExportOptions {
             positions: 16,
             seed: 1,
             chunk: 64 * 1024,
+            lookups: 40,
         }
     }
 }
@@ -59,10 +63,18 @@ pub struct Report {
     pub wdl_error: f32,
     pub value_error: f32,
     pub policy_error: f32,
+    /// The book export, if one was written.
+    pub book: Option<super::book::BookStats>,
 }
 
-/// Writes every generated module under `out`.
-pub fn write_all(weights: &Weights, out: &Path, opts: &ExportOptions) -> Result<Report, String> {
+/// Writes every generated module under `out`: the network's modules for `weights`, the
+/// opening book's for `book`, and the decoder either way.
+pub fn write_all(
+    weights: Option<&Weights>,
+    book: Option<&Book>,
+    out: &Path,
+    opts: &ExportOptions,
+) -> Result<Report, String> {
     let dir = out.join(&opts.prefix);
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let mut report = Report::default();
@@ -73,39 +85,47 @@ pub fn write_all(weights: &Weights, out: &Path, opts: &ExportOptions) -> Result<
         report.files.push((path, text.len()));
         Ok(())
     };
-    let rounded = weights.dequantised();
-    let names = codegen::Names::new(&weights.config);
-    emit("Spec", spec_module(weights, &opts.prefix))?;
-    let positions = reference_positions(opts.seed, opts.positions);
-    // The reference holds what the shipped (int16-rounded) network computes.
-    emit(
-        "Reference",
-        reference_module(&rounded, &positions, &opts.prefix),
-    )?;
-    let (text, stream_bytes, chunks, manifest_names) =
-        weights_module(weights, &opts.prefix, opts.chunk);
-    emit("Weights", text)?;
-    report.stream_bytes = stream_bytes;
-    report.chunks = chunks;
     emit("Decode", codegen::decode_module(&opts.prefix))?;
-    emit(
-        "Net",
-        codegen::net_module(&names, &opts.prefix, &manifest_names),
-    )?;
-    emit("SelfTest", codegen::selftest_module(&names, &opts.prefix))?;
-    report.vecgen = codegen::vecgen_command(&names);
-    for (_, state) in &positions {
-        let exact = weights.evaluate(state);
-        let other = rounded.evaluate(state);
-        for (a, b) in exact.wdl.iter().zip(&other.wdl) {
-            report.wdl_error = report.wdl_error.max((a - b).abs());
+    if let Some(weights) = weights {
+        let rounded = weights.dequantised();
+        let names = codegen::Names::new(&weights.config);
+        emit("Spec", spec_module(weights, &opts.prefix))?;
+        let positions = reference_positions(opts.seed, opts.positions);
+        // The reference holds what the shipped (int16-rounded) network computes.
+        emit(
+            "Reference",
+            reference_module(&rounded, &positions, &opts.prefix),
+        )?;
+        let (text, stream_bytes, chunks, manifest_names) =
+            weights_module(weights, &opts.prefix, opts.chunk);
+        emit("Weights", text)?;
+        emit(
+            "Net",
+            codegen::net_module(&names, &opts.prefix, &manifest_names),
+        )?;
+        emit("SelfTest", codegen::selftest_module(&names, &opts.prefix))?;
+        report.stream_bytes = stream_bytes;
+        report.chunks = chunks;
+        report.vecgen = codegen::vecgen_command(&names);
+        for (_, state) in &positions {
+            let exact = weights.evaluate(state);
+            let other = rounded.evaluate(state);
+            for (a, b) in exact.wdl.iter().zip(&other.wdl) {
+                report.wdl_error = report.wdl_error.max((a - b).abs());
+            }
+            report.value_error = report
+                .value_error
+                .max((exact.value() - other.value()).abs());
+            for (a, b) in exact.policy.iter().zip(&other.policy) {
+                report.policy_error = report.policy_error.max((a.2 - b.2).abs());
+            }
         }
-        report.value_error = report
-            .value_error
-            .max((exact.value() - other.value()).abs());
-        for (a, b) in exact.policy.iter().zip(&other.policy) {
-            report.policy_error = report.policy_error.max((a.2 - b.2).abs());
-        }
+    }
+    if let Some(book) = book {
+        let (text, stats) =
+            super::book::book_module(book, &opts.prefix, opts.chunk, opts.seed, opts.lookups);
+        emit("Book", text)?;
+        report.book = Some(stats);
     }
     Ok(report)
 }
@@ -189,11 +209,11 @@ pub fn weights_module(
 }
 
 /// Characters of base64 per line of a string literal.
-const LITERAL_WIDTH: usize = 1024;
+pub(super) const LITERAL_WIDTH: usize = 1024;
 
 /// A string literal over several lines, joined by string gaps (`\` newline `\`), indented
 /// two spaces.
-fn write_string_literal(s: &mut String, text: &str, width: usize) {
+pub(super) fn write_string_literal(s: &mut String, text: &str, width: usize) {
     let lines: Vec<&str> = if text.is_empty() {
         vec![""]
     } else {
@@ -502,7 +522,7 @@ fn raw_code(mine: u16, theirs: u16) -> usize {
     code
 }
 
-fn hs_list<T: std::fmt::Display>(items: impl Iterator<Item = T>) -> String {
+pub(super) fn hs_list<T: std::fmt::Display>(items: impl Iterator<Item = T>) -> String {
     let items: Vec<String> = items.map(|x| x.to_string()).collect();
     format!("[{}]", items.join(", "))
 }
