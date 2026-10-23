@@ -24,10 +24,10 @@ use burn::tensor::activation::relu;
 use super::model::{MOVES, Model, Prediction, Verdict};
 use crate::game::{BitState, GameState, LINES};
 
-const BOARDS: usize = 9;
-const CELLS: usize = 9;
+pub const BOARDS: usize = 9;
+pub const CELLS: usize = 9;
 /// Raw contents: each of 9 cells is empty, mine or theirs.
-const RAW_CONTENTS: usize = 3usize.pow(9);
+pub const RAW_CONTENTS: usize = 3usize.pow(9);
 
 /// Compact content ids: the open contents in increasing raw-code order, then the three
 /// decided kinds.
@@ -116,6 +116,15 @@ const fn compact_table() -> [u16; RAW_CONTENTS] {
     table
 }
 
+/// Compact id of a raw content code (`sum of v * 3^cell`, `v` = 1 mine, 2 theirs), or `None`
+/// where both players hold a line.
+pub fn compact_id(code: usize) -> Option<usize> {
+    match COMPACT[code] {
+        u16::MAX => None,
+        id => Some(id as usize),
+    }
+}
+
 /// Compact content id of a board from its two mark masks (bit `i` = square `i`).
 pub fn content_id(mine: u16, theirs: u16) -> usize {
     let mut code = 0usize;
@@ -136,26 +145,26 @@ pub fn content_id(mine: u16, theirs: u16) -> usize {
 // The content table: compact contents, a row for "no forced board", per-cell rows for open
 // boards (cell times empty/mine/theirs) and a padding row standing in for the cells of
 // decided boards and of a missing forced board.
-const NO_FORCED: usize = CONTENTS;
-const CELL_BASE: usize = NO_FORCED + 1;
-const CELL_PAD: usize = CELL_BASE + CELLS * 3;
-const CONTENT_ROWS: usize = CELL_PAD + 1;
+pub const NO_FORCED: usize = CONTENTS;
+pub const CELL_BASE: usize = NO_FORCED + 1;
+pub const CELL_PAD: usize = CELL_BASE + CELLS * 3;
+pub const CONTENT_ROWS: usize = CELL_PAD + 1;
 /// Ids per board token: its content and its nine cells.
-const IDS_PER_BOARD: usize = 1 + CELLS;
+pub const IDS_PER_BOARD: usize = 1 + CELLS;
 /// Board tokens: the nine boards, then the forced board again (or the "none" token).
-const TOKENS: usize = BOARDS + 1;
+pub const TOKENS: usize = BOARDS + 1;
 
 // The feature table, already at accumulator width: the forced board (9 boards or none), the
 // state of each big-board line (three statuses in 0..4), and the game phase as the number of
 // decided boards and the marks on the open ones (both functions of the compact contents, so
 // that dead cells never matter).
-const FORCED_BASE: usize = 0;
-const LINE_BASE: usize = FORCED_BASE + BOARDS + 1;
-const LINE_STATES: usize = 4 * 4 * 4;
-const DECIDED_BASE: usize = LINE_BASE + LINES.len() * LINE_STATES;
-const OPEN_MARKS_BASE: usize = DECIDED_BASE + BOARDS + 1;
-const FEATURE_ROWS: usize = OPEN_MARKS_BASE + BOARDS * (CELLS - 1) + 1;
-const FEATURE_IDS: usize = 1 + LINES.len() + 2;
+pub const FORCED_BASE: usize = 0;
+pub const LINE_BASE: usize = FORCED_BASE + BOARDS + 1;
+pub const LINE_STATES: usize = 4 * 4 * 4;
+pub const DECIDED_BASE: usize = LINE_BASE + LINES.len() * LINE_STATES;
+pub const OPEN_MARKS_BASE: usize = DECIDED_BASE + BOARDS + 1;
+pub const FEATURE_ROWS: usize = OPEN_MARKS_BASE + BOARDS * (CELLS - 1) + 1;
+pub const FEATURE_IDS: usize = 1 + LINES.len() + 2;
 
 /// Ids per position: the board tokens, then the feature ids.
 pub const IDS: usize = TOKENS * IDS_PER_BOARD + FEATURE_IDS;
@@ -329,21 +338,21 @@ pub struct Nnue {
     #[module(skip)]
     config: NnueConfig,
     /// `[CONTENT_ROWS, d_embed]`: contents, the no-forced row, cell rows, padding.
-    content: Embedding,
+    pub(crate) content: Embedding,
     /// `[9 * d_embed, d_acc]`: the nine board-specific matrices side by side.
-    mix: Linear,
+    pub(crate) mix: Linear,
     /// `[d_embed, d_acc]`: the forced board's content.
-    forced_mix: Linear,
+    pub(crate) forced_mix: Linear,
     /// `[FEATURE_ROWS, d_acc]`.
-    features: Embedding,
-    hidden: Vec<Linear>,
-    value: Linear,
-    value_skip: Linear,
-    policy: Linear,
+    pub(crate) features: Embedding,
+    pub(crate) hidden: Vec<Linear>,
+    pub(crate) value: Linear,
+    pub(crate) value_skip: Linear,
+    pub(crate) policy: Linear,
     /// `[CONTENTS, 9]`: a board's own cell logits.
-    local_policy: Embedding,
+    pub(crate) local_policy: Embedding,
     /// `[CONTENTS, 1]`: the logit of sending the opponent to a board with this content.
-    send_policy: Embedding,
+    pub(crate) send_policy: Embedding,
 }
 
 impl Nnue {

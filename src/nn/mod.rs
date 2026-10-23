@@ -16,6 +16,7 @@ pub mod backend;
 pub mod board_transformer;
 pub mod cell_transformer;
 pub mod encode;
+pub mod export;
 pub mod games;
 pub mod heads;
 pub mod linear;
