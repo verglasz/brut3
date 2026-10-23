@@ -189,11 +189,21 @@ lockstep matches too, and the search starts at the first position outside the bo
   `fromListRestN`. `Weights.hs` compiles at the project's `-O2` on purpose: at `-O0` its
   literals are updatable CAFs whose unpacked characters stay alive during decoding (53 MB
   peak residency instead of 18).
-- `Net.hs`: the `Net` record decoded from the stream on first use (`net`), `foldRow`,
-  `accumulateRows`, `hiddenOf`, `wdlOf`, `policyLogit`. Imports `FixedVec` (the
-  Haskell project's `gen/vecgen.py` output: `VecN`, `RowsM_N`, `dotN`, `selM_N`,
-  `linear/dense/residualM_N`, ...) and aliases `VecE`/`VecA`/`VecH`; the export prints the
-  exact `vecgen.py` command line for the shapes it needs.
+- `FixedVec.hs` (module `Gen.FixedVec`): the fixed-width vector family for exactly the
+  shapes the model needs, from `export::vecgen`, a line-for-line port of the Haskell
+  project's `gen/vecgen.py` (verified identical on both nets, with `--int32`, `--int16`,
+  `--sum`, `--rows` and `--alias` extras). Hand-written code that needs more shapes passes
+  them in vecgen flag syntax: `--vec-extra "--int32 512 --rows 9:128"`; `--no-fixed-vec`
+  keeps a hand-generated module instead. The export prints the equivalent vecgen command.
+- `Net.hs`: the `Net` record decoded from the arrays on first use (`net`), `foldRow`,
+  `accumulateRows`, `hiddenOf`, `wdlOf`, `policyLogits`. Imports `Gen.FixedVec` and aliases
+  `VecE`/`VecA`/`VecH`. Layout per the project's vector codegen notes
+  (`2026-10-23-vector-codegen.md` there): each `W_k^T` is `A/64` pieces of `Rows64_E` and
+  the fold is `A/64` `linear64_E` calls joined by `concat`; the 605-row feature array is
+  split at decode into four tables (forced 10, one `Rows64_A` per big line, decided 10,
+  marks 73) indexed by local ids; the policy head is nine `Rows9_H` + `Vec9` giving a
+  board's nine logits with `linear9_H`; the accumulator is a `foldl addA` over the 21 rows
+  then `reluA`. Requires `A` a multiple of 64 and `H` at most 64 or a multiple of it.
 - `Reference.hs`: positions with cells, side to move, last move, forced board, raw codes,
   the input ids, accumulator, hidden layer, W/D/L logits and probabilities, and every legal
   move's logit and probability, as computed by the **int16-rounded** weights (so the port
