@@ -12,6 +12,7 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
 use super::Weights;
+use super::codegen;
 use super::quant::base64;
 use crate::game::{BitState, GameState, LINES, Move};
 use crate::nn::model::MOVES;
@@ -51,6 +52,8 @@ pub struct Report {
     /// Bytes of the int16 weight stream and the base64 chunks it was cut into.
     pub stream_bytes: usize,
     pub chunks: usize,
+    /// The `gen/vecgen.py` command that makes the `FixedVec` module the code needs.
+    pub vecgen: String,
     /// Largest deviations of the dequantised weights from the exact ones over the reference
     /// positions: win/draw/loss probability, `p_win - p_loss`, legal-move probability.
     pub wdl_error: f32,
@@ -70,17 +73,27 @@ pub fn write_all(weights: &Weights, out: &Path, opts: &ExportOptions) -> Result<
         report.files.push((path, text.len()));
         Ok(())
     };
+    let rounded = weights.dequantised();
+    let names = codegen::Names::new(&weights.config);
     emit("Spec", spec_module(weights, &opts.prefix))?;
     let positions = reference_positions(opts.seed, opts.positions);
+    // The reference holds what the shipped (int16-rounded) network computes.
     emit(
         "Reference",
-        reference_module(weights, &positions, &opts.prefix),
+        reference_module(&rounded, &positions, &opts.prefix),
     )?;
-    let (text, stream_bytes, chunks) = weights_module(weights, &opts.prefix, opts.chunk);
+    let (text, stream_bytes, chunks, manifest_names) =
+        weights_module(weights, &opts.prefix, opts.chunk);
     emit("Weights", text)?;
     report.stream_bytes = stream_bytes;
     report.chunks = chunks;
-    let rounded = weights.dequantised();
+    emit("Decode", codegen::decode_module(&opts.prefix))?;
+    emit(
+        "Net",
+        codegen::net_module(&names, &opts.prefix, &manifest_names),
+    )?;
+    emit("SelfTest", codegen::selftest_module(&names, &opts.prefix))?;
+    report.vecgen = codegen::vecgen_command(&names);
     for (_, state) in &positions {
         let exact = weights.evaluate(state);
         let other = rounded.evaluate(state);
@@ -98,8 +111,12 @@ pub fn write_all(weights: &Weights, out: &Path, opts: &ExportOptions) -> Result<
 }
 
 /// `Weights.hs`: the manifest and the base64 chunks of the int16 stream. Returns the text,
-/// the stream's size in bytes and the number of chunks.
-pub fn weights_module(weights: &Weights, prefix: &str, chunk: usize) -> (String, usize, usize) {
+/// the stream's size in bytes, the number of chunks and the manifest's array names.
+pub fn weights_module(
+    weights: &Weights,
+    prefix: &str,
+    chunk: usize,
+) -> (String, usize, usize, Vec<String>) {
     let stream = weights.stream();
     let encoded = base64(&stream.bytes);
     let chunks: Vec<&str> = {
@@ -114,6 +131,12 @@ pub fn weights_module(weights: &Weights, prefix: &str, chunk: usize) -> (String,
     };
     let mut s = String::with_capacity(encoded.len() + 4096);
     banner(&mut s, &format!("{prefix}.Weights"), "(manifest, chunks)");
+    // Nothing to optimise here, and the literals are large.
+    s = s.replacen(
+        "{- FOURMOLU_DISABLE -}\n",
+        "{- FOURMOLU_DISABLE -}\n{-# LANGUAGE Safe #-}\n{-# OPTIONS_GHC -O0 #-}\n",
+        1,
+    );
     s.push_str(
         "-- Every array in stream order as (name, rows, cols, scale): rows * cols little-endian\n\
          -- Int16 values, each worth q * scale, matrices one row per output. The stream is the\n\
@@ -146,7 +169,8 @@ pub fn weights_module(weights: &Weights, prefix: &str, chunk: usize) -> (String,
         let _ = writeln!(s, "{name} :: String");
         let _ = writeln!(s, "{name} = \"{text}\"\n");
     }
-    (s, stream.bytes.len(), chunks.len())
+    let names = stream.manifest.iter().map(|e| e.name.clone()).collect();
+    (s, stream.bytes.len(), chunks.len(), names)
 }
 
 fn banner(out: &mut String, module: &str, exports: &str) {
@@ -352,7 +376,8 @@ pub fn reference_module(
     let mut s = String::new();
     banner(&mut s, &format!("{prefix}.Reference"), "(Ref (..), refs)");
     s.push_str(
-        "-- A position and what the network computes for it, from the side to move's view.\n\
+        "-- A position and what the shipped (int16-rounded) network computes for it, from the\n\
+         -- side to move's view.\n\
          data Ref = Ref\n\
          \x20 { refName :: String\n\
          \x20 , refCells :: [Int]      -- 81 cells by board * 9 + square: 0 empty, 1 X, 2 O\n\

@@ -755,6 +755,7 @@ fn export(
          wdl {:.2e}, value {:.2e}, policy {:.2e}",
         report.stream_bytes, report.chunks, report.wdl_error, report.value_error, report.policy_error
     );
+    println!("FixedVec shapes: {}", report.vecgen);
     Ok(())
 }
 
