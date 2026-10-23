@@ -271,6 +271,7 @@ mod tests {
             AgentSpec::Mcts {
                 simulations: 10,
                 seed: 2,
+                book: None,
             },
             "new o\nundo\nquit\n",
         );

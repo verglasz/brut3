@@ -452,6 +452,7 @@ pub fn run_loop(
             let evaluator = AgentSpec::Nn {
                 path: best.clone(),
                 backend: cfg.backend,
+                book: None,
             };
             let selfplay = SelfPlayConfig {
                 seed: cfg.selfplay.seed.wrapping_add(generation as u64),
@@ -511,6 +512,7 @@ pub fn run_loop(
             simulations: cfg.eval_simulations,
             batch_size: cfg.eval_batch,
             seed: generation as u64,
+            book: None,
         };
         let eval = play_match_with(
             &searcher(&candidate_path),

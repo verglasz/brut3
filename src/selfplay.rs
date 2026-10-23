@@ -13,6 +13,7 @@ use std::time::Instant;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use crate::agent::{Evaluations, UtttAgent};
+use crate::book::Book;
 use crate::game::{BitState, GameState, Move, Outcome, Player};
 use crate::mcts::{MctsConfig, RootNoise, SearchTree};
 
@@ -383,6 +384,8 @@ pub fn search_positions<A: UtttAgent<State = BitState>>(
 pub struct Side<'a, A> {
     pub evaluator: &'a mut A,
     pub search: MctsConfig,
+    /// Opening book: while the position is in it, the side plays its move without searching.
+    pub book: Option<&'a Book>,
 }
 
 /// Exploration applied to both sides of a [`lockstep_match`] so that its games differ. Two
@@ -431,6 +434,46 @@ impl MatchGame {
 
     fn rng(&mut self, side_a: bool) -> &mut SmallRng {
         &mut self.rngs[usize::from(!side_a)]
+    }
+
+    /// Applies `mv`, counting it and the game's end if it ends the game.
+    fn play(&mut self, mv: Move, tally: &mut MatchTally, on_game: &mut impl FnMut(usize)) {
+        self.state.apply(mv);
+        self.plies += 1;
+        tally.moves += 1;
+        if let Some(outcome) = self.state.outcome() {
+            tally.games += 1;
+            match outcome {
+                Outcome::Win(p) if p == self.a_plays => {
+                    tally.a_wins += 1;
+                    if self.a_plays == Player::X {
+                        tally.a_wins_as_x += 1;
+                    } else {
+                        tally.a_wins_as_o += 1;
+                    }
+                }
+                Outcome::Win(_) => tally.b_wins += 1,
+                Outcome::Draw => tally.draws += 1,
+            }
+            self.finished = true;
+            on_game(tally.games);
+        }
+    }
+
+    /// Plays book moves for as long as the side to move has one, instantly.
+    fn play_book_moves(
+        &mut self,
+        books: (Option<&Book>, Option<&Book>),
+        tally: &mut MatchTally,
+        on_game: &mut impl FnMut(usize),
+    ) {
+        while !self.finished {
+            let book = if self.a_to_move() { books.0 } else { books.1 };
+            match book.and_then(|b| b.best_move(&self.state)) {
+                Some(mv) => self.play(mv, tally, on_game),
+                None => break,
+            }
+        }
     }
 }
 
@@ -514,6 +557,7 @@ fn advance_match(
     games: &mut [MatchGame],
     side_a: bool,
     searches: (&MctsConfig, &MctsConfig),
+    books: (Option<&Book>, Option<&Book>),
     exploration: &MatchExploration,
     tally: &mut MatchTally,
     on_game: &mut impl FnMut(usize),
@@ -533,32 +577,14 @@ fn advance_match(
             .result()
             .sample_move(temperature, &mut game.rngs[usize::from(!side_a)])
             .expect("non-terminal position has moves");
-        game.state.apply(mv);
-        game.plies += 1;
-        tally.moves += 1;
-        match game.state.outcome() {
-            Some(outcome) => {
-                tally.games += 1;
-                match outcome {
-                    Outcome::Win(p) if p == game.a_plays => {
-                        tally.a_wins += 1;
-                        if game.a_plays == Player::X {
-                            tally.a_wins_as_x += 1;
-                        } else {
-                            tally.a_wins_as_o += 1;
-                        }
-                    }
-                    Outcome::Win(_) => tally.b_wins += 1,
-                    Outcome::Draw => tally.draws += 1,
-                }
-                game.finished = true;
-                on_game(tally.games);
-            }
-            None => {
-                let a_next = game.a_to_move();
-                let next = if a_next { searches.0 } else { searches.1 };
-                game.tree = search_tree(game.state, next, exploration.root_noise, game.rng(a_next));
-            }
+        game.play(mv, tally, on_game);
+        if !game.finished {
+            game.play_book_moves(books, tally, on_game);
+        }
+        if !game.finished {
+            let a_next = game.a_to_move();
+            let next = if a_next { searches.0 } else { searches.1 };
+            game.tree = search_tree(game.state, next, exploration.root_noise, game.rng(a_next));
         }
     }
 }
@@ -579,26 +605,29 @@ pub fn lockstep_match<A: UtttAgent<State = BitState>, B: UtttAgent<State = BitSt
 ) -> MatchTally {
     let mut tally = MatchTally::default();
     let mut active: Vec<MatchGame> = Vec::with_capacity(games);
+    let books = (a.book, b.book);
     for g in 0..games {
         let a_plays = if g % 2 == 0 { Player::X } else { Player::O };
-        let mut rngs = [
+        let rngs = [
             SmallRng::seed_from_u64(a.search.seed.wrapping_add(g as u64)),
             SmallRng::seed_from_u64(b.search.seed.wrapping_add(g as u64)),
         ];
-        let (opener, rng) = if a_plays == Player::X {
-            (&a.search, &mut rngs[0])
-        } else {
-            (&b.search, &mut rngs[1])
-        };
-        let tree = search_tree(BitState::initial(), opener, exploration.root_noise, rng);
-        active.push(MatchGame {
+        let mut game = MatchGame {
             state: BitState::initial(),
-            tree,
+            tree: SearchTree::new(BitState::initial(), 0, 1.0, 0.0),
             a_plays,
             rngs,
             plies: 0,
             finished: false,
-        });
+        };
+        // Book moves first; the first position outside both books gets the search.
+        game.play_book_moves(books, &mut tally, &mut on_game);
+        if !game.finished {
+            let a_next = game.a_to_move();
+            let next = if a_next { &a.search } else { &b.search };
+            game.tree = search_tree(game.state, next, exploration.root_noise, game.rng(a_next));
+        }
+        active.push(game);
     }
     let (mut batch_a, mut batch_b) = (SideBatch::default(), SideBatch::default());
     let searches = (&a.search, &b.search);
@@ -616,6 +645,7 @@ pub fn lockstep_match<A: UtttAgent<State = BitState>, B: UtttAgent<State = BitSt
                 &mut active,
                 true,
                 searches,
+                books,
                 exploration,
                 &mut tally,
                 &mut on_game,
@@ -628,6 +658,7 @@ pub fn lockstep_match<A: UtttAgent<State = BitState>, B: UtttAgent<State = BitSt
                 &mut active,
                 false,
                 searches,
+                books,
                 exploration,
                 &mut tally,
                 &mut on_game,
@@ -741,10 +772,12 @@ mod tests {
             Side {
                 evaluator: &mut strong,
                 search: search(40, 3),
+                book: None,
             },
             Side {
                 evaluator: &mut weak,
                 search: search(1, 4),
+                book: None,
             },
             6,
             &MatchExploration::default(),
@@ -782,10 +815,12 @@ mod tests {
                 Side {
                     evaluator: &mut Flat,
                     search: search.clone(),
+                    book: None,
                 },
                 Side {
                     evaluator: &mut Flat,
                     search: search.clone(),
+                    book: None,
                 },
                 4,
                 exploration,

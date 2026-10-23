@@ -8,6 +8,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use super::{Evaluation, Evaluations, GreedyAgent, MinimaxAgent, RandomAgent, UtttAgent};
+use crate::book::Book;
 use crate::game::{BitState, Move};
 use crate::mcts::{Mcts, MctsConfig};
 #[cfg(feature = "nn")]
@@ -32,12 +33,15 @@ pub enum AgentSpec {
     Mcts {
         simulations: u32,
         seed: u64,
+        /// Opening book file: its moves are played without searching.
+        book: Option<PathBuf>,
     },
     /// One-ply lookahead with a trained value network.
     #[cfg(feature = "nn")]
     Nn {
         path: PathBuf,
         backend: BackendKind,
+        book: Option<PathBuf>,
     },
     /// MCTS with value-network leaf evaluation, batched.
     #[cfg(feature = "nn")]
@@ -47,6 +51,7 @@ pub enum AgentSpec {
         simulations: u32,
         batch_size: usize,
         seed: u64,
+        book: Option<PathBuf>,
     },
 }
 
@@ -67,6 +72,20 @@ impl AgentSpec {
         }
         spec
     }
+
+    /// The agent's opening book, if it has one.
+    pub fn book_path(&self) -> Option<&PathBuf> {
+        match self {
+            AgentSpec::Mcts { book, .. } => book.as_ref(),
+            #[cfg(feature = "nn")]
+            AgentSpec::Nn { book, .. } | AgentSpec::MctsNn { book, .. } => book.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn load_book(&self) -> Result<Option<Book>, String> {
+        self.book_path().map(|path| Book::load(path)).transpose()
+    }
 }
 
 #[cfg(not(feature = "nn"))]
@@ -81,8 +100,32 @@ impl AgentSpec {
 
     /// Parses `random [seed]`, `greedy [seed]`, `minimax [depth] [seed]`,
     /// `mcts [simulations] [seed]`, `nn <weights> [backend]` or
-    /// `mcts-nn <weights> [backend] [simulations] [batch] [seed]`.
+    /// `mcts-nn <weights> [backend] [simulations] [batch] [seed]`, each of the last three
+    /// optionally followed by `book <file>`, an opening book whose moves are played without
+    /// searching.
     pub fn parse(words: &[&str]) -> Result<Self, String> {
+        let (words, book) = match words.iter().position(|w| *w == "book") {
+            Some(i) => match words.get(i + 1) {
+                Some(path) if i + 2 == words.len() => (&words[..i], Some(PathBuf::from(path))),
+                Some(_) => return Err("`book <file>` must come last".to_string()),
+                None => return Err("missing book file after `book`".to_string()),
+            },
+            None => (words, None),
+        };
+        let mut spec = Self::parse_bare(words)?;
+        match &mut spec {
+            AgentSpec::Mcts { book: slot, .. } => *slot = book,
+            #[cfg(feature = "nn")]
+            AgentSpec::Nn { book: slot, .. } | AgentSpec::MctsNn { book: slot, .. } => *slot = book,
+            _ if book.is_some() => {
+                return Err(format!("{} cannot take an opening book", words[0]));
+            }
+            _ => {}
+        }
+        Ok(spec)
+    }
+
+    fn parse_bare(words: &[&str]) -> Result<Self, String> {
         fn num<T: std::str::FromStr>(
             words: &[&str],
             i: usize,
@@ -110,6 +153,7 @@ impl AgentSpec {
             Some("mcts") => Ok(Self::Mcts {
                 simulations: num(words, 1, "simulations", Self::DEFAULT_SIMULATIONS)?,
                 seed: num(words, 2, "seed", 0)?,
+                book: None,
             }),
             #[cfg(feature = "nn")]
             Some("nn") => {
@@ -117,7 +161,11 @@ impl AgentSpec {
                 if let Some(extra) = rest.first() {
                     return Err(format!("unexpected argument {extra:?} after nn backend"));
                 }
-                Ok(Self::Nn { path, backend })
+                Ok(Self::Nn {
+                    path,
+                    backend,
+                    book: None,
+                })
             }
             #[cfg(feature = "nn")]
             Some("mcts-nn") => {
@@ -128,6 +176,7 @@ impl AgentSpec {
                     simulations: num(rest, 0, "simulations", Self::DEFAULT_SIMULATIONS)?,
                     batch_size: num(rest, 1, "batch", Self::DEFAULT_NN_BATCH)?,
                     seed: num(rest, 2, "seed", 0)?,
+                    book: None,
                 })
             }
             Some(other) => Err(format!("unknown agent {other:?}; try {NAMES}")),
@@ -135,19 +184,22 @@ impl AgentSpec {
         }
     }
 
-    /// For a search agent (`mcts`, `mcts-nn`): the leaf evaluator it searches over and its
-    /// search settings, so that many of its games can be played in lockstep
-    /// ([`crate::selfplay::lockstep_match`]). `None` for agents that are not searches. Fails
-    /// only for network agents whose weights cannot be loaded.
-    pub fn search_parts(&self) -> Result<Option<(AnyAgent, MctsConfig)>, String> {
+    /// For a search agent (`mcts`, `mcts-nn`): the leaf evaluator it searches over, its
+    /// search settings and its opening book, so that many of its games can be played in
+    /// lockstep ([`crate::selfplay::lockstep_match`]). `None` for agents that are not
+    /// searches. Fails for network weights or a book that cannot be loaded.
+    pub fn search_parts(&self) -> Result<Option<(AnyAgent, MctsConfig, Option<Book>)>, String> {
         Ok(match self {
-            AgentSpec::Mcts { simulations, seed } => Some((
+            AgentSpec::Mcts {
+                simulations, seed, ..
+            } => Some((
                 AnyAgent::Random(RandomAgent::new(seed ^ 0x9E37_79B9_7F4A_7C15)),
                 MctsConfig {
                     simulations: *simulations,
                     seed: *seed,
                     ..Default::default()
                 },
+                self.load_book()?,
             )),
             #[cfg(feature = "nn")]
             AgentSpec::MctsNn {
@@ -156,6 +208,7 @@ impl AgentSpec {
                 simulations,
                 batch_size,
                 seed,
+                ..
             } => Some((
                 AnyAgent::Nn(NetAgent::load(path, *backend)?),
                 MctsConfig {
@@ -164,20 +217,32 @@ impl AgentSpec {
                     seed: *seed,
                     ..Default::default()
                 },
+                self.load_book()?,
             )),
             _ => None,
         })
     }
 
-    /// Builds the agent. Fails only for network agents whose weights cannot be loaded.
+    /// Builds the agent, wrapped in its opening book if it has one. Fails for network
+    /// weights or a book that cannot be loaded.
     pub fn build(&self) -> Result<AnyAgent, String> {
+        let agent = self.build_bare()?;
+        Ok(match self.load_book()? {
+            Some(book) => AnyAgent::Booked(book, Box::new(agent)),
+            None => agent,
+        })
+    }
+
+    fn build_bare(&self) -> Result<AnyAgent, String> {
         Ok(match self {
             AgentSpec::Random { seed } => AnyAgent::Random(RandomAgent::new(*seed)),
             AgentSpec::Greedy { seed } => AnyAgent::Greedy(GreedyAgent::new(*seed)),
             AgentSpec::Minimax { depth, seed } => {
                 AnyAgent::Minimax(MinimaxAgent::new(*depth, *seed))
             }
-            AgentSpec::Mcts { simulations, seed } => AnyAgent::Mcts(Mcts::new(
+            AgentSpec::Mcts {
+                simulations, seed, ..
+            } => AnyAgent::Mcts(Mcts::new(
                 RandomAgent::new(seed ^ 0x9E37_79B9_7F4A_7C15),
                 MctsConfig {
                     simulations: *simulations,
@@ -186,7 +251,7 @@ impl AgentSpec {
                 },
             )),
             #[cfg(feature = "nn")]
-            AgentSpec::Nn { path, backend } => AnyAgent::Nn(NetAgent::load(path, *backend)?),
+            AgentSpec::Nn { path, backend, .. } => AnyAgent::Nn(NetAgent::load(path, *backend)?),
             #[cfg(feature = "nn")]
             AgentSpec::MctsNn {
                 path,
@@ -194,6 +259,7 @@ impl AgentSpec {
                 simulations,
                 batch_size,
                 seed,
+                ..
             } => AnyAgent::MctsNn(Mcts::new(
                 NetAgent::load(path, *backend)?,
                 MctsConfig {
@@ -227,24 +293,37 @@ impl Default for AgentSpec {
         Self::Mcts {
             simulations: Self::DEFAULT_SIMULATIONS,
             seed: 0,
+            book: None,
         }
     }
 }
 
 impl fmt::Display for AgentSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_bare(f)?;
+        if let Some(book) = self.book_path() {
+            write!(f, " + book {}", book.display())?;
+        }
+        Ok(())
+    }
+}
+
+impl AgentSpec {
+    fn fmt_bare(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AgentSpec::Random { seed } => write!(f, "random (seed {seed})"),
             AgentSpec::Greedy { seed } => write!(f, "greedy (seed {seed})"),
             AgentSpec::Minimax { depth, seed } => write!(f, "minimax (depth {depth}, seed {seed})"),
-            AgentSpec::Mcts { simulations, seed } => {
+            AgentSpec::Mcts {
+                simulations, seed, ..
+            } => {
                 write!(
                     f,
                     "mcts ({simulations} simulations, random playouts, seed {seed})"
                 )
             }
             #[cfg(feature = "nn")]
-            AgentSpec::Nn { path, backend } => {
+            AgentSpec::Nn { path, backend, .. } => {
                 write!(f, "nn ({} on {backend})", path.display())
             }
             #[cfg(feature = "nn")]
@@ -254,6 +333,7 @@ impl fmt::Display for AgentSpec {
                 simulations,
                 batch_size,
                 seed,
+                ..
             } => write!(
                 f,
                 "mcts-nn ({simulations} simulations, batch {batch_size}, {} on {backend}, seed {seed})",
@@ -275,6 +355,8 @@ pub enum AnyAgent {
     Nn(NetAgent),
     #[cfg(feature = "nn")]
     MctsNn(Mcts<NetAgent>),
+    /// An agent whose moves come from an opening book while the position is in it.
+    Booked(Book, Box<AnyAgent>),
 }
 
 impl UtttAgent for AnyAgent {
@@ -290,6 +372,10 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Nn(a) => a.choose_move(state),
             #[cfg(feature = "nn")]
             AnyAgent::MctsNn(a) => a.choose_move(state),
+            AnyAgent::Booked(book, a) => match book.best_move(state) {
+                Some(mv) => mv,
+                None => a.choose_move(state),
+            },
         }
     }
 
@@ -303,6 +389,10 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Nn(a) => a.choose_move_with_policy(state),
             #[cfg(feature = "nn")]
             AnyAgent::MctsNn(a) => a.choose_move_with_policy(state),
+            AnyAgent::Booked(book, a) => match book.best_move(state) {
+                Some(mv) => (mv, vec![(mv, 1.0)]),
+                None => a.choose_move_with_policy(state),
+            },
         }
     }
 
@@ -316,6 +406,7 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Nn(a) => a.evaluate(state),
             #[cfg(feature = "nn")]
             AnyAgent::MctsNn(a) => a.evaluate(state),
+            AnyAgent::Booked(_, a) => a.evaluate(state),
         }
     }
 
@@ -329,6 +420,7 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Nn(a) => a.evaluate_batch(states, out),
             #[cfg(feature = "nn")]
             AnyAgent::MctsNn(a) => a.evaluate_batch(states, out),
+            AnyAgent::Booked(_, a) => a.evaluate_batch(states, out),
         }
     }
 
@@ -342,6 +434,7 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Nn(a) => a.begin_batch(states),
             #[cfg(feature = "nn")]
             AnyAgent::MctsNn(a) => a.begin_batch(states),
+            AnyAgent::Booked(_, a) => a.begin_batch(states),
         }
     }
 
@@ -355,6 +448,7 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Nn(a) => a.finish_batch(states, out),
             #[cfg(feature = "nn")]
             AnyAgent::MctsNn(a) => a.finish_batch(states, out),
+            AnyAgent::Booked(_, a) => a.finish_batch(states, out),
         }
     }
 }
@@ -363,6 +457,24 @@ impl UtttAgent for AnyAgent {
 mod tests {
     use super::*;
     use crate::game::GameState;
+
+    #[test]
+    fn parse_book_suffix() {
+        let spec = AgentSpec::parse(&["mcts", "50", "2", "book", "models/book.txt"]).unwrap();
+        assert_eq!(
+            spec,
+            AgentSpec::Mcts {
+                simulations: 50,
+                seed: 2,
+                book: Some(PathBuf::from("models/book.txt")),
+            }
+        );
+        assert_eq!(spec.book_path(), Some(&PathBuf::from("models/book.txt")));
+        assert!(spec.to_string().ends_with("+ book models/book.txt"));
+        assert!(AgentSpec::parse(&["random", "book", "x"]).is_err());
+        assert!(AgentSpec::parse(&["mcts", "book"]).is_err());
+        assert!(AgentSpec::parse(&["mcts", "book", "x", "3"]).is_err());
+    }
 
     #[test]
     fn parse_specs() {
@@ -378,14 +490,16 @@ mod tests {
             AgentSpec::parse(&["mcts"]),
             Ok(AgentSpec::Mcts {
                 simulations: 400,
-                seed: 0
+                seed: 0,
+                book: None,
             })
         );
         assert_eq!(
             AgentSpec::parse(&["mcts", "50", "3"]),
             Ok(AgentSpec::Mcts {
                 simulations: 50,
-                seed: 3
+                seed: 3,
+                book: None,
             })
         );
         assert!(AgentSpec::parse(&["mcts", "lots"]).is_err());
@@ -405,7 +519,8 @@ mod tests {
                 AgentSpec::parse(&["nn", "models/value"]),
                 Ok(AgentSpec::Nn {
                     path: "models/value".into(),
-                    backend
+                    backend,
+                    book: None,
                 })
             );
             assert_eq!(
@@ -415,7 +530,8 @@ mod tests {
                     backend,
                     simulations: 100,
                     batch_size: 8,
-                    seed: 3
+                    seed: 3,
+                    book: None,
                 })
             );
             assert_eq!(
@@ -425,7 +541,8 @@ mod tests {
                     backend,
                     simulations: 100,
                     batch_size: AgentSpec::DEFAULT_NN_BATCH,
-                    seed: 0
+                    seed: 0,
+                    book: None,
                 })
             );
             assert!(AgentSpec::parse(&["nn"]).is_err());
@@ -433,7 +550,8 @@ mod tests {
             assert!(
                 AgentSpec::Nn {
                     path: "/nonexistent".into(),
-                    backend
+                    backend,
+                    book: None,
                 }
                 .build()
                 .is_err()
@@ -451,6 +569,7 @@ mod tests {
             AgentSpec::Mcts {
                 simulations: 20,
                 seed: 1,
+                book: None,
             },
         ] {
             let mut agent = spec.build().unwrap();

@@ -18,7 +18,9 @@ enum Command {
     /// Play against an agent in the terminal (the default command).
     ///
     /// SPEC is e.g. `mcts 800 3`, `minimax 4`, `greedy`, `random`, `nn models/value cuda`,
-    /// `mcts-nn models/value cuda 400 16`. Defaults to `mcts 400`.
+    /// `mcts-nn models/value cuda 400 16`; `mcts`, `nn` and `mcts-nn` may end with
+    /// `book <file>` to play an opening book's moves without searching. Defaults to
+    /// `mcts 400`.
     Play {
         #[arg(trailing_var_arg = true)]
         spec: Vec<String>,
@@ -442,7 +444,7 @@ fn book(
 
     let words: Vec<&str> = search.split_whitespace().collect();
     let spec = AgentSpec::parse(&words)?;
-    let (mut evaluator, search_cfg) = spec
+    let (mut evaluator, search_cfg, _) = spec
         .search_parts()?
         .ok_or_else(|| format!("{spec} is not a search; use mcts or mcts-nn"))?;
     let mut book = if out.exists() {

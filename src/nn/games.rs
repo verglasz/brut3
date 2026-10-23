@@ -272,6 +272,7 @@ mod tests {
             &AgentSpec::Mcts {
                 simulations: 4,
                 seed: 3,
+                book: None,
             },
             2,
             |_| {},

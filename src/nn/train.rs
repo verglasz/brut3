@@ -957,6 +957,7 @@ pub(crate) mod tests {
             &AgentSpec::Mcts {
                 simulations: 8,
                 seed: 1,
+                book: None,
             },
             2,
             |_| {},
@@ -1015,6 +1016,7 @@ pub(crate) mod tests {
             &AgentSpec::Mcts {
                 simulations: 8,
                 seed: 2,
+                book: None,
             },
             1,
             |_| {},

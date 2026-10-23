@@ -155,8 +155,10 @@ the lexicographically smallest key, key = 81 cell digits by `board*9+square` (0 
 2 O) + forced board digit (9 = free). Entries store the move in that frame; lookup maps back
 through the inverse symmetry (the quarter turns are each other's inverses, the rest are
 self-inverse). Ties between symmetries are harmless (symmetric positions, equivalent moves).
-File lines: `KEY MOVE VALUE move:visits,...`; the Haskell table can be a stripped `KEY MOVE`
-export (~100 bytes per entry).
+File lines: `KEY MOVE VALUE move:visits,...`. Agents use a book by ending their spec with
+`book <file>` (`mcts`, `nn`, `mcts-nn`), e.g. `benchmark "mcts-nn models/m cuda 1000 16 book
+models/book.txt" "mcts-nn models/m cuda 1000 16"`: book moves are played instantly, in
+lockstep matches too, and the search starts at the first position outside the book.
 
 ## Training notes (for reproducing weights)
 

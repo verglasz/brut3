@@ -94,17 +94,19 @@ pub fn play_match_with(
         moves: 0,
         seconds: 0.0,
     };
-    if let (Some((mut eval_a, search_a)), Some((mut eval_b, search_b))) =
+    if let (Some((mut eval_a, search_a, book_a)), Some((mut eval_b, search_b, book_b))) =
         (a.search_parts()?, b.search_parts()?)
     {
         let tally = lockstep_match(
             Side {
                 evaluator: &mut eval_a,
                 search: search_a,
+                book: book_a.as_ref(),
             },
             Side {
                 evaluator: &mut eval_b,
                 search: search_b,
+                book: book_b.as_ref(),
             },
             games,
             exploration,
@@ -283,6 +285,7 @@ mod tests {
         let a = AgentSpec::Mcts {
             simulations: 60,
             seed: 1,
+            book: None,
         };
         let b = AgentSpec::Random { seed: 2 };
         let mut seen = 0;
@@ -300,10 +303,12 @@ mod tests {
         let a = AgentSpec::Mcts {
             simulations: 40,
             seed: 1,
+            book: None,
         };
         let b = AgentSpec::Mcts {
             simulations: 1,
             seed: 2,
+            book: None,
         };
         let mut seen = 0;
         let r = play_match(&a, &b, 4, |n| seen = n).unwrap();
@@ -322,6 +327,7 @@ mod tests {
             AgentSpec::Mcts {
                 simulations: 60,
                 seed: 2,
+                book: None,
             },
             AgentSpec::Greedy { seed: 3 },
         ];
@@ -348,6 +354,7 @@ mod tests {
             let bad = AgentSpec::Nn {
                 path: "/nonexistent".into(),
                 backend: crate::nn::BackendKind::preferred(),
+                book: None,
             };
             assert!(play_match(&bad, &AgentSpec::Random { seed: 0 }, 1, |_| {}).is_err());
         }
