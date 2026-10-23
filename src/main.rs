@@ -79,6 +79,13 @@ enum Command {
         /// Reference book lookups to emit for the port's tests.
         #[arg(long, default_value_t = 40)]
         lookups: usize,
+        /// Extra FixedVec shapes for hand-written code, in vecgen.py flag syntax, e.g.
+        /// `--vec-extra "--int32 512 --rows 9:128"`.
+        #[arg(long, allow_hyphen_values = true)]
+        vec_extra: Option<String>,
+        /// Do not write FixedVec.hs (keep a hand-generated one).
+        #[arg(long)]
+        no_fixed_vec: bool,
     },
     /// Build or deepen an opening book by searching the positions of the first plies with a
     /// search agent, e.g. `book --search "mcts-nn models/big cuda 100000 16" --out models/book.txt`.
@@ -393,6 +400,8 @@ fn main() -> ExitCode {
             positions,
             seed,
             lookups,
+            vec_extra,
+            no_fixed_vec,
         } => export(
             model.as_deref(),
             book.as_deref(),
@@ -402,6 +411,8 @@ fn main() -> ExitCode {
             positions,
             seed,
             lookups,
+            vec_extra.as_deref(),
+            !no_fixed_vec,
         ),
         #[cfg(feature = "nn")]
         Command::Backends => {
@@ -751,9 +762,11 @@ fn export(
     positions: usize,
     seed: u64,
     lookups: usize,
+    vec_extra: Option<&str>,
+    fixed_vec: bool,
 ) -> Result<(), String> {
     use ultimate_ttt_burn::book::Book;
-    use ultimate_ttt_burn::nn::export::{ExportOptions, Weights, write_all};
+    use ultimate_ttt_burn::nn::export::{ExportOptions, VecSpec, Weights, write_all};
     use ultimate_ttt_burn::nn::{AnyModel, BackendKind};
 
     let weights = match model {
@@ -789,11 +802,19 @@ fn export(
         }
         None => None,
     };
+    let vec_extra = match vec_extra {
+        Some(flags) => Some(VecSpec::parse_args(
+            &flags.split_whitespace().collect::<Vec<_>>(),
+        )?),
+        None => None,
+    };
     let opts = ExportOptions {
         prefix: module,
         positions,
         seed,
         lookups,
+        vec_extra,
+        fixed_vec,
         ..ExportOptions::default()
     };
     let report = write_all(weights.as_ref(), book.as_ref(), out, &opts)?;
@@ -806,7 +827,7 @@ fn export(
              wdl {:.2e}, value {:.2e}, policy {:.2e}",
             report.stream_bytes, report.chunks, report.wdl_error, report.value_error, report.policy_error
         );
-        println!("FixedVec shapes: {}", report.vecgen);
+        println!("FixedVec: {}", report.vecgen);
     }
     if let Some(stats) = &report.book {
         println!(

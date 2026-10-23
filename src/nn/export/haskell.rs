@@ -14,6 +14,7 @@ use rand::{Rng, SeedableRng};
 use super::Weights;
 use super::codegen;
 use super::quant::base64;
+use super::vecgen::VecSpec;
 use crate::book::Book;
 use crate::game::{BitState, GameState, LINES, Move};
 use crate::nn::model::MOVES;
@@ -35,6 +36,10 @@ pub struct ExportOptions {
     pub chunk: usize,
     /// Reference book lookups to emit.
     pub lookups: usize,
+    /// Extra `FixedVec` shapes beyond the model's, in `vecgen.py` flag syntax.
+    pub vec_extra: Option<VecSpec>,
+    /// Whether to write `<prefix>/FixedVec.hs` at all.
+    pub fixed_vec: bool,
 }
 
 impl Default for ExportOptions {
@@ -45,6 +50,8 @@ impl Default for ExportOptions {
             seed: 1,
             chunk: 64 * 1024,
             lookups: 40,
+            vec_extra: None,
+            fixed_vec: true,
         }
     }
 }
@@ -105,7 +112,14 @@ pub fn write_all(
         emit("SelfTest", codegen::selftest_module(&names, &opts.prefix))?;
         report.stream_bytes = stream_bytes;
         report.chunks = chunks;
-        report.vecgen = codegen::vecgen_command(&names);
+        let mut vec_spec = codegen::vec_spec(&names, &opts.prefix);
+        if let Some(extra) = &opts.vec_extra {
+            vec_spec.merge(extra);
+        }
+        report.vecgen = vec_spec.command();
+        if opts.fixed_vec {
+            emit("FixedVec", vec_spec.generate())?;
+        }
         for (_, state) in &positions {
             let exact = weights.evaluate(state);
             let other = rounded.evaluate(state);

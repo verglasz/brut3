@@ -9,15 +9,18 @@
 //!   specification the generated Haskell is checked against, and the place where the
 //!   quantisation error of an export is measured without a GHC in the loop.
 //! - [`quant`]: int16 quantisation and the base64 stream the weights ship as.
-//! - [`haskell`] and [`codegen`]: the generated Haskell modules; [`book`]: the opening book.
+//! - [`haskell`] and [`codegen`]: the generated Haskell modules; [`book`]: the opening book;
+//!   [`vecgen`]: the `FixedVec` vector module (a port of the Haskell project's `vecgen.py`).
 
 pub mod book;
 pub mod codegen;
 pub mod haskell;
 pub mod quant;
 pub mod scalar;
+pub mod vecgen;
 pub mod weights;
 
 pub use haskell::{ExportOptions, write_all};
 pub use scalar::Evaluation;
+pub use vecgen::VecSpec;
 pub use weights::{Array, Dense, Matrix, Weights};
