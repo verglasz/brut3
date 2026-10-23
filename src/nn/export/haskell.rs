@@ -30,7 +30,7 @@ pub struct ExportOptions {
     pub positions: usize,
     /// Seed of the random games the reference positions come from.
     pub seed: u64,
-    /// Characters per weight string literal.
+    /// Characters of base64 per weight string literal.
     pub chunk: usize,
 }
 
@@ -40,7 +40,7 @@ impl Default for ExportOptions {
             prefix: "Gen".into(),
             positions: 16,
             seed: 1,
-            chunk: 256 * 1024,
+            chunk: 64 * 1024,
         }
     }
 }
@@ -49,7 +49,7 @@ impl Default for ExportOptions {
 #[derive(Clone, Debug, Default)]
 pub struct Report {
     pub files: Vec<(PathBuf, usize)>,
-    /// Bytes of the int16 weight stream and the base64 chunks it was cut into.
+    /// Bytes of int16 weights and the number of base64 string literals holding them.
     pub stream_bytes: usize,
     pub chunks: usize,
     /// The `gen/vecgen.py` command that makes the `FixedVec` module the code needs.
@@ -110,27 +110,18 @@ pub fn write_all(weights: &Weights, out: &Path, opts: &ExportOptions) -> Result<
     Ok(report)
 }
 
-/// `Weights.hs`: the manifest and the base64 chunks of the int16 stream. Returns the text,
-/// the stream's size in bytes, the number of chunks and the manifest's array names.
+/// `Weights.hs`: every array with its shape, scale and base64 text, each array's text in
+/// its own string literals of at most `chunk` characters, wrapped with string gaps. Returns
+/// the text, the total bytes of int16 values, the number of literals and the arrays' names.
 pub fn weights_module(
     weights: &Weights,
     prefix: &str,
     chunk: usize,
 ) -> (String, usize, usize, Vec<String>) {
-    let stream = weights.stream();
-    let encoded = base64(&stream.bytes);
-    let chunks: Vec<&str> = {
-        let mut out = Vec::new();
-        let mut rest = encoded.as_str();
-        while !rest.is_empty() {
-            let n = chunk.min(rest.len());
-            out.push(&rest[..n]);
-            rest = &rest[n..];
-        }
-        out
-    };
-    let mut s = String::with_capacity(encoded.len() + 4096);
-    banner(&mut s, &format!("{prefix}.Weights"), "(manifest, chunks)");
+    let arrays = weights.quantised();
+    let bytes: usize = arrays.iter().map(|a| a.bytes.len()).sum();
+    let mut s = String::with_capacity(bytes * 4 / 3 + 4096);
+    banner(&mut s, &format!("{prefix}.Weights"), "(Array (..), arrays)");
     // Nothing to optimise here, and the literals are large.
     s = s.replacen(
         "{- FOURMOLU_DISABLE -}\n",
@@ -138,39 +129,84 @@ pub fn weights_module(
         1,
     );
     s.push_str(
-        "-- Every array in stream order as (name, rows, cols, scale): rows * cols little-endian\n\
-         -- Int16 values, each worth q * scale, matrices one row per output. The stream is the\n\
-         -- concatenation of the chunks, base64 with the standard alphabet and padding.\n",
+        "-- | One weight array: rows * cols little-endian Int16 values, each worth q * scale,\n\
+         -- matrices one row per output, as base64 text (standard alphabet, padded) split into\n\
+         -- pieces to concatenate.\n\
+         data Array = Array\n\
+         \x20 { arrayName :: String\n\
+         \x20 , arrayRows :: Int\n\
+         \x20 , arrayCols :: Int\n\
+         \x20 , arrayScale :: Float\n\
+         \x20 , arrayText :: [String]\n\
+         \x20 }\n\n",
     );
-    let _ = writeln!(s, "manifest :: [(String, Int, Int, Float)]");
-    let _ = writeln!(s, "manifest =");
-    for (i, e) in stream.manifest.iter().enumerate() {
+    let mut literals = 0;
+    let _ = writeln!(s, "arrays :: [Array]");
+    let _ = writeln!(s, "arrays =");
+    for (i, a) in arrays.iter().enumerate() {
         let _ = writeln!(
             s,
-            "  {} ({:?}, {}, {}, {})",
+            "  {} Array {:?} {} {} {} {}_text",
             if i == 0 { "[" } else { "," },
-            e.name,
-            e.rows,
-            e.cols,
-            hs_float(e.scale)
+            a.name,
+            a.rows,
+            a.cols,
+            hs_float(a.scale),
+            a.name
         );
     }
     let _ = writeln!(s, "  ]\n");
-    let _ = writeln!(
-        s,
-        "-- {} bytes of int16 values in {} chunks.",
-        stream.bytes.len(),
-        chunks.len()
-    );
-    let _ = writeln!(s, "chunks :: [String]");
-    let names: Vec<String> = (0..chunks.len()).map(|i| format!("chunk{i}")).collect();
-    let _ = writeln!(s, "chunks = [{}]\n", names.join(", "));
-    for (name, text) in names.iter().zip(&chunks) {
-        let _ = writeln!(s, "{name} :: String");
-        let _ = writeln!(s, "{name} = \"{text}\"\n");
+    for a in &arrays {
+        let encoded = base64(&a.bytes);
+        let pieces: Vec<&str> = {
+            let mut out = Vec::new();
+            let mut rest = encoded.as_str();
+            while !rest.is_empty() {
+                let n = chunk.min(rest.len());
+                out.push(&rest[..n]);
+                rest = &rest[n..];
+            }
+            if out.is_empty() {
+                out.push("");
+            }
+            out
+        };
+        literals += pieces.len();
+        let names: Vec<String> = (0..pieces.len())
+            .map(|i| format!("{}_{i}", a.name))
+            .collect();
+        let _ = writeln!(s, "{}_text :: [String]", a.name);
+        let _ = writeln!(s, "{}_text = [{}]\n", a.name, names.join(", "));
+        for (name, text) in names.iter().zip(&pieces) {
+            let _ = writeln!(s, "{name} :: String");
+            let _ = writeln!(s, "{name} =");
+            write_string_literal(&mut s, text, LITERAL_WIDTH);
+            s.push('\n');
+        }
     }
-    let names = stream.manifest.iter().map(|e| e.name.clone()).collect();
-    (s, stream.bytes.len(), chunks.len(), names)
+    let names = arrays.iter().map(|a| a.name.clone()).collect();
+    (s, bytes, literals, names)
+}
+
+/// Characters of base64 per line of a string literal.
+const LITERAL_WIDTH: usize = 1024;
+
+/// A string literal over several lines, joined by string gaps (`\` newline `\`), indented
+/// two spaces.
+fn write_string_literal(s: &mut String, text: &str, width: usize) {
+    let lines: Vec<&str> = if text.is_empty() {
+        vec![""]
+    } else {
+        text.as_bytes()
+            .chunks(width)
+            .map(|c| std::str::from_utf8(c).expect("ascii"))
+            .collect()
+    };
+    for (i, line) in lines.iter().enumerate() {
+        let open = if i == 0 { '"' } else { '\\' };
+        let close = if i + 1 == lines.len() { "\"" } else { "\\" };
+        let _ = writeln!(s, "  {open}{line}{close}");
+    }
 }
 
 fn banner(out: &mut String, module: &str, exports: &str) {

@@ -207,7 +207,13 @@ impl Weights {
         out.push(m("policy", &self.policy.weight));
         out.push(v("policy_bias", &self.policy.bias));
         out.push(m("local", &self.local));
-        out.push(v("send", &self.send));
+        // One value per content: a column, not a row.
+        out.push(Array {
+            name: "send".into(),
+            rows: self.send.len(),
+            cols: 1,
+            data: &self.send,
+        });
         out
     }
 }

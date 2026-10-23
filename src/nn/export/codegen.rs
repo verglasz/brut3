@@ -105,7 +105,7 @@ pub fn decode_module(prefix: &str) -> String {
     header(
         &mut s,
         &format!("{prefix}.Decode"),
-        "(decodeStream, takeRows, only, single)",
+        "(decodeStream, decodeRows, only, single)",
         "-O2 -fobject-code",
     );
     s.push_str(
@@ -135,17 +135,17 @@ decodeStream = pairs . bytes
       | ch == '/' = 63
       | otherwise = 0
 
--- | The next @rows@ rows of @cols@ values off the stream, each built by @mk@ from the scaled
--- values, and the rest of the stream.
-takeRows :: Int -> Int -> Float -> ([Float] -> v) -> [Int] -> ([v], [Int])
-takeRows rows cols scale mk = go rows
+-- | @rows@ rows of @cols@ values from an array's base64 pieces, each row built by @mk@ from
+-- the scaled values; the text must hold exactly rows * cols values.
+decodeRows :: String -> Int -> Int -> Float -> ([Float] -> v) -> [String] -> [v]
+decodeRows name rows cols scale mk pieces = go rows (decodeStream (concat pieces))
   where
-    go 0 stream = ([], stream)
+    go 0 [] = []
+    go 0 _ = error ("decodeRows: " ++ name ++ " has more values than rows * cols")
     go n stream =
       let (row, rest) = splitAt cols stream
-          v = mk (map (\q -> fromIntegral q * scale) row)
-          (vs, rest') = go (n - 1) rest
-       in v `seq` (v : vs, rest')
+          v = if length row == cols then mk (map (\q -> fromIntegral q * scale) row) else error ("decodeRows: " ++ name ++ " has fewer values than rows * cols")
+       in v `seq` (v : go (n - 1) rest)
 
 -- | The one element of a one-element list (a bias row, a one-column value).
 only :: [a] -> a
@@ -171,7 +171,7 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
     );
     let _ = writeln!(s, "import FixedVec");
     let _ = writeln!(s, "import {prefix}.Decode");
-    let _ = writeln!(s, "import {prefix}.Weights (chunks, manifest)\n");
+    let _ = writeln!(s, "import {prefix}.Weights (Array (..), arrays)\n");
     let _ = writeln!(s, "type VecE = {}", Names::vec(e));
     let _ = writeln!(s, "type VecA = {}", Names::vec(a));
     let _ = writeln!(s, "type VecH = {}\n", Names::vec(h));
@@ -242,99 +242,101 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
     }
     let _ = writeln!(s, "  }}\n");
 
-    // Decoding: the stream in manifest order.
+    // Decoding: every array from its own text, after checking names and shapes.
     let _ = writeln!(
         s,
-        "-- | The network, decoded from the weight stream on first use."
+        "-- | The network, decoded from the weight arrays on first use."
     );
     let _ = writeln!(s, "net :: Net");
     let _ = writeln!(s, "net =");
-    let _ = writeln!(s, "  let names = [n | (n, _, _, _) <- manifest]");
-    let _ = writeln!(s, "      scales = [sc | (_, _, _, sc) <- manifest]");
-    let _ = writeln!(s, "      expected = {}", hs_strings(manifest_names));
     let _ = writeln!(
         s,
-        "      s0 = if names == expected then decodeStream (concat chunks) else error \"weight manifest does not match the generated decoder\""
+        "  let rows r c mk a = if arrayRows a == r && arrayCols a == c then decodeRows (arrayName a) r c (arrayScale a) mk (arrayText a) else error (\"weights: \" ++ arrayName a ++ \" is not \" ++ show r ++ \"x\" ++ show c)"
+    );
+    let _ = writeln!(s, "      expected = {}", hs_strings(manifest_names));
+    let _ = writeln!(s, "   in case arrays of");
+    let vars_: Vec<String> = (0..manifest_names.len()).map(|i| format!("a{i}")).collect();
+    let _ = writeln!(
+        s,
+        "        [{}] | map arrayName arrays == expected -> Net",
+        vars_.join(", ")
     );
     let mut step = 0usize;
-    let mut take = |s: &mut String, var: &str, rows: usize, cols: usize, mk: &str| {
-        let _ = writeln!(
-            s,
-            "      ({var}, s{}) = takeRows {rows} {cols} (scales !! {step}) {mk} s{step}",
-            step + 1
-        );
+    let mut decode = |rows: usize, cols: usize, mk: &str| -> String {
+        let text = format!("rows {rows} {cols} {mk} a{step}");
         step += 1;
+        text
     };
-    take(&mut s, "content", CONTENT_ROWS, e, &format!("fromList{e}"));
-    for k in 0..BOARDS {
-        take(&mut s, &format!("mix{k}"), a, e, &format!("fromList{e}"));
-    }
-    take(&mut s, "mixBias", 1, a, &format!("fromList{a}"));
-    take(&mut s, "forced", a, e, &format!("fromList{e}"));
-    take(&mut s, "features", FEATURE_ROWS, a, &format!("fromList{a}"));
-    for i in 0..names.layers {
-        let d_in = if i == 0 { a } else { h };
-        take(
-            &mut s,
-            &format!("hidden{i}"),
-            h,
-            d_in,
-            &format!("fromList{d_in}"),
-        );
-        take(
-            &mut s,
-            &format!("hidden{i}Bias"),
-            1,
-            h,
-            &format!("fromList{h}"),
-        );
-    }
-    take(&mut s, "value", 3, h, &format!("fromList{h}"));
-    take(&mut s, "valueBias", 1, 3, "fromList3");
-    take(&mut s, "skip", 3, a, &format!("fromList{a}"));
-    take(&mut s, "policy", MOVES, h, &format!("fromList{h}"));
-    take(&mut s, "policyBias", 1, MOVES, &format!("fromList{MOVES}"));
-    take(
-        &mut s,
-        "local",
-        CONTENTS,
-        CELLS,
-        &format!("fromList{CELLS}"),
-    );
-    take(&mut s, "send", CONTENTS, 1, "single");
-    let _ = writeln!(s, "   in if null s{step} then Net");
+    let mut inits = vec![format!(
+        "netContent = {}",
+        decode(CONTENT_ROWS, e, &format!("fromList{e}"))
+    )];
     let mix_list: Vec<String> = (0..BOARDS)
-        .map(|k| format!("fromListRows{a}_{e} mix{k}"))
+        .map(|_| {
+            format!(
+                "fromListRows{a}_{e} ({})",
+                decode(a, e, &format!("fromList{e}"))
+            )
+        })
         .collect();
-    let mut inits = vec![
-        "netContent = content".to_string(),
-        format!("netMix = [{}]", mix_list.join(", ")),
-        "netMixBias = only mixBias".to_string(),
-        format!("netForced = fromListRows{a}_{e} forced"),
-        format!("netFeatures = fromListRows{FEATURE_ROWS}_{a} features"),
-    ];
+    inits.push(format!("netMix = [{}]", mix_list.join(", ")));
+    inits.push(format!(
+        "netMixBias = only ({})",
+        decode(1, a, &format!("fromList{a}"))
+    ));
+    inits.push(format!(
+        "netForced = fromListRows{a}_{e} ({})",
+        decode(a, e, &format!("fromList{e}"))
+    ));
+    inits.push(format!(
+        "netFeatures = fromListRows{FEATURE_ROWS}_{a} ({})",
+        decode(FEATURE_ROWS, a, &format!("fromList{a}"))
+    ));
     for i in 0..names.layers {
         let d_in = if i == 0 { a } else { h };
-        inits.push(format!("netHidden{i} = fromListRows{h}_{d_in} hidden{i}"));
-        inits.push(format!("netHidden{i}Bias = only hidden{i}Bias"));
+        inits.push(format!(
+            "netHidden{i} = fromListRows{h}_{d_in} ({})",
+            decode(h, d_in, &format!("fromList{d_in}"))
+        ));
+        inits.push(format!(
+            "netHidden{i}Bias = only ({})",
+            decode(1, h, &format!("fromList{h}"))
+        ));
     }
-    inits.extend([
-        format!("netValue = fromListRows3_{h} value"),
-        "netValueBias = only valueBias".to_string(),
-        format!("netSkip = fromListRows3_{a} skip"),
-        format!("netPolicy = fromListRows{MOVES}_{h} policy"),
-        "netPolicyBias = only policyBias".to_string(),
-        "netLocal = local".to_string(),
-        "netSend = send".to_string(),
-    ]);
+    inits.push(format!(
+        "netValue = fromListRows3_{h} ({})",
+        decode(3, h, &format!("fromList{h}"))
+    ));
+    inits.push(format!(
+        "netValueBias = only ({})",
+        decode(1, 3, "fromList3")
+    ));
+    inits.push(format!(
+        "netSkip = fromListRows3_{a} ({})",
+        decode(3, a, &format!("fromList{a}"))
+    ));
+    inits.push(format!(
+        "netPolicy = fromListRows{MOVES}_{h} ({})",
+        decode(MOVES, h, &format!("fromList{h}"))
+    ));
+    inits.push(format!(
+        "netPolicyBias = only ({})",
+        decode(1, MOVES, &format!("fromList{MOVES}"))
+    ));
+    inits.push(format!(
+        "netLocal = {}",
+        decode(CONTENTS, CELLS, &format!("fromList{CELLS}"))
+    ));
+    inits.push(format!("netSend = {}", decode(CONTENTS, 1, "single")));
+    assert_eq!(step, manifest_names.len(), "one decode per array");
     for (i, init) in inits.iter().enumerate() {
         let sep = if i == 0 { "{" } else { "," };
-        let _ = writeln!(s, "        {sep} {init}");
+        let _ = writeln!(s, "          {sep} {init}");
     }
-    let _ = writeln!(s, "        }}");
+    let _ = writeln!(s, "          }}");
     let _ = writeln!(
         s,
-        "      else error \"weight stream longer than the manifest\"\n"
+        "        _ -> error \"weights: the arrays do not match the generated decoder\"\n"
     );
 
     // Forward pieces.

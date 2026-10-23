@@ -1,7 +1,7 @@
-//! Int16 quantisation of the weights and their base64 stream for `Gen/Weights.hs`.
+//! Int16 quantisation of the weights and their base64 text for `Gen/Weights.hs`.
 //!
 //! Each array gets one scale, `max |w| / 32767`; the Haskell decoder multiplies the `Int16`
-//! back into `Float`. The stream is every array of [`Weights::arrays`] in order, row-major,
+//! back into `Float`. Every array of [`Weights::arrays`] is shipped on its own: row-major,
 //! little-endian `Int16`, base64-encoded with the standard alphabet and padding.
 
 use super::weights::{Array, Dense, Matrix, Weights};
@@ -30,19 +30,14 @@ fn dequantise(data: &[f32]) -> Vec<f32> {
     q.values.iter().map(|&v| v as f32 * q.scale).collect()
 }
 
-/// One manifest entry: the array's name, shape and scale, in stream order.
+/// One array as the Haskell decoder sees it: name, shape, scale, and its values as
+/// little-endian `Int16` bytes.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ManifestEntry {
+pub struct QuantisedArray {
     pub name: String,
     pub rows: usize,
     pub cols: usize,
     pub scale: f32,
-}
-
-/// The quantised weights as the Haskell decoder sees them.
-pub struct Stream {
-    pub manifest: Vec<ManifestEntry>,
-    /// Little-endian `Int16` values of every array in manifest order.
     pub bytes: Vec<u8>,
 }
 
@@ -106,23 +101,21 @@ impl Weights {
         self.map_arrays(|a| dequantise(a.data))
     }
 
-    /// The quantised byte stream and its manifest.
-    pub fn stream(&self) -> Stream {
-        let mut manifest = Vec::new();
-        let mut bytes = Vec::new();
-        for a in self.arrays() {
-            let q = quantise(a.data);
-            manifest.push(ManifestEntry {
-                name: a.name,
-                rows: a.rows,
-                cols: a.cols,
-                scale: q.scale,
-            });
-            for v in q.values {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        Stream { manifest, bytes }
+    /// Every array quantised, in [`Weights::arrays`] order.
+    pub fn quantised(&self) -> Vec<QuantisedArray> {
+        self.arrays()
+            .into_iter()
+            .map(|a| {
+                let q = quantise(a.data);
+                QuantisedArray {
+                    name: a.name,
+                    rows: a.rows,
+                    cols: a.cols,
+                    scale: q.scale,
+                    bytes: q.values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                }
+            })
+            .collect()
     }
 }
 
@@ -189,16 +182,18 @@ mod tests {
             .with_d_hidden(4)
             .init(&device);
         let weights = Weights::from_model(&model);
-        let stream = weights.stream();
-        let values: usize = stream.manifest.iter().map(|e| e.rows * e.cols).sum();
+        let arrays = weights.quantised();
+        let values: usize = arrays.iter().map(|a| a.rows * a.cols).sum();
         assert_eq!(values, weights.parameters());
-        assert_eq!(stream.bytes.len(), 2 * values);
-        assert_eq!(decode(&base64(&stream.bytes)), stream.bytes);
+        for a in &arrays {
+            assert_eq!(a.bytes.len(), 2 * a.rows * a.cols, "{}", a.name);
+            assert_eq!(decode(&base64(&a.bytes)), a.bytes, "{}", a.name);
+        }
         // The first array is the content table; its first row decodes to the weights.
-        let first = &stream.manifest[0];
+        let first = &arrays[0];
         assert_eq!(first.name, "content");
         for (i, w) in weights.content.row(0).iter().enumerate() {
-            let q = i16::from_le_bytes([stream.bytes[2 * i], stream.bytes[2 * i + 1]]);
+            let q = i16::from_le_bytes([first.bytes[2 * i], first.bytes[2 * i + 1]]);
             assert!((q as f32 * first.scale - w).abs() <= first.scale / 2.0 + 1e-9);
         }
         assert_eq!(weights.dequantised().config, weights.config);

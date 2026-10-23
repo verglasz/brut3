@@ -177,11 +177,12 @@ export (~100 bytes per entry).
 
 - `Spec.hs`: widths, every id convention, the open-content checksum (`h <- (h * 1000003 +
   code) mod 2^32` over open raw codes ascending), parameter count and folded MACs.
-- `Weights.hs`: every array int16-quantised with one scale per array, as a little-endian
-  stream, base64 in 256 KB string literals, plus the manifest `(name, rows, cols, scale)`
-  in stream order. Matrices are one row per output (burn's `[d_in, d_out]` transposed),
-  `W_mix` split into `mix0..mix8`.
-- `Decode.hs`: base64 to signed 16-bit values; `takeRows`.
+- `Weights.hs`: `arrays :: [Array]`, one `Array name rows cols scale text` per weight array,
+  int16-quantised with one scale per array, little-endian, base64 in string literals of
+  64 KB (lines of 1024 characters joined by string gaps). Matrices are one row per output
+  (burn's `[d_in, d_out]` transposed), `W_mix` split into `mix0..mix8`.
+- `Decode.hs`: base64 to signed 16-bit values; `decodeRows` for one array, which checks the
+  value count.
 - `Net.hs`: the `Net` record decoded from the stream on first use (`net`), `foldRow`,
   `accumulateRows`, `hiddenOf`, `wdlOf`, `policyLogit`, `tokenOf`. Imports `FixedVec` (the
   Haskell project's `gen/vecgen.py` output: `VecN`, `RowsM_N`, `dotN`, `selM_N`,
@@ -202,8 +203,8 @@ Measured (GHC 9.10.3, `-O2 -XSafe`, one core), including `FixedVec`:
 
 | model | params | int16 stream | quantisation error (wdl / policy) | compile | self-test | µs per eval after the fold |
 |---|---|---|---|---|---|---|
-| `nnue 64 128 32 2` | 0.99M | 2.0 MB, 11 chunks | 1.8e-4 / 3.6e-4 | 12 s, 0.35 GB | max dev 9e-6 | 7–10 |
-| `nnue 64 512 128 4` | 1.59M | 3.2 MB, 17 chunks | 2.8e-4 / 1.5e-3 | 62 s, 2.3 GB | max dev 1e-5 | 100 |
+| `nnue 64 128 32 2` | 0.99M | 2.0 MB, 59 literals | 1.8e-4 / 3.6e-4 | 12 s, 0.35 GB | max dev 9e-6 | 7–10 |
+| `nnue 64 512 128 4` | 1.59M | 3.2 MB, 84 literals | 2.8e-4 / 1.5e-3 | 60 s, 1.8–2.3 GB | max dev 1e-5 | 100–140 |
 
 The medium net's compile cost is the 512-wide `FixedVec` code (dense layers over `Vec512`
 rows), worth checking against the grader's limits; its evaluation is ~1.5x the 0.5 ns/MAC
