@@ -134,8 +134,7 @@ impl Book {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let (key, entry) =
-                parse_entry(line).map_err(|e| format!("line {}: {e}", i + 1))?;
+            let (key, entry) = parse_entry(line).map_err(|e| format!("line {}: {e}", i + 1))?;
             book.entries.insert(key, entry);
         }
         Ok(book)
@@ -236,7 +235,13 @@ impl Book {
             }
             let plies = frontier
                 .iter()
-                .map(|s| key_of(s).bytes().take(Move::COUNT).filter(|&b| b != b'0').count())
+                .map(|s| {
+                    key_of(s)
+                        .bytes()
+                        .take(Move::COUNT)
+                        .filter(|&b| b != b'0')
+                        .count()
+                })
                 .fold((usize::MAX, 0), |(lo, hi), p| (lo.min(p), hi.max(p)));
             log(format!(
                 "searching {} positions at ply {}{}",
@@ -370,7 +375,10 @@ mod tests {
             Entry {
                 best: reply_c,
                 value: -0.1,
-                visits: vec![(reply_c, 90), (sym.apply_move(Move::new(sq(2, 0), sq(0, 0))), 10)],
+                visits: vec![
+                    (reply_c, 90),
+                    (sym.apply_move(Move::new(sq(2, 0), sq(0, 0))), 10),
+                ],
             },
         );
         let _ = image;

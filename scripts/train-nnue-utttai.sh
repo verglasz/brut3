@@ -10,7 +10,8 @@ set -eu
 cd "$(dirname "$0")/.."
 
 MODEL=${MODEL:-"nnue 64 128 32 2"}
-NAME=${NAME:-$(echo "$MODEL" | tr ' ' '-')_$(date -Is)}
+SUFFIX=${SUFFIX:-$(date -Is)}
+NAME=${NAME:-$(echo "$MODEL" | tr ' ' '-')_$SUFFIX}
 EPOCHS1=${EPOCHS1:-10}
 EPOCHS2=${EPOCHS2:-10}
 BATCH=${BATCH:-2048}

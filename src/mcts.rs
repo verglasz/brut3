@@ -414,7 +414,10 @@ impl<S: GameState> SearchTree<S> {
                 NO_NODE => (0.0, 0),
                 child => {
                     let stats = &self.stats[child as usize];
-                    (stats.q_for_parent(self.virtual_loss), stats.effective_visits())
+                    (
+                        stats.q_for_parent(self.virtual_loss),
+                        stats.effective_visits(),
+                    )
                 }
             };
             let score = q + self.c_puct * edge.prior * sqrt_n / (1.0 + n as f32);
@@ -455,7 +458,13 @@ impl<S: GameState> SearchTree<S> {
     /// Creates the edges of `idx` (at position `state`) from the prior row (indexed by
     /// `Move::index`; only legal moves' entries are read, and an unusable row means uniform);
     /// returns the clamped value.
-    fn expand(&mut self, idx: u32, state: &S, value: f32, priors: Option<&[f32; Move::COUNT]>) -> f32 {
+    fn expand(
+        &mut self,
+        idx: u32,
+        state: &S,
+        value: f32,
+        priors: Option<&[f32; Move::COUNT]>,
+    ) -> f32 {
         let moves = state.legal_moves();
         debug_assert!(!moves.is_empty(), "non-terminal state without legal moves");
 

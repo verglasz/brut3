@@ -92,8 +92,7 @@ fn write_sample(out: &mut Vec<u8>, s: &Sample) -> Result<(), String> {
 
 /// Reads the games written by [`save`]; game ids are `0..`.
 pub fn load(path: &Path) -> Result<Dataset, String> {
-    let bytes =
-        std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -269,7 +268,15 @@ mod tests {
 
     #[test]
     fn games_survive_a_round_trip() {
-        let data = generate(&AgentSpec::Mcts { simulations: 4, seed: 3 }, 2, |_| {}).unwrap();
+        let data = generate(
+            &AgentSpec::Mcts {
+                simulations: 4,
+                seed: 3,
+            },
+            2,
+            |_| {},
+        )
+        .unwrap();
         assert!(data.len() > 10 && data.games() == 2);
         let path = std::env::temp_dir().join(format!("uttt-games-{}.games", std::process::id()));
         save(&path, &data).unwrap();
@@ -294,7 +301,8 @@ mod tests {
     #[test]
     fn load_many_renumbers_games() {
         let data = generate(&AgentSpec::Random { seed: 5 }, 3, |_| {}).unwrap();
-        let path = std::env::temp_dir().join(format!("uttt-games-many-{}.games", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("uttt-games-many-{}.games", std::process::id()));
         save(&path, &data).unwrap();
         let both = load_many(&[&path, &path]).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -323,13 +331,16 @@ mod tests {
             game: 2,
             ..base
         });
-        let path = std::env::temp_dir().join(format!("uttt-games-soft-{}.games", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("uttt-games-soft-{}.games", std::process::id()));
         save(&path, &data).unwrap();
         let back = load(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.len(), 3);
         let w = back.samples[0].wdl.unwrap();
-        assert!((w[0] - 0.5).abs() < 1e-4 && (w[1] - 0.3).abs() < 1e-4 && (w[2] - 0.2).abs() < 1e-4);
+        assert!(
+            (w[0] - 0.5).abs() < 1e-4 && (w[1] - 0.3).abs() < 1e-4 && (w[2] - 0.2).abs() < 1e-4
+        );
         assert_eq!(back.samples[0].search_value, None);
         assert_eq!(back.samples[1].wdl, None);
         assert!((back.samples[1].search_value.unwrap() + 0.25).abs() < 1e-4);

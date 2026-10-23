@@ -243,7 +243,12 @@ pub fn round_robin(
     games_per_pair: usize,
     on_match: impl FnMut(&MatchResult),
 ) -> Result<Tournament, String> {
-    round_robin_with(specs, games_per_pair, &MatchExploration::default(), on_match)
+    round_robin_with(
+        specs,
+        games_per_pair,
+        &MatchExploration::default(),
+        on_match,
+    )
 }
 
 /// [`round_robin`] with opening exploration for the lockstep matches

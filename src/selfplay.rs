@@ -557,8 +557,7 @@ fn advance_match(
             None => {
                 let a_next = game.a_to_move();
                 let next = if a_next { searches.0 } else { searches.1 };
-                game.tree =
-                    search_tree(game.state, next, exploration.root_noise, game.rng(a_next));
+                game.tree = search_tree(game.state, next, exploration.root_noise, game.rng(a_next));
             }
         }
     }

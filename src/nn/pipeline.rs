@@ -251,8 +251,7 @@ impl LoopConfig {
 
     /// Learning rate of `generation` under the schedule (generations 0 and 1 use `lr`).
     pub fn learning_rate_at(&self, generation: usize) -> f64 {
-        let decayed =
-            self.train.learning_rate * self.lr_decay.powi(generation.max(1) as i32 - 1);
+        let decayed = self.train.learning_rate * self.lr_decay.powi(generation.max(1) as i32 - 1);
         decayed.max(self.lr_min)
     }
 }
@@ -635,8 +634,16 @@ fn append_markdown(dir: &Path, cfg: &LoopConfig, report: &GenerationReport) -> R
     };
     if fresh {
         let mut header = vec![
-            "gen", "games", "lr", "sims/s", "positions", "verdict acc", "value mse",
-            "policy acc", "vs best", "promoted",
+            "gen",
+            "games",
+            "lr",
+            "sims/s",
+            "positions",
+            "verdict acc",
+            "value mse",
+            "policy acc",
+            "vs best",
+            "promoted",
         ]
         .into_iter()
         .map(str::to_string)

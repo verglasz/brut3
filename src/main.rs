@@ -446,7 +446,10 @@ fn book(
     let round_start = std::cell::Cell::new(Instant::now());
     let save = |book: &Book| {
         let header = vec![
-            format!("ultimate-ttt opening book: {} entries, plies up to {plies}", book.len()),
+            format!(
+                "ultimate-ttt opening book: {} entries, plies up to {plies}",
+                book.len()
+            ),
             format!("searched by {spec}; replies covered from {min_prior} of the visits"),
         ];
         book.save(out, &header)
@@ -672,12 +675,14 @@ fn selfplay(args: &SelfplayArgs) -> Result<(), String> {
     for run in runs {
         let (part, part_stats) = run?;
         let offset = data.games();
-        data.samples.extend(part.samples.into_iter().map(|s| {
-            ultimate_ttt_burn::nn::Sample {
-                game: s.game + offset,
-                ..s
-            }
-        }));
+        data.samples.extend(
+            part.samples
+                .into_iter()
+                .map(|s| ultimate_ttt_burn::nn::Sample {
+                    game: s.game + offset,
+                    ..s
+                }),
+        );
         stats.games += part_stats.games;
         stats.positions += part_stats.positions;
         stats.simulations += part_stats.simulations;
@@ -733,7 +738,13 @@ fn export(
     };
     let weights = match AnyModel::load(model, &backend.device())? {
         AnyModel::Nnue(m) => Weights::from_model(&m),
-        other => return Err(format!("{} is a {} model, not nnue", model.display(), other.spec())),
+        other => {
+            return Err(format!(
+                "{} is a {} model, not nnue",
+                model.display(),
+                other.spec()
+            ));
+        }
     };
     println!(
         "{}: {} parameters",
@@ -753,7 +764,11 @@ fn export(
     println!(
         "int16 stream: {} bytes in {} chunks; quantisation error over the reference positions: \
          wdl {:.2e}, value {:.2e}, policy {:.2e}",
-        report.stream_bytes, report.chunks, report.wdl_error, report.value_error, report.policy_error
+        report.stream_bytes,
+        report.chunks,
+        report.wdl_error,
+        report.value_error,
+        report.policy_error
     );
     println!("FixedVec shapes: {}", report.vecgen);
     Ok(())

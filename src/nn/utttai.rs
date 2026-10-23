@@ -63,11 +63,11 @@ pub fn import(paths: &[PathBuf]) -> Result<Dataset, String> {
     for part in parts {
         let part = part?;
         let offset = data.len();
-        data.samples.extend(
-            part.into_iter()
-                .enumerate()
-                .map(|(i, s)| Sample { game: offset + i, ..s }),
-        );
+        data.samples
+            .extend(part.into_iter().enumerate().map(|(i, s)| Sample {
+                game: offset + i,
+                ..s
+            }));
     }
     Ok(data)
 }
@@ -160,10 +160,7 @@ fn num<T: std::str::FromStr>(s: &str) -> Result<T, String> {
 /// inside `evaluatedActions{...}`.
 fn split_line(line: &str) -> Result<(Vec<&str>, Vec<&str>), String> {
     let inner = |tag: &str| -> Result<&str, String> {
-        let start = line
-            .find(tag)
-            .ok_or_else(|| format!("missing {tag}"))?
-            + tag.len();
+        let start = line.find(tag).ok_or_else(|| format!("missing {tag}"))? + tag.len();
         let end = line[start..]
             .find('}')
             .ok_or_else(|| format!("unterminated {tag}"))?;
@@ -182,7 +179,9 @@ fn split_line(line: &str) -> Result<(Vec<&str>, Vec<&str>), String> {
 pub fn parse_state(digits: &str) -> Result<Option<BitState>, String> {
     let bytes = digits.as_bytes();
     if bytes.len() != STATE_DIGITS || !bytes.iter().all(u8::is_ascii_digit) {
-        return Err(format!("state must be {STATE_DIGITS} digits, got {digits:?}"));
+        return Err(format!(
+            "state must be {STATE_DIGITS} digits, got {digits:?}"
+        ));
     }
     let digit = |i: usize| bytes[i] - b'0';
     if digit(RESULT) != 0 {
@@ -265,8 +264,7 @@ mod tests {
     use super::*;
     use crate::game::sq;
 
-    const INITIAL: &str =
-        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000190";
+    const INITIAL: &str = "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000190";
 
     #[test]
     fn parses_the_initial_position_in_both_formats() {
@@ -348,7 +346,8 @@ mod tests {
     fn imports_a_file_with_sequential_game_ids() {
         let dir = std::env::temp_dir().join(format!("uttt-utttai-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let line = format!("evaluatedState{{{INITIAL} 10 5 3 2}} evaluatedActions{{1 0 10 5 3 2}}\n");
+        let line =
+            format!("evaluatedState{{{INITIAL} 10 5 3 2}} evaluatedActions{{1 0 10 5 3 2}}\n");
         std::fs::write(dir.join("depth00.txt"), format!("{line}{line}")).unwrap();
         std::fs::write(dir.join("depth01.txt"), &line).unwrap();
         std::fs::write(dir.join("notes.md"), "ignored").unwrap();

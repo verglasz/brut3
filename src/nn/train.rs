@@ -23,9 +23,7 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use super::linear::LinearNet;
-use super::model::{
-    MOVES, Model, Verdict, expected_value, legal_mask, most_likely, predict_host,
-};
+use super::model::{MOVES, Model, Verdict, expected_value, legal_mask, most_likely, predict_host};
 use crate::agent::{AgentSpec, UtttAgent};
 use crate::game::{BitState, GameState, Move, Outcome, Symmetry};
 
@@ -324,7 +322,10 @@ impl BurnDataset<Sample> for Augmented {
         let n = self.samples.len();
         match Symmetry::ALL.get(index / n.max(1)) {
             Some(&symmetry) => Ok(self.samples[index % n].transform(symmetry)),
-            None => panic!("index out of bounds for Augmented: {index} >= {}", self.len()),
+            None => panic!(
+                "index out of bounds for Augmented: {index} >= {}",
+                self.len()
+            ),
         }
     }
 
@@ -724,7 +725,9 @@ pub fn train<M: Trainable>(
         .set_device(ad_device.clone());
     let loader_train = match opts.augment {
         Augment::All => loader_train.build(Augmented::new(train_data)),
-        Augment::None | Augment::Random => loader_train.build(InMemDataset::new(train_data.samples)),
+        Augment::None | Augment::Random => {
+            loader_train.build(InMemDataset::new(train_data.samples))
+        }
     };
     let valid_samples = valid_data.samples;
     let valid_batcher =
@@ -968,7 +971,10 @@ pub(crate) mod tests {
         }
         // Consecutive positions of one game alternate perspective, so values alternate (or
         // are all draws).
-        let (a, b) = (data.samples[0].value_target(), data.samples[1].value_target());
+        let (a, b) = (
+            data.samples[0].value_target(),
+            data.samples[1].value_target(),
+        );
         assert!(a == -b);
         assert_eq!(data.verdict_counts().iter().sum::<usize>(), data.len());
         assert!(data.baseline_policy_accuracy() > 0.0);
@@ -1019,7 +1025,10 @@ pub(crate) mod tests {
         let n = data.len();
         for (i, original) in data.samples.iter().enumerate() {
             assert_eq!(aug.get(i).as_ref().ok(), Some(original), "identity first");
-            assert_eq!(aug.get(n + i).ok(), Some(original.transform(Symmetry::ALL[1])));
+            assert_eq!(
+                aug.get(n + i).ok(),
+                Some(original.transform(Symmetry::ALL[1]))
+            );
             for sym in Symmetry::ALL {
                 let s = original.transform(sym);
                 assert_eq!(s.wdl, original.wdl);

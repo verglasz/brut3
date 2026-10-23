@@ -17,8 +17,8 @@ use super::cell_transformer::{
 };
 use super::heads::BodyConfig;
 use super::linear::{LinearNet, LinearNetConfig};
-use super::nnue::{Nnue, NnueConfig};
 use super::model::{HostPrediction, predict_host, predict_logits, predict_logits_tensor};
+use super::nnue::{Nnue, NnueConfig};
 use crate::game::BitState;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -333,11 +333,17 @@ mod tests {
         );
         assert!(ModelSpec::parse(&["board-transformer", "big"]).is_err());
         match ModelSpec::parse(&["nnue"]).unwrap() {
-            ModelSpec::Nnue(cfg) => assert_eq!((cfg.d_embed, cfg.d_acc, cfg.d_hidden, cfg.layers), (64, 256, 32, 2)),
+            ModelSpec::Nnue(cfg) => assert_eq!(
+                (cfg.d_embed, cfg.d_acc, cfg.d_hidden, cfg.layers),
+                (64, 256, 32, 2)
+            ),
             other => panic!("{other:?}"),
         }
         match ModelSpec::parse(&["nnue", "32", "512", "512", "3"]).unwrap() {
-            ModelSpec::Nnue(cfg) => assert_eq!((cfg.d_embed, cfg.d_acc, cfg.d_hidden, cfg.layers), (32, 512, 512, 3)),
+            ModelSpec::Nnue(cfg) => assert_eq!(
+                (cfg.d_embed, cfg.d_acc, cfg.d_hidden, cfg.layers),
+                (32, 512, 512, 3)
+            ),
             other => panic!("{other:?}"),
         }
         assert!(ModelSpec::parse(&["nnue", "32", "512", "512", "0"]).is_err());
