@@ -16,8 +16,8 @@
 //! File format: lines of `KEY MOVE VALUE VISITS`, where `KEY` is 81 cell digits by
 //! [`Move::index`] (0 empty, 1 X, 2 O) followed by the forced board's index (9 for a free
 //! choice), `MOVE` the chosen move's index, `VALUE` the root value for the side to move, and
-//! `VISITS` a comma-separated list of `move:count` over the moves. Lines starting with `#`
-//! are comments.
+//! `VISITS` a comma-separated list of `move:count` over the moves, then `dropped` for an entry
+//! pruned from the shipped book. Lines starting with `#` are comments.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
@@ -39,6 +39,9 @@ pub struct Entry {
     pub value: f32,
     /// Visit counts of the root's moves.
     pub visits: Vec<(Move, u32)>,
+    /// Pruned from the shipped book (`prune-book`): lookups and the export skip the entry,
+    /// while the walks over the book (deepening, common lines) still use it.
+    pub dropped: bool,
 }
 
 impl Entry {
@@ -47,6 +50,7 @@ impl Entry {
             best: result.best_move()?,
             value: result.root_value,
             visits: result.visits.clone(),
+            dropped: false,
         })
     }
 
@@ -210,20 +214,32 @@ pub fn agent_agrees(
 }
 
 impl Book {
+    /// Entries, dropped ones included.
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Entries not dropped: the shipped book.
+    pub fn live_len(&self) -> usize {
+        self.entries.values().filter(|e| !e.dropped).count()
     }
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// Every entry by canonical key, in no particular order.
+    /// Every entry not dropped by canonical key, in no particular order.
     pub fn entries(&self) -> impl Iterator<Item = (&Key, &Entry)> {
+        self.entries.iter().filter(|(_, e)| !e.dropped)
+    }
+
+    /// Every entry, dropped ones included, by canonical key in no particular order.
+    pub fn all_entries(&self) -> impl Iterator<Item = (&Key, &Entry)> {
         self.entries.iter()
     }
 
-    /// Every entry's position (in the canonical frame) with its key, sorted by key.
+    /// Every entry's position (in the canonical frame) with its key, sorted by key, dropped
+    /// entries included.
     pub fn positions(&self) -> Result<Vec<(Key, BitState)>, String> {
         let mut keys: Vec<&Key> = self.entries.keys().collect();
         keys.sort();
@@ -283,15 +299,22 @@ impl Book {
         common
     }
 
-    /// Keeps the entries for which `keep` is true.
-    pub fn retain(&mut self, mut keep: impl FnMut(&Key, &Entry) -> bool) {
-        self.entries.retain(|key, entry| keep(key, entry));
+    /// Marks the entry under `key` as dropped; returns whether it was live before.
+    pub fn drop_entry(&mut self, key: &str) -> bool {
+        match self.entries.get_mut(key) {
+            Some(entry) if !entry.dropped => {
+                entry.dropped = true;
+                true
+            }
+            _ => false,
+        }
     }
 
-    /// The book's entry for `state`, if any, with its moves mapped back to `state`'s frame.
+    /// The book's live entry for `state`, if any, with its moves mapped back to `state`'s
+    /// frame.
     pub fn lookup(&self, state: &BitState) -> Option<Entry> {
         let (sym, _, key) = canonical(state);
-        let entry = self.entries.get(&key)?;
+        let entry = self.entries.get(&key).filter(|e| !e.dropped)?;
         let back = sym.inverse();
         Some(Entry {
             best: back.apply_move(entry.best),
@@ -301,6 +324,7 @@ impl Book {
                 .iter()
                 .map(|(mv, n)| (back.apply_move(*mv), *n))
                 .collect(),
+            dropped: false,
         })
     }
 
@@ -342,6 +366,9 @@ impl Book {
             for (i, (mv, n)) in e.visits.iter().enumerate() {
                 out.push(if i == 0 { ' ' } else { ',' });
                 let _ = write!(out, "{}:{n}", mv.index());
+            }
+            if e.dropped {
+                out.push_str(" dropped");
             }
             out.push('\n');
         }
@@ -476,7 +503,9 @@ fn parse_entry(line: &str) -> Result<(Key, Entry), String> {
         .parse()
         .map_err(|_| "bad value".to_string())?;
     let mut visits = Vec::new();
-    if let Some(list) = fields.next() {
+    let mut dropped = false;
+    let mut rest = fields.peekable();
+    if let Some(list) = rest.next_if(|f| *f != "dropped") {
         for item in list.split(',') {
             let (mv, n) = item
                 .split_once(':')
@@ -485,7 +514,10 @@ fn parse_entry(line: &str) -> Result<(Key, Entry), String> {
             visits.push((move_index(mv)?, n));
         }
     }
-    if let Some(extra) = fields.next() {
+    if rest.next_if(|f| *f == "dropped").is_some() {
+        dropped = true;
+    }
+    if let Some(extra) = rest.next() {
         return Err(format!("unexpected field {extra:?}"));
     }
     Ok((
@@ -494,6 +526,7 @@ fn parse_entry(line: &str) -> Result<(Key, Entry), String> {
             best,
             value,
             visits,
+            dropped,
         },
     ))
 }
@@ -613,6 +646,7 @@ mod tests {
                     best: sym.apply_move(best),
                     value: 0.0,
                     visits,
+                    dropped: false,
                 },
             );
         };
@@ -670,6 +704,7 @@ mod tests {
                     (reply_c, 90),
                     (sym.apply_move(Move::new(sq(2, 0), sq(0, 0))), 10),
                 ],
+                dropped: false,
             },
         );
         let _ = image;
@@ -694,6 +729,7 @@ mod tests {
                 best: Move::from_index(40),
                 value: 0.0625,
                 visits: vec![(Move::from_index(40), 7), (Move::from_index(0), 3)],
+                dropped: false,
             },
         );
         let path = std::env::temp_dir().join(format!("uttt-book-{}.txt", std::process::id()));
@@ -705,6 +741,47 @@ mod tests {
         assert_eq!(back.entries, book.entries);
         assert!(Book::parse("bad line").is_err());
         assert!(Book::parse(&format!("{key} 81 0.0")).is_err());
+        assert!(Book::parse(&format!("{key} 40 0.0 40:1 dropped extra")).is_err());
+    }
+
+    #[test]
+    fn dropped_entries_are_kept_for_walks_but_not_looked_up() {
+        let root = BitState::initial();
+        let centre = Move::new(sq(1, 1), sq(1, 1));
+        let reply = Move::new(sq(1, 1), sq(0, 0));
+        let mut after = root;
+        after.apply(centre);
+        let mut book = Book::default();
+        for (state, best) in [(root, centre), (after, reply)] {
+            let (sym, _, key) = canonical(&state);
+            book.entries.insert(
+                key,
+                Entry {
+                    best: sym.apply_move(best),
+                    value: 0.0,
+                    visits: vec![(sym.apply_move(best), 10)],
+                    dropped: false,
+                },
+            );
+        }
+        assert!(book.drop_entry(&key_of(&root)));
+        assert!(!book.drop_entry(&key_of(&root)), "already dropped");
+        assert_eq!(
+            (book.len(), book.live_len(), book.entries().count()),
+            (2, 1, 1)
+        );
+        assert_eq!(book.best_move(&root), None);
+        assert_eq!(book.best_move(&after), Some(reply));
+        // The walk still passes through the dropped root to reach O's position.
+        assert!(book.common_lines(0.5).contains(&canonical(&after).2));
+
+        let path = std::env::temp_dir().join(format!("uttt-drop-{}.txt", std::process::id()));
+        book.save(&path, &[]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let back = Book::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.lines().next().unwrap().ends_with(" dropped"), "{text}");
+        assert_eq!(back.entries, book.entries);
     }
 
     #[test]
@@ -727,6 +804,7 @@ mod tests {
                 best: centre,
                 value: 0.1,
                 visits: vec![(centre, 70), (corner, 25), (edge, 5)],
+                dropped: false,
             },
         );
         let frontier = book.frontier(&cfg);

@@ -160,17 +160,26 @@ File lines: `KEY MOVE VALUE move:visits,...`. Agents use a book by ending their 
 models/book.txt" "mcts-nn models/m cuda 1000 16"`: book moves are played instantly, in
 lockstep matches too, and the search starts at the first position outside the book.
 
-To ship a smaller book, `prune-book --book models/book.txt --agent "<spec>" --out <file>`
-drops the entries whose move the agent (the engine's search at its play-time budget) plays
-anyway, counting moves equal up to the position's symmetries. Book keys hold no history, so
-each position is rebuilt from its key with a last move that sends play to the stored forced
-board. `--min-advantage a` keeps entries where the book move's share of the agent's visits
-or policy leads its second-best move by less than `a`, each move counted with its
-symmetric equivalents (a margin for a noisier search). `--keep-replies r` keeps the common lines
-unsearched: every entry reached through opponent replies of at least `r` of the book
-search's visits each, judged reply by reply (at 0.05: 7,874 of the 107,798 entries).
-`--from-ply p` keeps every entry before ply `p` unsearched as well. A
-pruned book cannot be extended by `book`, so the full book stays the source.
+To ship a smaller book, `prune-book --book <file> --out <file>` marks entries `dropped`
+(a trailing field on the line) instead of deleting them: lookups (`book <file>` agents,
+`serve`) and the export skip dropped entries, while `book` (deepening) and the walks of
+later passes still use them. So a book can be pruned in passes, in place, e.g. different
+settings from different plies, and the header gets a line per pass. A pass drops:
+
+- with `--drop-rare r`, without searching, every entry off the lines whose opponent replies
+  each had at least `r` of the book search's visits (judged reply by reply). Even `r = 0`
+  drops a third of the 107,798-entry book: the positions where the book's side is to move
+  only on the other colour's tree, stored for their visit counts but never looked up when
+  the book's moves are followed;
+- with `--agent "<spec>"`, the entries whose move the agent (the engine's search at its
+  play-time budget) plays anyway, counting moves equal up to the position's symmetries.
+  Positions are rebuilt from their keys, with a last move that sends play to the stored
+  forced board. `--min-advantage a` keeps entries where the book move leads the agent's
+  second-best by less than `a` of its visits or policy (each with its symmetric
+  equivalents); `--keep-replies k` keeps the lines of replies of at least `k` each
+  unsearched (at 0.05: 7,874 entries).
+
+`--from-ply p` limits a pass's drops to ply `p` and deeper.
 
 ## Training notes (for reproducing weights)
 
