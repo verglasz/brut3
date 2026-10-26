@@ -160,6 +160,16 @@ File lines: `KEY MOVE VALUE move:visits,...`. Agents use a book by ending their 
 models/book.txt" "mcts-nn models/m cuda 1000 16"`: book moves are played instantly, in
 lockstep matches too, and the search starts at the first position outside the book.
 
+To ship a smaller book, `prune-book --book models/book.txt --agent "<spec>" --out <file>`
+drops the entries whose move the agent (the engine's search at its play-time budget) plays
+anyway, counting moves equal up to the position's symmetries. Book keys hold no history, so
+each position is rebuilt from its key with a last move that sends play to the stored forced
+board. `--min-share s` keeps entries the agent agrees with by less than `s` of its visits
+or policy (a margin for a noisier search). `--keep-replies r` keeps the common lines
+unsearched: every entry reached through opponent replies of at least `r` of the book
+search's visits each, judged reply by reply (at 0.05: 7,874 of the 107,798 entries). A
+pruned book cannot be extended by `book`, so the full book stays the source.
+
 ## Training notes (for reproducing weights)
 
 - Data: uttt.ai stage1-mcts (8.0M positions, W/D/L counts from 1M random playouts, mover's

@@ -24,7 +24,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::agent::UtttAgent;
-use crate::game::{BitState, GameState, Move, Player, Symmetry};
+use crate::game::{BitState, GameState, Move, Player, Position, Symmetry};
 use crate::mcts::{MctsConfig, SearchResult};
 use crate::selfplay::search_positions;
 
@@ -91,6 +91,97 @@ pub fn canonical(state: &BitState) -> (Symmetry, BitState, Key) {
     best.expect("eight symmetries")
 }
 
+/// The state a key describes, in the key's frame. A key holds no move history, so the last
+/// move is set to some mark of the side that just moved whose square sends play to the key's
+/// forced board (or to a decided board when the choice is free); the rules read nothing else
+/// of it.
+pub fn state_of_key(key: &str) -> Result<BitState, String> {
+    let digits = key.as_bytes();
+    if digits.len() != Move::COUNT + 1 || !digits.iter().all(u8::is_ascii_digit) {
+        return Err(format!("bad key {key:?}"));
+    }
+    let mut position = Position::initial();
+    let (mut xs, mut os) = (0usize, 0usize);
+    for (i, &d) in digits[..Move::COUNT].iter().enumerate() {
+        let cell = match d {
+            b'0' => None,
+            b'1' => {
+                xs += 1;
+                Some(Player::X)
+            }
+            b'2' => {
+                os += 1;
+                Some(Player::O)
+            }
+            _ => return Err(format!("bad cell digit in {key:?}")),
+        };
+        position.set_cell(Move::from_index(i), cell);
+    }
+    let to_move = match xs.checked_sub(os) {
+        Some(0) => Player::X,
+        Some(1) => Player::O,
+        _ => return Err(format!("{key:?}: {xs} X marks against {os} O marks")),
+    };
+    position.set_to_move(to_move);
+    let forced = usize::from(digits[Move::COUNT] - b'0');
+    if xs + os > 0 {
+        let mover = to_move.other();
+        let last = (0..Move::COUNT).map(Move::from_index).find(|&mv| {
+            position.cell(mv) == Some(mover)
+                && if forced == 9 {
+                    position.board_status(mv.square).is_decided()
+                } else {
+                    mv.square.index() == forced
+                }
+        });
+        position.set_last_move(Some(last.ok_or_else(|| {
+            format!("{key:?}: no last move of {mover} leads to forced board {forced}")
+        })?));
+    }
+    let state = BitState::from_position(&position);
+    if key_of(&state) != key {
+        return Err(format!("{key:?} is not a reachable position"));
+    }
+    Ok(state)
+}
+
+/// The moves that are the same as `mv` in `state` up to the symmetries that leave `state`
+/// unchanged (always including `mv` itself), e.g. all four corners of the empty board.
+pub fn equivalent_moves(state: &BitState, mv: Move) -> Vec<Move> {
+    let key = key_of(state);
+    let mut moves: Vec<Move> = Symmetry::ALL
+        .into_iter()
+        .filter(|&sym| key_of(&state.transform(sym)) == key)
+        .map(|sym| sym.apply_move(mv))
+        .collect();
+    moves.sort();
+    moves.dedup();
+    moves
+}
+
+/// Whether an agent that plays `played` with move distribution `policy` at `state` finds the
+/// book move `best` anyway: `played` is `best` up to the position's symmetries, and those
+/// moves together have at least `min_share` of the policy.
+pub fn agent_agrees(
+    state: &BitState,
+    best: Move,
+    played: Move,
+    policy: &[(Move, f32)],
+    min_share: f32,
+) -> bool {
+    let same = equivalent_moves(state, best);
+    if !same.contains(&played) {
+        return false;
+    }
+    let total: f32 = policy.iter().map(|(_, p)| p.max(0.0)).sum();
+    let share: f32 = policy
+        .iter()
+        .filter(|(mv, _)| same.contains(mv))
+        .map(|(_, p)| p.max(0.0))
+        .sum();
+    total <= 0.0 || share >= min_share * total
+}
+
 impl Book {
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -103,6 +194,120 @@ impl Book {
     /// Every entry by canonical key, in no particular order.
     pub fn entries(&self) -> impl Iterator<Item = (&Key, &Entry)> {
         self.entries.iter()
+    }
+
+    /// Every entry's position (in the canonical frame) with its key, sorted by key.
+    pub fn positions(&self) -> Result<Vec<(Key, BitState)>, String> {
+        let mut keys: Vec<&Key> = self.entries.keys().collect();
+        keys.sort();
+        keys.into_iter()
+            .map(|key| Ok((key.clone(), state_of_key(key)?)))
+            .collect()
+    }
+
+    /// The entry stored under the canonical `key`.
+    pub fn get(&self, key: &str) -> Option<&Entry> {
+        self.entries.get(key)
+    }
+
+    /// How often each entry's position comes up in the games the book is built for: the
+    /// probability of reaching it when the side to move there plays the book's moves and the
+    /// other side replies in proportion to the visits the book's search gave each reply
+    /// (summed over transpositions, by canonical key). Each position is measured in the tree
+    /// where its side to move is the book's user. Entries off both trees get no value.
+    pub fn reach(&self) -> HashMap<Key, f32> {
+        let mut reach = HashMap::new();
+        for us in [Player::X, Player::O] {
+            let mut level: HashMap<Key, (BitState, f32)> = HashMap::new();
+            let root = BitState::initial();
+            level.insert(key_of(&root), (root, 1.0));
+            while !level.is_empty() {
+                let mut next: HashMap<Key, (BitState, f32)> = HashMap::new();
+                for (key, (state, p)) in level {
+                    let Some(entry) = self.entries.get(&key) else {
+                        continue;
+                    };
+                    if state.to_move() == us {
+                        reach.insert(key, p);
+                    }
+                    let total = entry.total_visits() as f32;
+                    let children: Vec<(Move, f32)> = if state.to_move() == us {
+                        vec![(entry.best, p)]
+                    } else if total > 0.0 {
+                        entry
+                            .visits
+                            .iter()
+                            .filter(|(_, n)| *n > 0)
+                            .map(|(mv, n)| (*mv, p * *n as f32 / total))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    for (mv, q) in children {
+                        let mut child = state;
+                        child.apply(mv);
+                        if child.is_terminal() {
+                            continue;
+                        }
+                        let (_, image, child_key) = canonical(&child);
+                        next.entry(child_key).or_insert((image, 0.0)).1 += q;
+                    }
+                }
+                level = next;
+            }
+        }
+        reach
+    }
+
+    /// The entries on the book's common lines: the positions reached from the start when the
+    /// side the book plays follows its book moves and the other side only plays replies that
+    /// had at least `min_reply` of the book search's visits at their ply (judged reply by reply,
+    /// not as a product along the line). Only the positions where the book's side is to move
+    /// count, the ones whose entry it plays from.
+    pub fn common_lines(&self, min_reply: f32) -> HashSet<Key> {
+        let mut common = HashSet::new();
+        let mut seen: HashSet<(Key, bool, bool)> = HashSet::new();
+        let mut queue: VecDeque<(BitState, bool, bool)> = VecDeque::new();
+        queue.push_back((BitState::initial(), true, true));
+        while let Some((state, x_line, o_line)) = queue.pop_front() {
+            if state.is_terminal() {
+                continue;
+            }
+            let (sym, _, key) = canonical(&state);
+            if !seen.insert((key.clone(), x_line, o_line)) {
+                continue;
+            }
+            let Some(entry) = self.entries.get(&key) else {
+                continue;
+            };
+            let mover = state.to_move();
+            if (mover == Player::X && x_line) || (mover == Player::O && o_line) {
+                common.insert(key);
+            }
+            let back = sym.inverse();
+            let best = back.apply_move(entry.best);
+            let total = entry.total_visits().max(1) as f32;
+            for (mv, n) in &entry.visits {
+                let mv = back.apply_move(*mv);
+                let frequent = *n as f32 / total >= min_reply;
+                let is_best = mv == best;
+                let (xl, ol) = match mover {
+                    Player::X => (x_line && is_best, o_line && frequent),
+                    Player::O => (x_line && frequent, o_line && is_best),
+                };
+                if xl || ol {
+                    let mut child = state;
+                    child.apply(mv);
+                    queue.push_back((child, xl, ol));
+                }
+            }
+        }
+        common
+    }
+
+    /// Keeps the entries for which `keep` is true.
+    pub fn retain(&mut self, mut keep: impl FnMut(&Key, &Entry) -> bool) {
+        self.entries.retain(|key, entry| keep(key, entry));
     }
 
     /// The book's entry for `state`, if any, with its moves mapped back to `state`'s frame.
@@ -365,6 +570,148 @@ mod tests {
         let forced: usize = key[81..].parse().unwrap();
         assert!(forced < 9);
         assert_eq!(image.forced_board(), Some(Square::from_index(forced)));
+    }
+
+    #[test]
+    fn states_round_trip_through_their_keys() {
+        let mut agent = RandomAgent::<BitState>::new(3);
+        for _ in 0..50 {
+            let mut s = BitState::initial();
+            while !s.is_terminal() {
+                for state in [s, canonical(&s).1] {
+                    let back = state_of_key(&key_of(&state)).expect("reachable");
+                    assert_eq!(key_of(&back), key_of(&state));
+                    assert_eq!(back.to_move(), state.to_move());
+                    assert_eq!(back.legal_moves_vec(), state.legal_moves_vec());
+                }
+                s.apply(agent.choose_move(&s));
+            }
+        }
+        assert!(state_of_key(&format!("{}9", "0".repeat(81))).is_ok());
+        assert!(state_of_key(&format!("{}4", "0".repeat(81))).is_err());
+        assert!(state_of_key(&format!("1{}9", "1".repeat(80))).is_err());
+        assert!(state_of_key("01").is_err());
+    }
+
+    #[test]
+    fn agreement_counts_symmetric_moves() {
+        let empty = BitState::initial();
+        let corner = Move::new(sq(0, 0), sq(0, 0));
+        let far_corner = Move::new(sq(2, 2), sq(2, 2));
+        let centre = Move::new(sq(1, 1), sq(1, 1));
+        assert_eq!(equivalent_moves(&empty, corner).len(), 4);
+        assert_eq!(equivalent_moves(&empty, centre), vec![centre]);
+        let policy = [(far_corner, 0.3), (corner, 0.3), (centre, 0.4)];
+        assert!(agent_agrees(&empty, corner, far_corner, &policy, 0.5));
+        assert!(!agent_agrees(&empty, corner, far_corner, &policy, 0.7));
+        assert!(!agent_agrees(&empty, corner, centre, &policy, 0.0));
+        // X in the top-middle square of the top-middle board keeps only the left-right
+        // mirror: O's top corners of that board are the same move, its corner and edge not.
+        let mut s = empty;
+        s.apply(Move::new(sq(0, 1), sq(0, 1)));
+        let a = Move::new(sq(0, 1), sq(0, 0));
+        let b = Move::new(sq(0, 1), sq(0, 2));
+        let edge = Move::new(sq(0, 1), sq(1, 0));
+        assert_eq!(equivalent_moves(&s, a), vec![a, b]);
+        assert!(agent_agrees(&s, a, b, &[(b, 1.0)], 1.0));
+        assert!(!agent_agrees(&s, a, edge, &[(edge, 1.0)], 0.0));
+    }
+
+    #[test]
+    fn reach_follows_book_moves_and_reply_shares() {
+        let mut book = Book::default();
+        let root = BitState::initial();
+        let a = Move::new(sq(1, 1), sq(1, 1));
+        let b = Move::new(sq(1, 1), sq(0, 1));
+        let insert = |book: &mut Book, state: &BitState, best: Move, visits: Vec<(Move, u32)>| {
+            let (sym, _, key) = canonical(state);
+            let visits = visits
+                .into_iter()
+                .map(|(m, n)| (sym.apply_move(m), n))
+                .collect();
+            book.entries.insert(
+                key,
+                Entry {
+                    best: sym.apply_move(best),
+                    value: 0.0,
+                    visits,
+                },
+            );
+        };
+        insert(&mut book, &root, a, vec![(a, 75), (b, 25)]);
+        let (mut after_a, mut after_b) = (root, root);
+        after_a.apply(a);
+        after_b.apply(b);
+        let reply = Move::new(sq(1, 1), sq(0, 0));
+        insert(&mut book, &after_a, reply, vec![(reply, 10)]);
+        let other = Move::new(sq(0, 1), sq(0, 0));
+        insert(&mut book, &after_b, other, vec![(other, 10)]);
+        let reach = book.reach();
+        let at = |s: &BitState| reach.get(&canonical(s).2).copied();
+        assert_eq!(at(&root), Some(1.0), "X always starts");
+        assert_eq!(
+            at(&after_a),
+            Some(0.75),
+            "O meets X's moves by their shares"
+        );
+        assert_eq!(at(&after_b), Some(0.25));
+    }
+
+    #[test]
+    fn common_lines_judge_each_reply_by_its_own_share() {
+        // X's book move a; O replies b (10%) or c (90%); after b, X's book move d; O replies
+        // e (10%) or f (90%).
+        let mut book = Book::default();
+        let insert = |book: &mut Book, state: &BitState, best: Move, visits: &[(Move, u32)]| {
+            let (sym, _, key) = canonical(state);
+            let visits = visits
+                .iter()
+                .map(|&(m, n)| (sym.apply_move(m), n))
+                .collect();
+            book.entries.insert(
+                key,
+                Entry {
+                    best: sym.apply_move(best),
+                    value: 0.0,
+                    visits,
+                },
+            );
+        };
+        let play = |s: &BitState, mv: Move| {
+            let mut next = *s;
+            next.apply(mv);
+            next
+        };
+        let root = BitState::initial();
+        let a = Move::new(sq(1, 1), sq(0, 1));
+        let (b, c) = (Move::new(sq(0, 1), sq(0, 0)), Move::new(sq(0, 1), sq(2, 2)));
+        let d = Move::new(sq(0, 0), sq(1, 1));
+        let (e, f) = (Move::new(sq(1, 1), sq(0, 0)), Move::new(sq(1, 1), sq(2, 2)));
+        insert(&mut book, &root, a, &[(a, 100)]);
+        let after_a = play(&root, a);
+        insert(&mut book, &after_a, c, &[(b, 10), (c, 90)]);
+        let after_b = play(&after_a, b);
+        insert(&mut book, &after_b, d, &[(d, 100)]);
+        let after_d = play(&after_b, d);
+        insert(&mut book, &after_d, f, &[(e, 10), (f, 90)]);
+        let after_e = play(&after_d, e);
+        insert(&mut book, &after_e, a, &[(a, 1)]);
+        let key = |s: &BitState| canonical(s).2;
+
+        let common = book.common_lines(0.05);
+        for s in [&root, &after_b, &after_e] {
+            assert!(common.contains(&key(s)), "X to move on a common line");
+        }
+        // Positions where O is to move count on the lines where the book plays O: after a
+        // (X's only move) yes, after d no, since there O plays its book move c rather than b.
+        assert!(common.contains(&key(&after_a)));
+        assert!(
+            !common.contains(&key(&after_d)),
+            "O meets d only after O's book move c"
+        );
+        let rare = book.common_lines(0.2);
+        assert!(rare.contains(&key(&root)));
+        assert!(!rare.contains(&key(&after_b)) && !rare.contains(&key(&after_e)));
     }
 
     #[test]

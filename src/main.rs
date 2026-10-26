@@ -108,6 +108,39 @@ enum Command {
         #[arg(long, default_value_t = 256)]
         concurrent: usize,
     },
+    /// Write a copy of an opening book without the entries whose move an agent plays anyway,
+    /// e.g. `prune-book --book models/book.txt --agent "mcts-nn models/m cuda 800 16"
+    /// --out models/book-pruned.txt`. A move counts as the book's when it is the same up to
+    /// the position's symmetries. The pruned book is for shipping: `book` cannot extend it,
+    /// because its walk through the book needs the dropped entries.
+    PruneBook {
+        /// Book file to prune (left unchanged).
+        #[arg(long)]
+        book: std::path::PathBuf,
+        /// The agent that plays instead of the book, as on the playing side: search agents
+        /// (`mcts`, `mcts-nn`) run batched, `mcts-nn <weights> [backend] [simulations]
+        /// [batch]`; any other agent spec plays position by position.
+        #[arg(long)]
+        agent: String,
+        /// Pruned book file to write.
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Margin on the agent's agreement: drop an entry only if the agent also gives the
+        /// book move (with its symmetric equivalents) at least this share of its visits or
+        /// policy, so that moves it barely prefers stay in the book for a weaker or noisier
+        /// search at play time.
+        #[arg(long, default_value_t = 0.0)]
+        min_share: f32,
+        /// Keep the common lines whatever the agent plays, to save search time where games
+        /// usually go: every entry reached from the start through opponent replies that each
+        /// had at least this share of the book search's visits at their ply (judged reply by
+        /// reply, so two 10% replies in a row stay with 0.05). These are not searched.
+        #[arg(long)]
+        keep_replies: Option<f32>,
+        /// Positions searched at once by a search agent.
+        #[arg(long, default_value_t = 256)]
+        concurrent: usize,
+    },
     /// Round-robin tournament between agents, e.g. `benchmark "mcts 400" "nn models/value" random`.
     Benchmark {
         /// Games per pair of agents (colours alternate; game g uses each agent's seed + g).
@@ -400,6 +433,14 @@ fn main() -> ExitCode {
             min_prior,
             concurrent,
         } => book(&search, &out, plies, min_prior, concurrent),
+        Command::PruneBook {
+            book,
+            agent,
+            out,
+            min_share,
+            keep_replies,
+            concurrent,
+        } => prune_book(&book, &agent, &out, min_share, keep_replies, concurrent),
         #[cfg(feature = "nn")]
         Command::ImportUtttai { paths, out } => import_utttai(&paths, &out),
         #[cfg(feature = "nn")]
@@ -452,6 +493,148 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn prune_book(
+    path: &std::path::Path,
+    agent: &str,
+    out: &std::path::Path,
+    min_share: f32,
+    keep_replies: Option<f32>,
+    concurrent: usize,
+) -> Result<(), String> {
+    use std::collections::{BTreeMap, HashSet};
+    use std::io::Write;
+    use std::time::Instant;
+    use ultimate_ttt_burn::agent::UtttAgent;
+    use ultimate_ttt_burn::book::{Book, agent_agrees};
+    use ultimate_ttt_burn::game::{BitState, Move};
+    use ultimate_ttt_burn::selfplay::search_positions;
+
+    if out == path
+        || std::fs::canonicalize(out).ok() == std::fs::canonicalize(path).ok() && out.exists()
+    {
+        return Err("--out must differ from --book: the full book stays the source".into());
+    }
+    let words: Vec<&str> = agent.split_whitespace().collect();
+    let spec = AgentSpec::parse(&words)?;
+    if spec.book_path().is_some() {
+        return Err(format!(
+            "{spec} plays from a book itself; give it without `book`"
+        ));
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut header: Vec<String> = text
+        .lines()
+        .map_while(|l| l.strip_prefix('#'))
+        .map(|l| l.trim().to_string())
+        .collect();
+    let mut book = Book::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let entries = book.len();
+    let common = keep_replies.map_or_else(HashSet::new, |share| book.common_lines(share));
+    // Only the entries off the common lines are candidates, and only they are searched.
+    let positions: Vec<_> = book
+        .positions()?
+        .into_iter()
+        .filter(|(key, _)| !common.contains(key))
+        .collect();
+    let states: Vec<BitState> = positions.iter().map(|(_, s)| *s).collect();
+    let total = states.len();
+    println!(
+        "pruning {} ({entries} entries, {} on common lines kept) against {spec}",
+        path.display(),
+        common.len()
+    );
+
+    let start = Instant::now();
+    let progress = |done: usize| {
+        if done.is_multiple_of(200) || done == total {
+            print!("\r  {done}/{total} ({:.0}s)", start.elapsed().as_secs_f32());
+            let _ = io::stdout().flush();
+            if done == total {
+                println!();
+            }
+        }
+    };
+    let choices: Vec<Option<(Move, Vec<(Move, f32)>)>> = match spec.search_parts()? {
+        Some((mut evaluator, search, _)) => {
+            search_positions(&mut evaluator, &states, &search, concurrent, progress)
+                .into_iter()
+                .map(|r| Some((r.best_move()?, r.policy())))
+                .collect()
+        }
+        None => {
+            let mut agent = spec.build()?;
+            states
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let choice = agent.choose_move_with_policy(s);
+                    progress(i + 1);
+                    Some(choice)
+                })
+                .collect()
+        }
+    };
+
+    // Entries, common ones and drops per ply (marks on the board).
+    let ply_of = |key: &str| key.bytes().take(Move::COUNT).filter(|&b| b != b'0').count();
+    let mut per_ply: BTreeMap<usize, (usize, usize, usize)> = BTreeMap::new();
+    for key in &common {
+        let counts = per_ply.entry(ply_of(key)).or_default();
+        counts.0 += 1;
+        counts.1 += 1;
+    }
+    let mut dropped: HashSet<String> = HashSet::new();
+    for ((key, state), choice) in positions.iter().zip(&choices) {
+        let counts = per_ply.entry(ply_of(key)).or_default();
+        counts.0 += 1;
+        let entry = book.get(key).expect("position of an entry");
+        if let Some((played, policy)) = choice
+            && agent_agrees(state, entry.best, *played, policy, min_share)
+        {
+            counts.2 += 1;
+            dropped.insert(key.clone());
+        }
+    }
+    book.retain(|key, _| !dropped.contains(key));
+    println!("ply  entries   common  dropped");
+    for (ply, (n, c, d)) in &per_ply {
+        println!("{ply:>3}  {n:>7}  {c:>7}  {d:>7}");
+    }
+    println!(
+        "kept {} of {entries} entries, dropped {} ({:.1}%), in {:.0}s",
+        book.len(),
+        dropped.len(),
+        100.0 * dropped.len() as f32 / entries.max(1) as f32,
+        start.elapsed().as_secs_f32()
+    );
+    let mut how = Vec::new();
+    if min_share > 0.0 {
+        how.push(format!("with at least {min_share} of its policy"));
+    }
+    if let Some(share) = keep_replies {
+        how.push(format!(
+            "off the lines of replies with at least {share} of the visits"
+        ));
+    }
+    header.push(format!(
+        "pruned to {} of {entries} entries: dropped the moves {spec} plays anyway{}",
+        book.len(),
+        if how.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", how.join(", "))
+        }
+    ));
+    header.push(
+        "a pruned book is for shipping; `book` cannot extend it (deepen the full book instead)"
+            .into(),
+    );
+    book.save(out, &header)?;
+    println!("wrote {}", out.display());
+    Ok(())
 }
 
 fn book(
