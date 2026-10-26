@@ -137,6 +137,10 @@ enum Command {
         /// reply, so two 10% replies in a row stay with 0.05). These are not searched.
         #[arg(long)]
         keep_replies: Option<f32>,
+        /// Only drop entries at this ply or deeper (marks on the board); the earlier ones are
+        /// kept and not searched.
+        #[arg(long, alias = "ply", default_value_t = 0)]
+        from_ply: usize,
         /// Positions searched at once by a search agent.
         #[arg(long, default_value_t = 256)]
         concurrent: usize,
@@ -439,8 +443,17 @@ fn main() -> ExitCode {
             out,
             min_advantage,
             keep_replies,
+            from_ply,
             concurrent,
-        } => prune_book(&book, &agent, &out, min_advantage, keep_replies, concurrent),
+        } => prune_book(
+            &book,
+            &agent,
+            &out,
+            min_advantage,
+            keep_replies,
+            from_ply,
+            concurrent,
+        ),
         #[cfg(feature = "nn")]
         Command::ImportUtttai { paths, out } => import_utttai(&paths, &out),
         #[cfg(feature = "nn")]
@@ -501,6 +514,7 @@ fn prune_book(
     out: &std::path::Path,
     min_advantage: f32,
     keep_replies: Option<f32>,
+    from_ply: usize,
     concurrent: usize,
 ) -> Result<(), String> {
     use std::collections::{BTreeMap, HashSet};
@@ -533,11 +547,13 @@ fn prune_book(
     let mut book = Book::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     let entries = book.len();
     let common = keep_replies.map_or_else(HashSet::new, |share| book.common_lines(share));
-    // Only the entries off the common lines are candidates, and only they are searched.
+    let ply_of = |key: &str| key.bytes().take(Move::COUNT).filter(|&b| b != b'0').count();
+    // Only the entries off the common lines from `from_ply` on are candidates, and only they
+    // are searched.
     let positions: Vec<_> = book
         .positions()?
         .into_iter()
-        .filter(|(key, _)| !common.contains(key))
+        .filter(|(key, _)| !common.contains(key) && ply_of(key) >= from_ply)
         .collect();
     let states: Vec<BitState> = positions.iter().map(|(_, s)| *s).collect();
     let total = states.len();
@@ -579,22 +595,21 @@ fn prune_book(
     };
 
     // Entries, common ones and drops per ply (marks on the board).
-    let ply_of = |key: &str| key.bytes().take(Move::COUNT).filter(|&b| b != b'0').count();
     let mut per_ply: BTreeMap<usize, (usize, usize, usize)> = BTreeMap::new();
-    for key in &common {
+    for (key, _) in book.entries() {
         let counts = per_ply.entry(ply_of(key)).or_default();
         counts.0 += 1;
-        counts.1 += 1;
+        if common.contains(key) {
+            counts.1 += 1;
+        }
     }
     let mut dropped: HashSet<String> = HashSet::new();
     for ((key, state), choice) in positions.iter().zip(&choices) {
-        let counts = per_ply.entry(ply_of(key)).or_default();
-        counts.0 += 1;
         let entry = book.get(key).expect("position of an entry");
         if let Some((played, policy)) = choice
             && agent_agrees(state, entry.best, *played, policy, min_advantage)
         {
-            counts.2 += 1;
+            per_ply.entry(ply_of(key)).or_default().2 += 1;
             dropped.insert(key.clone());
         }
     }
@@ -615,6 +630,9 @@ fn prune_book(
         how.push(format!(
             "leading its second-best move by at least {min_advantage} of its policy"
         ));
+    }
+    if from_ply > 0 {
+        how.push(format!("from ply {from_ply}"));
     }
     if let Some(share) = keep_replies {
         how.push(format!(

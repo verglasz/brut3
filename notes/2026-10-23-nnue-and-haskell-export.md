@@ -168,7 +168,8 @@ board. `--min-advantage a` keeps entries where the book move's share of the agen
 or policy leads its second-best move by less than `a`, each move counted with its
 symmetric equivalents (a margin for a noisier search). `--keep-replies r` keeps the common lines
 unsearched: every entry reached through opponent replies of at least `r` of the book
-search's visits each, judged reply by reply (at 0.05: 7,874 of the 107,798 entries). A
+search's visits each, judged reply by reply (at 0.05: 7,874 of the 107,798 entries).
+`--from-ply p` keeps every entry before ply `p` unsearched as well. A
 pruned book cannot be extended by `book`, so the full book stays the source.
 
 ## Training notes (for reproducing weights)
