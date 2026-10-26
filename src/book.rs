@@ -387,9 +387,11 @@ impl Book {
         // A node's children depend on which of the two trees it belongs to, so the visited
         // set is keyed by that too.
         let mut seen: HashSet<(Key, bool, bool)> = HashSet::new();
-        let mut queue: VecDeque<(BitState, usize, bool, bool)> = VecDeque::new();
-        queue.push_back((BitState::initial(), 0, true, true));
-        while let Some((state, ply, x_strict, o_strict)) = queue.pop_front() {
+        // The last flag: reached by its parent's book move (which main-lines mode requires
+        // of a missing position).
+        let mut queue: VecDeque<(BitState, usize, bool, bool, bool)> = VecDeque::new();
+        queue.push_back((BitState::initial(), 0, true, true, true));
+        while let Some((state, ply, x_strict, o_strict, by_best)) = queue.pop_front() {
             if state.is_terminal() {
                 continue;
             }
@@ -397,8 +399,10 @@ impl Book {
             if !seen.insert((key.clone(), x_strict, o_strict)) {
                 continue;
             }
-            let Some(entry) = self.entries.get(&key) else {
-                if ply <= cfg.plies && frontier_keys.insert(key) {
+            // A dropped entry counts as missing: a frontier position, whose stored search
+            // `extend` brings back instead of searching again.
+            let Some(entry) = self.entries.get(&key).filter(|e| !e.dropped) else {
+                if ply <= cfg.plies && (by_best || !cfg.main_lines) && frontier_keys.insert(key) {
                     frontier.push(image);
                 }
                 continue;
@@ -421,7 +425,7 @@ impl Book {
                 if xs || os {
                     let mut child = state;
                     child.apply(mv);
-                    queue.push_back((child, ply + 1, xs, os));
+                    queue.push_back((child, ply + 1, xs, os, is_best));
                 }
             }
         }
@@ -429,10 +433,11 @@ impl Book {
     }
 
     /// Searches the frontier under `cfg` with `search` over `evaluator`, round after round
-    /// (each round one ply deeper), until the book is complete to `cfg.plies`. `log` gets a
-    /// line per round; `on_done` the count of positions searched so far in the round;
+    /// (each round one ply deeper), until the book is complete to `cfg.plies`. Frontier
+    /// positions with a dropped entry are not searched again: the entry is made live. `log`
+    /// gets a line per round; `on_done` the count of positions searched so far in the round;
     /// `after_round` the book after each round's entries are in (to save it provisionally),
-    /// and its error ends the run. Returns the number of entries added.
+    /// and its error ends the run.
     pub fn extend<A: UtttAgent<State = BitState>>(
         &mut self,
         evaluator: &mut A,
@@ -441,10 +446,10 @@ impl Book {
         mut log: impl FnMut(String),
         mut on_done: impl FnMut(usize, usize),
         mut after_round: impl FnMut(&Book) -> Result<(), String>,
-    ) -> Result<usize, String> {
-        let before = self.len();
+    ) -> Result<Extension, String> {
+        let mut done = Extension::default();
         loop {
-            let frontier = self.frontier(cfg);
+            let mut frontier = self.frontier(cfg);
             if frontier.is_empty() {
                 break;
             }
@@ -458,29 +463,63 @@ impl Book {
                         .count()
                 })
                 .fold((usize::MAX, 0), |(lo, hi), p| (lo.min(p), hi.max(p)));
+            let before = frontier.len();
+            // A dropped entry comes back from its stored search when that had at least the
+            // current search's budget (a search of n simulations stores n - 1 child visits);
+            // a shallower one is searched again.
+            frontier.retain(|state| match self.entries.get_mut(&key_of(state)) {
+                Some(entry) if entry.total_visits() + 1 >= search.simulations => {
+                    entry.dropped = false;
+                    false
+                }
+                _ => true,
+            });
+            let revived = before - frontier.len();
+            done.revived += revived;
             log(format!(
-                "searching {} positions at ply {}{}",
+                "searching {} positions at ply {}{}{}",
                 frontier.len(),
                 plies.0,
                 if plies.1 != plies.0 {
                     format!(" to {}", plies.1)
                 } else {
                     String::new()
+                },
+                if revived > 0 {
+                    format!(" ({revived} dropped entries live again from their stored search)")
+                } else {
+                    String::new()
                 }
             ));
-            let total = frontier.len();
-            let results = search_positions(evaluator, &frontier, search, cfg.concurrent, |n| {
-                on_done(n, total)
-            });
-            for (state, result) in frontier.iter().zip(&results) {
-                if let Some(entry) = Entry::from_result(result) {
-                    self.entries.insert(key_of(state), entry);
+            if !frontier.is_empty() {
+                let total = frontier.len();
+                let results = search_positions(evaluator, &frontier, search, cfg.concurrent, |n| {
+                    on_done(n, total)
+                });
+                for (state, result) in frontier.iter().zip(&results) {
+                    if let Some(entry) = Entry::from_result(result) {
+                        match self.entries.insert(key_of(state), entry) {
+                            Some(_) => done.researched += 1,
+                            None => done.added += 1,
+                        }
+                    }
                 }
             }
             after_round(self)?;
         }
-        Ok(self.len() - before)
+        Ok(done)
     }
+}
+
+/// What [`Book::extend`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Extension {
+    /// Positions searched and added.
+    pub added: usize,
+    /// Dropped entries made live again from their stored search.
+    pub revived: usize,
+    /// Dropped entries searched again, their stored search having had a smaller budget.
+    pub researched: usize,
 }
 
 fn parse_entry(line: &str) -> Result<(Key, Entry), String> {
@@ -539,6 +578,10 @@ pub struct BookConfig {
     pub min_prior: f32,
     /// Positions searched at once.
     pub concurrent: usize,
+    /// Only add positions reached by their parent's book move, whichever side plays it: the
+    /// existing tree is walked as usual, but new depth grows only along the main line from
+    /// each position, not into new reply branches.
+    pub main_lines: bool,
 }
 
 impl Default for BookConfig {
@@ -547,6 +590,7 @@ impl Default for BookConfig {
             plies: 8,
             min_prior: 0.01,
             concurrent: 256,
+            main_lines: false,
         }
     }
 }
@@ -790,6 +834,7 @@ mod tests {
             plies: 2,
             min_prior: 0.2,
             concurrent: 4,
+            main_lines: false,
         };
         let mut book = Book::default();
         assert_eq!(book.frontier(&cfg), vec![BitState::initial()]);
@@ -819,6 +864,36 @@ mod tests {
         assert!(keys.contains(&canonical(&after_centre).2));
         assert!(keys.contains(&canonical(&after_corner).2));
         assert!(!frontier.iter().any(|s| s.to_move() == Player::X));
+
+        // Main lines only: just the book move's child.
+        let main = BookConfig {
+            main_lines: true,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            book.frontier(&main),
+            vec![canonical(&after_centre).1],
+            "only the centre"
+        );
+        // An existing reply branch is still walked, and grows along its own main line.
+        let reply = Move::new(sq(0, 0), sq(1, 1));
+        let (sym, _, key) = canonical(&after_corner);
+        book.entries.insert(
+            key,
+            Entry {
+                best: sym.apply_move(reply),
+                value: 0.0,
+                visits: vec![(sym.apply_move(reply), 9), (sym.apply_move(edge), 1)],
+                dropped: false,
+            },
+        );
+        let mut after_reply = after_corner;
+        after_reply.apply(reply);
+        let keys: HashSet<Key> = book.frontier(&main).iter().map(key_of).collect();
+        let expected: HashSet<Key> = [canonical(&after_centre).2, canonical(&after_reply).2]
+            .into_iter()
+            .collect();
+        assert_eq!(keys, expected);
     }
 
     #[test]
@@ -827,6 +902,7 @@ mod tests {
         // reply is covered to exercise both trees.
         let cfg = BookConfig {
             plies: 2,
+            main_lines: false,
             min_prior: 0.0,
             concurrent: 8,
         };
@@ -853,7 +929,13 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(added, book.len());
+        assert_eq!(
+            added,
+            Extension {
+                added: book.len(),
+                ..Extension::default()
+            }
+        );
         assert_eq!(saves, 3);
         assert_eq!(rounds.len(), 3, "{rounds:?}");
         assert!(rounds[0].contains("1 positions at ply 0"));
@@ -861,6 +943,46 @@ mod tests {
         // Ply 1 holds the 15 canonical first moves (the O book covers them all).
         assert!(rounds[1].contains("15 positions at ply 1"), "{rounds:?}");
         assert!(book.frontier(&cfg).is_empty());
+
+        // Dropped entries are frontier again, and come back from their stored search.
+        let ply_one: Vec<Key> = book
+            .all_entries()
+            .filter(|(k, _)| k.bytes().take(Move::COUNT).filter(|&b| b != b'0').count() == 1)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &ply_one {
+            book.drop_entry(key);
+        }
+        let stored = book.entries.clone();
+        assert_eq!(book.frontier(&cfg).len(), ply_one.len());
+        let again = book
+            .extend(&mut evaluator, &search, &cfg, |_| {}, |_, _| {}, |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            again,
+            Extension {
+                revived: ply_one.len(),
+                ..Extension::default()
+            }
+        );
+        for (key, entry) in &stored {
+            assert_eq!(book.entries[key].visits, entry.visits, "stored search kept");
+        }
+        // A bigger budget than the stored searches had: searched again instead.
+        for key in &ply_one {
+            book.drop_entry(key);
+        }
+        let deeper = MctsConfig {
+            simulations: search.simulations + 10,
+            ..search.clone()
+        };
+        let again = book
+            .extend(&mut evaluator, &deeper, &cfg, |_| {}, |_, _| {}, |_| Ok(()))
+            .unwrap();
+        // (A new best move opens lines the book did not have, so some entries are added.)
+        assert_eq!((again.researched, again.revived), (ply_one.len(), 0));
+        assert_eq!(book.live_len(), book.len());
+        assert_eq!(book.live_len(), book.len());
         // Every book position answers from any symmetric image.
         let mut s = BitState::initial();
         s.apply(book.best_move(&s).unwrap());

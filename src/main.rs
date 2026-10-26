@@ -107,6 +107,11 @@ enum Command {
         /// Positions searched at once (the evaluator batch is concurrent / 2 x the search's batch).
         #[arg(long, default_value_t = 256)]
         concurrent: usize,
+        /// Only extend the main lines: new positions must be reached by their parent's book
+        /// move, whichever side plays it, so each round deepens the principal variation from
+        /// every leaf (to --plies) without opening new reply branches.
+        #[arg(long)]
+        main_lines: bool,
     },
     /// Mark the entries of an opening book that the shipped book can do without, e.g.
     /// `prune-book --book models/book.txt --agent "mcts-nn models/m cuda 800 16" --out
@@ -444,7 +449,8 @@ fn main() -> ExitCode {
             plies,
             min_prior,
             concurrent,
-        } => book(&search, &out, plies, min_prior, concurrent),
+            main_lines,
+        } => book(&search, &out, plies, min_prior, concurrent, main_lines),
         Command::PruneBook(args) => prune_book(&args),
         #[cfg(feature = "nn")]
         Command::ImportUtttai { paths, out } => import_utttai(&paths, &out),
@@ -684,6 +690,7 @@ fn book(
     plies: usize,
     min_prior: f32,
     concurrent: usize,
+    main_lines: bool,
 ) -> Result<(), String> {
     use std::io::Write;
     use std::time::Instant;
@@ -694,31 +701,42 @@ fn book(
     let (mut evaluator, search_cfg, _) = spec
         .search_parts()?
         .ok_or_else(|| format!("{spec} is not a search; use mcts or mcts-nn"))?;
-    let mut book = if out.exists() {
-        let book = Book::load(out)?;
+    // The header keeps the lines of earlier runs and prune passes, after a fresh count.
+    let (mut book, mut history) = if out.exists() {
+        let text = std::fs::read_to_string(out)
+            .map_err(|e| format!("cannot read {}: {e}", out.display()))?;
+        let book = Book::parse(&text).map_err(|e| format!("{}: {e}", out.display()))?;
         println!("extending {} ({} entries)", out.display(), book.len());
-        book
+        let history: Vec<String> = text
+            .lines()
+            .map_while(|l| l.strip_prefix('#'))
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.starts_with("ultimate-ttt opening book:"))
+            .collect();
+        (book, history)
     } else {
-        Book::default()
+        (Book::default(), Vec::new())
     };
     let cfg = BookConfig {
         plies,
         min_prior,
         concurrent,
+        main_lines,
     };
-    println!(
-        "book to ply {plies}, replies covered from {min_prior} of the visits, searched by {spec}"
-    );
+    let run = if main_lines {
+        format!("main lines to ply {plies} searched by {spec}")
+    } else {
+        format!("to ply {plies} searched by {spec}; replies covered from {min_prior} of the visits")
+    };
+    println!("book {run}");
+    if !history.contains(&run) {
+        history.push(run);
+    }
     let start = Instant::now();
     let round_start = std::cell::Cell::new(Instant::now());
     let save = |book: &Book| {
-        let header = vec![
-            format!(
-                "ultimate-ttt opening book: {} entries, plies up to {plies}",
-                book.len()
-            ),
-            format!("searched by {spec}; replies covered from {min_prior} of the visits"),
-        ];
+        let mut header = vec![format!("ultimate-ttt opening book: {} entries", book.len())];
+        header.extend(history.iter().cloned());
         book.save(out, &header)
     };
     let added = book.extend(
@@ -748,7 +766,10 @@ fn book(
         },
     )?;
     println!(
-        "added {added} entries in {:.0}s; {} entries saved to {}",
+        "added {} entries, made {} dropped ones live again and searched {} again in {:.0}s; {} entries saved to {}",
+        added.added,
+        added.revived,
+        added.researched,
         start.elapsed().as_secs_f32(),
         book.len(),
         out.display()

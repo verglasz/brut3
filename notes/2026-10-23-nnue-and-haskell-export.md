@@ -182,6 +182,15 @@ settings from different plies, and the header gets a line per pass. A pass drops
 
 `--from-ply p` limits a pass's drops to ply `p` and deeper.
 
+`book` treats dropped entries as missing when it looks for the frontier: one that falls
+inside the tree it builds is made live again from its stored search when that had at
+least the current search's budget (n simulations store n - 1 child visits), and searched
+again otherwise. So deepening after pruning undoes the drops inside the deepened tree:
+prune last. `book --main-lines` only adds positions reached by their parent's book move,
+whichever side plays it: each round deepens the principal variation from every leaf, to
+`--plies`, without opening new reply branches. `book` keeps the header lines of earlier
+runs and prune passes and adds one per run.
+
 ## Training notes (for reproducing weights)
 
 - Data: uttt.ai stage1-mcts (8.0M positions, W/D/L counts from 1M random playouts, mover's
