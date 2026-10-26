@@ -164,8 +164,9 @@ To ship a smaller book, `prune-book --book models/book.txt --agent "<spec>" --ou
 drops the entries whose move the agent (the engine's search at its play-time budget) plays
 anyway, counting moves equal up to the position's symmetries. Book keys hold no history, so
 each position is rebuilt from its key with a last move that sends play to the stored forced
-board. `--min-share s` keeps entries the agent agrees with by less than `s` of its visits
-or policy (a margin for a noisier search). `--keep-replies r` keeps the common lines
+board. `--min-advantage a` keeps entries where the book move's share of the agent's visits
+or policy leads its second-best move by less than `a`, each move counted with its
+symmetric equivalents (a margin for a noisier search). `--keep-replies r` keeps the common lines
 unsearched: every entry reached through opponent replies of at least `r` of the book
 search's visits each, judged reply by reply (at 0.05: 7,874 of the 107,798 entries). A
 pruned book cannot be extended by `book`, so the full book stays the source.

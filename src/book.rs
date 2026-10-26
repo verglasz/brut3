@@ -145,15 +145,18 @@ pub fn state_of_key(key: &str) -> Result<BitState, String> {
     Ok(state)
 }
 
+/// The symmetries that leave `state` unchanged (the identity among them).
+fn stabiliser(state: &BitState) -> impl Iterator<Item = Symmetry> {
+    let key = key_of(state);
+    Symmetry::ALL
+        .into_iter()
+        .filter(move |&sym| key_of(&state.transform(sym)) == key)
+}
+
 /// The moves that are the same as `mv` in `state` up to the symmetries that leave `state`
 /// unchanged (always including `mv` itself), e.g. all four corners of the empty board.
 pub fn equivalent_moves(state: &BitState, mv: Move) -> Vec<Move> {
-    let key = key_of(state);
-    let mut moves: Vec<Move> = Symmetry::ALL
-        .into_iter()
-        .filter(|&sym| key_of(&state.transform(sym)) == key)
-        .map(|sym| sym.apply_move(mv))
-        .collect();
+    let mut moves: Vec<Move> = stabiliser(state).map(|sym| sym.apply_move(mv)).collect();
     moves.sort();
     moves.dedup();
     moves
@@ -161,25 +164,49 @@ pub fn equivalent_moves(state: &BitState, mv: Move) -> Vec<Move> {
 
 /// Whether an agent that plays `played` with move distribution `policy` at `state` finds the
 /// book move `best` anyway: `played` is `best` up to the position's symmetries, and those
-/// moves together have at least `min_share` of the policy.
+/// moves together lead the agent's second-best move (likewise with its symmetric
+/// equivalents) by at least `min_advantage` of the policy.
 pub fn agent_agrees(
     state: &BitState,
     best: Move,
     played: Move,
     policy: &[(Move, f32)],
-    min_share: f32,
+    min_advantage: f32,
 ) -> bool {
-    let same = equivalent_moves(state, best);
-    if !same.contains(&played) {
+    // Collected once: every move of the policy is mapped through them.
+    let syms: Vec<Symmetry> = stabiliser(state).collect();
+    let class = |mv: Move| {
+        syms.iter()
+            .map(|sym| sym.apply_move(mv))
+            .min()
+            .expect("the identity")
+    };
+    let book_class = class(best);
+    if class(played) != book_class {
         return false;
     }
     let total: f32 = policy.iter().map(|(_, p)| p.max(0.0)).sum();
-    let share: f32 = policy
+    if total <= 0.0 {
+        return true;
+    }
+    let mut shares: Vec<(Move, f32)> = Vec::new();
+    for &(mv, p) in policy {
+        let c = class(mv);
+        match shares.iter_mut().find(|(k, _)| *k == c) {
+            Some(entry) => entry.1 += p.max(0.0),
+            None => shares.push((c, p.max(0.0))),
+        }
+    }
+    let book_share = shares
         .iter()
-        .filter(|(mv, _)| same.contains(mv))
-        .map(|(_, p)| p.max(0.0))
-        .sum();
-    total <= 0.0 || share >= min_share * total
+        .find(|(k, _)| *k == book_class)
+        .map_or(0.0, |(_, p)| *p);
+    let second = shares
+        .iter()
+        .filter(|(k, _)| *k != book_class)
+        .map(|(_, p)| *p)
+        .fold(0.0, f32::max);
+    book_share - second >= min_advantage * total
 }
 
 impl Book {
@@ -208,55 +235,6 @@ impl Book {
     /// The entry stored under the canonical `key`.
     pub fn get(&self, key: &str) -> Option<&Entry> {
         self.entries.get(key)
-    }
-
-    /// How often each entry's position comes up in the games the book is built for: the
-    /// probability of reaching it when the side to move there plays the book's moves and the
-    /// other side replies in proportion to the visits the book's search gave each reply
-    /// (summed over transpositions, by canonical key). Each position is measured in the tree
-    /// where its side to move is the book's user. Entries off both trees get no value.
-    pub fn reach(&self) -> HashMap<Key, f32> {
-        let mut reach = HashMap::new();
-        for us in [Player::X, Player::O] {
-            let mut level: HashMap<Key, (BitState, f32)> = HashMap::new();
-            let root = BitState::initial();
-            level.insert(key_of(&root), (root, 1.0));
-            while !level.is_empty() {
-                let mut next: HashMap<Key, (BitState, f32)> = HashMap::new();
-                for (key, (state, p)) in level {
-                    let Some(entry) = self.entries.get(&key) else {
-                        continue;
-                    };
-                    if state.to_move() == us {
-                        reach.insert(key, p);
-                    }
-                    let total = entry.total_visits() as f32;
-                    let children: Vec<(Move, f32)> = if state.to_move() == us {
-                        vec![(entry.best, p)]
-                    } else if total > 0.0 {
-                        entry
-                            .visits
-                            .iter()
-                            .filter(|(_, n)| *n > 0)
-                            .map(|(mv, n)| (*mv, p * *n as f32 / total))
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    for (mv, q) in children {
-                        let mut child = state;
-                        child.apply(mv);
-                        if child.is_terminal() {
-                            continue;
-                        }
-                        let (_, image, child_key) = canonical(&child);
-                        next.entry(child_key).or_insert((image, 0.0)).1 += q;
-                    }
-                }
-                level = next;
-            }
-        }
-        reach
     }
 
     /// The entries on the book's common lines: the positions reached from the start when the
@@ -602,8 +580,9 @@ mod tests {
         assert_eq!(equivalent_moves(&empty, corner).len(), 4);
         assert_eq!(equivalent_moves(&empty, centre), vec![centre]);
         let policy = [(far_corner, 0.3), (corner, 0.3), (centre, 0.4)];
-        assert!(agent_agrees(&empty, corner, far_corner, &policy, 0.5));
-        assert!(!agent_agrees(&empty, corner, far_corner, &policy, 0.7));
+        // The corners together have 0.6 against the centre's 0.4.
+        assert!(agent_agrees(&empty, corner, far_corner, &policy, 0.15));
+        assert!(!agent_agrees(&empty, corner, far_corner, &policy, 0.25));
         assert!(!agent_agrees(&empty, corner, centre, &policy, 0.0));
         // X in the top-middle square of the top-middle board keeps only the left-right
         // mirror: O's top corners of that board are the same move, its corner and edge not.
@@ -615,46 +594,6 @@ mod tests {
         assert_eq!(equivalent_moves(&s, a), vec![a, b]);
         assert!(agent_agrees(&s, a, b, &[(b, 1.0)], 1.0));
         assert!(!agent_agrees(&s, a, edge, &[(edge, 1.0)], 0.0));
-    }
-
-    #[test]
-    fn reach_follows_book_moves_and_reply_shares() {
-        let mut book = Book::default();
-        let root = BitState::initial();
-        let a = Move::new(sq(1, 1), sq(1, 1));
-        let b = Move::new(sq(1, 1), sq(0, 1));
-        let insert = |book: &mut Book, state: &BitState, best: Move, visits: Vec<(Move, u32)>| {
-            let (sym, _, key) = canonical(state);
-            let visits = visits
-                .into_iter()
-                .map(|(m, n)| (sym.apply_move(m), n))
-                .collect();
-            book.entries.insert(
-                key,
-                Entry {
-                    best: sym.apply_move(best),
-                    value: 0.0,
-                    visits,
-                },
-            );
-        };
-        insert(&mut book, &root, a, vec![(a, 75), (b, 25)]);
-        let (mut after_a, mut after_b) = (root, root);
-        after_a.apply(a);
-        after_b.apply(b);
-        let reply = Move::new(sq(1, 1), sq(0, 0));
-        insert(&mut book, &after_a, reply, vec![(reply, 10)]);
-        let other = Move::new(sq(0, 1), sq(0, 0));
-        insert(&mut book, &after_b, other, vec![(other, 10)]);
-        let reach = book.reach();
-        let at = |s: &BitState| reach.get(&canonical(s).2).copied();
-        assert_eq!(at(&root), Some(1.0), "X always starts");
-        assert_eq!(
-            at(&after_a),
-            Some(0.75),
-            "O meets X's moves by their shares"
-        );
-        assert_eq!(at(&after_b), Some(0.25));
     }
 
     #[test]

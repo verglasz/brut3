@@ -125,12 +125,12 @@ enum Command {
         /// Pruned book file to write.
         #[arg(long)]
         out: std::path::PathBuf,
-        /// Margin on the agent's agreement: drop an entry only if the agent also gives the
-        /// book move (with its symmetric equivalents) at least this share of its visits or
-        /// policy, so that moves it barely prefers stay in the book for a weaker or noisier
-        /// search at play time.
+        /// Margin on the agent's agreement: drop an entry only if the book move's share of
+        /// the agent's visits or policy leads its second-best move by at least this much
+        /// (each with its symmetric equivalents), so that moves it barely prefers stay in the
+        /// book for a weaker or noisier search at play time.
         #[arg(long, default_value_t = 0.0)]
-        min_share: f32,
+        min_advantage: f32,
         /// Keep the common lines whatever the agent plays, to save search time where games
         /// usually go: every entry reached from the start through opponent replies that each
         /// had at least this share of the book search's visits at their ply (judged reply by
@@ -437,10 +437,10 @@ fn main() -> ExitCode {
             book,
             agent,
             out,
-            min_share,
+            min_advantage,
             keep_replies,
             concurrent,
-        } => prune_book(&book, &agent, &out, min_share, keep_replies, concurrent),
+        } => prune_book(&book, &agent, &out, min_advantage, keep_replies, concurrent),
         #[cfg(feature = "nn")]
         Command::ImportUtttai { paths, out } => import_utttai(&paths, &out),
         #[cfg(feature = "nn")]
@@ -499,7 +499,7 @@ fn prune_book(
     path: &std::path::Path,
     agent: &str,
     out: &std::path::Path,
-    min_share: f32,
+    min_advantage: f32,
     keep_replies: Option<f32>,
     concurrent: usize,
 ) -> Result<(), String> {
@@ -592,7 +592,7 @@ fn prune_book(
         counts.0 += 1;
         let entry = book.get(key).expect("position of an entry");
         if let Some((played, policy)) = choice
-            && agent_agrees(state, entry.best, *played, policy, min_share)
+            && agent_agrees(state, entry.best, *played, policy, min_advantage)
         {
             counts.2 += 1;
             dropped.insert(key.clone());
@@ -611,8 +611,10 @@ fn prune_book(
         start.elapsed().as_secs_f32()
     );
     let mut how = Vec::new();
-    if min_share > 0.0 {
-        how.push(format!("with at least {min_share} of its policy"));
+    if min_advantage > 0.0 {
+        how.push(format!(
+            "leading its second-best move by at least {min_advantage} of its policy"
+        ));
     }
     if let Some(share) = keep_replies {
         how.push(format!(
