@@ -169,8 +169,10 @@ struct PruneArgs {
     /// so two 10% replies in a row stay with 0.05). These are not searched.
     #[arg(long)]
     keep_replies: Option<f32>,
-    /// Drop, without searching, every entry off the lines of opponent replies with at least
-    /// this share of the visits each (the same reply-by-reply walk as --keep-replies).
+    /// Drop, without searching, the entries known to lie behind a rarer opponent reply: those
+    /// the book's lines reach (walking every reply the book has) but not the lines of
+    /// replies with at least this share of the visits each (the same reply-by-reply walk as
+    /// --keep-replies). Entries off the book's lines are left alone.
     #[arg(long)]
     drop_rare: Option<f32>,
     /// Only drop entries at this ply or deeper (marks on the board).
@@ -545,12 +547,13 @@ fn prune_book(args: &PruneArgs) -> Result<(), String> {
     }
     let start = Instant::now();
 
-    // Rare lines go without a search.
+    // Rare lines go without a search: entries on the book's lines but off the frequent ones.
     if let Some(share) = args.drop_rare {
+        let all_lines = book.common_lines(0.0);
         let lines = book.common_lines(share);
         let rare: Vec<String> = book
             .entries()
-            .filter(|(key, _)| deep(key) && !lines.contains(*key))
+            .filter(|(key, _)| deep(key) && all_lines.contains(*key) && !lines.contains(*key))
             .map(|(key, _)| key.clone())
             .collect();
         for key in rare {

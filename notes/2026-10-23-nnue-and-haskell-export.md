@@ -166,11 +166,12 @@ To ship a smaller book, `prune-book --book <file> --out <file>` marks entries `d
 later passes still use them. So a book can be pruned in passes, in place, e.g. different
 settings from different plies, and the header gets a line per pass. A pass drops:
 
-- with `--drop-rare r`, without searching, every entry off the lines whose opponent replies
-  each had at least `r` of the book search's visits (judged reply by reply). Even `r = 0`
-  drops a third of the 107,798-entry book: the positions where the book's side is to move
-  only on the other colour's tree, stored for their visit counts but never looked up when
-  the book's moves are followed;
+- with `--drop-rare r`, without searching, the entries known to lie behind a rarer reply:
+  reached by the book's lines (every reply the book has) but not by the lines whose opponent
+  replies each had at least `r` of the book search's visits (judged reply by reply).
+  Entries off the book's lines (a third of the 107,798-entry book: positions where the
+  book's side is to move only on the other colour's tree, stored for their visit counts)
+  are left alone; only an agent pass can drop them;
 - with `--agent "<spec>"`, the entries whose move the agent (the engine's search at its
   play-time budget) plays anyway, counting moves equal up to the position's symmetries.
   Positions are rebuilt from their keys, with a last move that sends play to the stored
