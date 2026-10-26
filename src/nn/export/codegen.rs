@@ -12,13 +12,15 @@
 
 use std::fmt::Write as _;
 
+use super::haskell::{bundle_body_begin, bundle_body_end, bundle_imports};
 use super::vecgen::VecSpec;
 
 use crate::game::LINES;
 use crate::nn::model::MOVES;
 use crate::nn::nnue::{
-    BOARDS, CELLS, CONTENT_ROWS, CONTENTS, DECIDED_BASE, FEATURE_ROWS, FORCED_BASE, IDS_PER_BOARD,
-    LINE_BASE, LINE_STATES, NnueConfig, OPEN_MARKS_BASE,
+    BOARDS, CELL_BASE, CELL_PAD, CELLS, CONTENT_ROWS, CONTENTS, DECIDED_BASE, FEATURE_ROWS,
+    FORCED_BASE, FULL, IDS_PER_BOARD, LINE_BASE, LINE_STATES, NO_FORCED, NnueConfig, OPEN_CONTENTS,
+    OPEN_MARKS_BASE, WON_BY_ME, WON_BY_THEM,
 };
 
 /// Width of a chunk of a wide vector, and of the fold's row pieces.
@@ -136,12 +138,20 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
     header(&mut s, &format!("{prefix}.Net"), "", "-O2 -fobject-code");
     let _ = writeln!(
         s,
-        "-- {prefix}.FixedVec is written by the same export (equivalently, gen/vecgen.py with:\n--   {}).\n",
+        "-- {prefix}.FixedVec is written by the same export (equivalently, gen/vecgen.py with:\n--   {}\n-- plus the bundle markers).\n",
         vec_spec(names, prefix).command()
     );
     let _ = writeln!(s, "import Decode (chunksOf, decodeFloats, decodeRowsWith)");
     let _ = writeln!(s, "import {prefix}.FixedVec");
-    let _ = writeln!(s, "import {prefix}.Weights (Array (..), arrays)\n");
+    let _ = writeln!(s, "import {prefix}.Spec (cellBase, cellPad, openContents)");
+    let _ = writeln!(s, "import {prefix}.Weights (Array (..), arrays)");
+    bundle_imports(&mut s, &[]);
+    bundle_body_begin(
+        &mut s,
+        "VecE, VecA, VecH, FoldPiece, OpenClosed (ocOpen, ocFull, ocWonByUs, ocWonByThem), \
+         splitOpenClosed, Net (every field starts with net), net, genZeroChunk, genZero3, \
+         foldRow, lineFeature, accumulateRows, hiddenOf, wdlOf, policyLogits",
+    );
     let _ = writeln!(s, "type VecE = {}", Names::vec(e));
     let _ = writeln!(s, "type VecA = {}", Names::vec(a));
     let _ = writeln!(s, "type VecH = {}", Names::vec(h));
@@ -150,15 +160,47 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
         "-- | {CHUNK} rows of the fold: a piece of a board's first-layer slice."
     );
     let _ = writeln!(s, "type FoldPiece = {}\n", Names::rows(CHUNK, e));
+    let _ = writeln!(
+        s,
+        r#"-- | A per-content table: the open contents (ids 0..{last_open}, raw-code order) and the three
+-- decided kinds (ids {FULL} fullId, {WON_BY_ME} wonByMe, {WON_BY_THEM} wonByThem).
+data OpenClosed a = OpenClosed
+  {{ ocOpen :: [a]
+  , ocFull :: !a
+  , ocWonByUs :: !a
+  , ocWonByThem :: !a
+  }}
+  deriving (Functor)
+
+-- | Splits a decoded per-content array into its table and whatever follows the table, failing
+-- with the array's name if it is shorter than Gen.Spec says.
+splitOpenClosed :: String -> [a] -> (OpenClosed a, [a])
+splitOpenClosed name xs = case splitAt openContents xs of
+  (open, full : me : them : rest) -> (OpenClosed open full me them, rest)
+  _ -> error ("net: array " ++ name ++ " is shorter than Gen.Spec says")
+"#,
+        last_open = OPEN_CONTENTS - 1
+    );
 
     // The record.
+    let content_ids = format!("content rows, ids 0..{}", CONTENTS - 1);
+    let no_forced_id = format!("id {NO_FORCED} (noForced)");
+    let cell_ids = format!(
+        "{} rows, ids {CELL_BASE}..{}, at 3 * cell + v (v: 0 empty, 1 mine, 2 theirs)",
+        CELL_PAD - CELL_BASE,
+        CELL_PAD - 1
+    );
+    let pad_id = format!("id {CELL_PAD} (cellPad)");
     let _ = writeln!(s, "data Net = Net");
     let mut fields: Vec<(String, String, &str)> = vec![
         (
             "netContent".into(),
-            "[VecE]".into(),
-            "content rows by id (contents, no-forced, cells, pad)",
+            "(OpenClosed VecE)".into(),
+            &content_ids,
         ),
+        ("netNoForced".into(), "VecE".into(), &no_forced_id),
+        ("netCells".into(), "[VecE]".into(), &cell_ids),
+        ("netPad".into(), "VecE".into(), &pad_id),
         (
             "netMix".into(),
             "[[FoldPiece]]".into(),
@@ -218,12 +260,12 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
     fields.extend([
         (
             "netLocal".into(),
-            format!("[{}]", Names::vec(CELLS)),
+            format!("(OpenClosed {})", Names::vec(CELLS)),
             "each content's own cell logits",
         ),
         (
             "netSend".into(),
-            "[Float]".into(),
+            "(OpenClosed Float)".into(),
             "each content's send logit",
         ),
     ]);
@@ -268,6 +310,12 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
         s,
         "      pieces r = map fromListRows{CHUNK}_{e} (chunksOf {CHUNK} r)"
     );
+    let _ = writeln!(
+        s,
+        "      table name xs = case splitOpenClosed name xs of\n\
+         \x20       (t, []) -> t\n\
+         \x20       _ -> error (\"net: array \" ++ name ++ \" is longer than Gen.Spec says\")"
+    );
     let _ = writeln!(s, "      expected = {}", hs_strings(manifest_names));
     let _ = writeln!(s, "   in case arrays of");
     let vars_: Vec<String> = (0..manifest_names.len()).map(|i| format!("a{i}")).collect();
@@ -307,17 +355,28 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
         "              policyBiases = map fromList{CELLS} (chunksOf {CELLS} (floats 1 {MOVES} a{}))",
         policy_index + 1
     );
-    let _ = writeln!(s, "           in Net");
     let mut step = 0usize;
     let mut next = || {
         let i = step;
         step += 1;
         i
     };
-    let mut inits = vec![format!(
-        "netContent = rows {CONTENT_ROWS} {e} fromListRest{e} a{}",
+    // The content array: the per-content table, then no-forced, the cell rows and the pad.
+    let _ = writeln!(
+        s,
+        "              (contentTable, contentRest) = splitOpenClosed \"content\" (rows {CONTENT_ROWS} {e} fromListRest{e} a{})\n\
+         \x20             (noForcedRow, cellRows, padRow) = case contentRest of\n\
+         \x20               noF : rest | (cells, [pad]) <- splitAt (cellPad - cellBase) rest -> (noF, cells, pad)\n\
+         \x20               _ -> error \"net: array content does not end in the no-forced, cell and pad rows of Gen.Spec\"",
         next()
-    )];
+    );
+    let _ = writeln!(s, "           in Net");
+    let mut inits = vec![
+        "netContent = contentTable".to_string(),
+        "netNoForced = noForcedRow".to_string(),
+        "netCells = cellRows".to_string(),
+        "netPad = padRow".to_string(),
+    ];
     let mix_list: Vec<String> = (0..BOARDS)
         .map(|_| format!("pieces (rows {a} {e} fromListRest{e} a{})", next()))
         .collect();
@@ -370,10 +429,13 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
         inits.push(format!("netPolicyBias{b} = policyBiases !! {b}"));
     }
     inits.push(format!(
-        "netLocal = rows {CONTENTS} {CELLS} fromListRest{CELLS} a{}",
+        "netLocal = table \"local\" (rows {CONTENTS} {CELLS} fromListRest{CELLS} a{})",
         next()
     ));
-    inits.push(format!("netSend = floats {CONTENTS} 1 a{}", next()));
+    inits.push(format!(
+        "netSend = table \"send\" (floats {CONTENTS} 1 a{})",
+        next()
+    ));
     assert_eq!(step, manifest_names.len(), "one decode per array");
     for (i, init) in inits.iter().enumerate() {
         let sep = if i == 0 { "{" } else { "," };
@@ -386,10 +448,10 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
     );
 
     // Forward pieces.
-    let _ = writeln!(s, "zeroChunk :: Vec{CHUNK}");
-    let _ = writeln!(s, "zeroChunk = replicate{CHUNK} 0\n");
-    let _ = writeln!(s, "zero3' :: Vec3");
-    let _ = writeln!(s, "zero3' = replicate3 0\n");
+    let _ = writeln!(s, "genZeroChunk :: Vec{CHUNK}");
+    let _ = writeln!(s, "genZeroChunk = replicate{CHUNK} 0\n");
+    let _ = writeln!(s, "genZero3 :: Vec3");
+    let _ = writeln!(s, "genZero3 = replicate3 0\n");
     let _ = writeln!(
         s,
         "-- | The folded first-layer row of a board token at board k (k = {BOARDS} for the forced\n\
@@ -399,7 +461,7 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
     let ps = vars("p", k);
     let parts: Vec<String> = ps
         .iter()
-        .map(|p| format!("(linear{CHUNK}_{e} {p} zeroChunk t)"))
+        .map(|p| format!("(linear{CHUNK}_{e} {p} genZeroChunk t)"))
         .collect();
     let _ = writeln!(
         s,
@@ -436,8 +498,8 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
     );
     let _ = writeln!(
         s,
-        "accumulateRows n rows forced lineCodes decided marks =\n\
-         \x20 let features = sel{FORCED_FEATURES}_{a} forced (netForcedFeature n) : zipWith (\\l code -> sel{LINE_STATES}_{a} code (lineFeature n l)) [0 ..] lineCodes ++ [sel{DECIDED_FEATURES}_{a} decided (netDecidedFeature n), sel{MARKS_FEATURES}_{a} marks (netMarksFeature n)]\n\
+        "accumulateRows n rows forcedBoard lineCodes decided marks =\n\
+         \x20 let features = sel{FORCED_FEATURES}_{a} forcedBoard (netForcedFeature n) : zipWith (\\l code -> sel{LINE_STATES}_{a} code (lineFeature n l)) [0 ..] lineCodes ++ [sel{DECIDED_FEATURES}_{a} decided (netDecidedFeature n), sel{MARKS_FEATURES}_{a} marks (netMarksFeature n)]\n\
          \x20  in relu{a} (foldl add{a} (netMixBias n) (rows ++ features))\n"
     );
     let _ = writeln!(s, "-- | The last hidden layer.");
@@ -451,13 +513,13 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
     let _ = writeln!(s, "wdlOf :: Net -> VecA -> VecH -> Vec3");
     let _ = writeln!(
         s,
-        "wdlOf n acc h = add3 (linear3_{h} (netValue n) (netValueBias n) h) (linear3_{a} (netSkip n) zero3' acc)\n"
+        "wdlOf n acc h = add3 (linear3_{h} (netValue n) (netValueBias n) h) (linear3_{a} (netSkip n) genZero3 acc)\n"
     );
     let _ = writeln!(
         s,
         "-- | The global part of the nine move logits of board b; the full logits add the\n\
-         -- board's own cell logits (netLocal n !! content b) and, at square j, the send logit\n\
-         -- netSend n !! content j."
+         -- board's own cell logits (netLocal n at content b) and, at square j, the send logit\n\
+         -- (netSend n at content j)."
     );
     let _ = writeln!(s, "policyLogits :: Net -> VecH -> Int -> Vec{CELLS}");
     let _ = writeln!(s, "policyLogits n h b = case b of");
@@ -467,7 +529,8 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
             "  {b} -> linear{CELLS}_{h} (netPolicy{b} n) (netPolicyBias{b} n) h"
         );
     }
-    let _ = writeln!(s, "  _ -> error \"policyLogits: board out of range\"\n");
+    let _ = writeln!(s, "  _ -> error \"policyLogits: board out of range\"");
+    bundle_body_end(&mut s);
     s
 }
 
@@ -491,19 +554,33 @@ pub fn selftest_module(names: &Names, prefix: &str) -> String {
     let _ = writeln!(s, "import {prefix}.Net");
     let _ = writeln!(s, "import {prefix}.Reference");
     let _ = writeln!(s, "import {prefix}.Spec\n");
-    let _ = writeln!(
-        s,
-        "-- | A board token from its {IDS_PER_BOARD} ids, looking the rows up in the content list\n\
-         -- (slow: for tests and for building a table, not for the search)."
-    );
-    let _ = writeln!(s, "tokenOf :: Net -> [Int] -> VecE");
-    let _ = writeln!(
-        s,
-        "tokenOf n ids = foldl1 add{e} (map (netContent n !!) ids)"
-    );
-    let _ = writeln!(s, "{{-# NOINLINE tokenOf #-}}\n");
     let text = format!(
-        r#"-- | The eleven global feature ids of a position's ids as the local indices the
+        r#"-- | Entry i of a per-content table, in the training numbering (ids 0..{last_content}).
+byId :: OpenClosed a -> Int -> a
+byId t i
+  | i < openContents = ocOpen t !! i
+  | i == fullId = ocFull t
+  | i == wonByMe = ocWonByUs t
+  | i == wonByThem = ocWonByThem t
+  | otherwise = error ("byId: " ++ show i ++ " is not a content id")
+
+-- | Row i of the content array in the training numbering: a content, the no-forced row, a
+-- cell row or the padding row.
+contentRow :: Net -> Int -> VecE
+contentRow n i
+  | i < noForced = byId (netContent n) i
+  | i == noForced = netNoForced n
+  | i < cellPad = netCells n !! (i - cellBase)
+  | i == cellPad = netPad n
+  | otherwise = error ("contentRow: " ++ show i ++ " is not a content row")
+
+-- | A board token from its {IDS_PER_BOARD} ids, looking the rows up in the content lists
+-- (slow: for tests and for building a table, not for the search).
+tokenOf :: Net -> [Int] -> VecE
+tokenOf n ids = foldl1 add{e} (map (contentRow n) ids)
+{{-# NOINLINE tokenOf #-}}
+
+-- | The eleven global feature ids of a position's ids as the local indices the
 -- feature tables take: forced board, the eight line codes, decided boards, open marks.
 localFeatures :: [Int] -> (Int, [Int], Int, Int)
 localFeatures ids =
@@ -541,7 +618,7 @@ moveLogit n ids hid m =
   let board = m `div` 9
       square = m `mod` 9
       content b = ids !! (b * idsPerBoard)
-   in index9 square (policyLogits n hid board) + index9 square (netLocal n !! content board) + netSend n !! content square
+   in index9 square (policyLogits n hid board) + index9 square (byId (netLocal n) (content board)) + byId (netSend n) (content square)
 
 softmax :: [Float] -> [Float]
 softmax zs = let m = maximum zs; es = map (\z -> exp (z - m)) zs; t = sum es in map (/ t) es
@@ -592,14 +669,15 @@ bench iters = do
                    | otherwise = let total' = step i total in total' `seq` loop (i + 1) total'
   -- Decode everything first: the strict fields of Net force a list-valued table only to its
   -- first element, so without this most of the decoding would land inside the timed loop.
-  let walkLists = sum (map (index{e} 0) (netContent n)) + sum (netSend n) + sum (map (index9 0) (netLocal n)) + sum [index{e} 0 (sel{CHUNK}_{e} 0 p) | ps <- netForced n : netMix n, p <- ps]
+  let walkLists = sum (map (index{e} 0) (ocOpen (netContent n) ++ netCells n)) + sum (ocOpen (netSend n)) + sum (map (index9 0) (ocOpen (netLocal n))) + sum [index{e} 0 (sel{CHUNK}_{e} 0 p) | ps <- netForced n : netMix n, p <- ps]
       walkRefs = sum [index3 0 wdl + index{a} 0 acc + index{h} 0 hid | r <- refs, let (acc, hid, wdl) = evalIds n (refIds r)]
   warm <- return $! walkLists + walkRefs + sum (map (\(rows, _) -> sum (map (index{a} 0) rows)) inputs)
   t0 <- getMonotonicTimeNSec
   total <- return $! loop 0 warm
   t1 <- getMonotonicTimeNSec
   putStrLn ("bench: " ++ show (fromIntegral (t1 - t0) / 1000 / fromIntegral iters :: Double) ++ " us per evaluation (checksum " ++ show total ++ ")")
-"#
+"#,
+        last_content = CONTENTS - 1
     );
     s.push_str(&text);
     s

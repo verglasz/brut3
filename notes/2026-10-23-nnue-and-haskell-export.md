@@ -204,11 +204,17 @@ lockstep matches too, and the search starts at the first position outside the bo
   marks 73) indexed by local ids; the policy head is nine `Rows9_H` + `Vec9` giving a
   board's nine logits with `linear9_H`; the accumulator is a `foldl addA` over the 21 rows
   then `reluA`. Requires `A` a multiple of 64 and `H` at most 64 or a multiple of it.
+  The per-content tables (`netContent`, `netLocal`, `netSend`) are `OpenClosed` values: the
+  open contents in raw-code order (`ocOpen`) and one entry each for full, won by the side to
+  move and won by the opponent; the content array's other rows are `netNoForced`,
+  `netCells` (27, at `3 * cell + v`) and `netPad`. `splitOpenClosed` cuts the decoded
+  arrays with the counts of `Gen.Spec` and fails naming the array on any other length.
 - `Reference.hs`: positions with cells, side to move, last move, forced board, raw codes,
   the input ids, accumulator, hidden layer, W/D/L logits and probabilities, and every legal
   move's logit and probability, as computed by the **int16-rounded** weights (so the port
   should match to Float rounding, not to quantisation error).
-- `SelfTest.hs` (verification only): `tokenOf` (tokens by list lookup), `selfTest`, which
+- `SelfTest.hs` (verification only): `byId` and `contentRow` (the tables in the training
+  numbering), `tokenOf` (tokens by list lookup), `selfTest`, which
   replays the references from their ids through `Net` and checks the deviations, and
   `bench n`, which times accumulator + MLP + value head + nine policy logits.
 - `Book.hs` (with `--book models/book.txt`, with or without a model): the canonical entries
@@ -223,16 +229,27 @@ lockstep matches too, and the search starts at the first position outside the bo
   symmetry on ties" means the same on both sides. The 14k-entry book is 354 KB of bytes
   (8 literals), compiles in 3 s and passes its 44 lookups.
 
+Every module carries `{-# LANGUAGE Safe #-}`. The five that ship (`Weights`, `FixedVec`,
+`Net`, `Spec`, `Book`) mark the sections the Haskell project's bundler concatenates into the
+single contest file (its `notes/2026-10-26-exporter-changes.md`): `{- BUNDLE IMPORTS BEGIN -}`
+/ `END` around the imports from base, `{- BUNDLE BODY BEGIN -}` / `END` around the top-level
+declarations, each body preceded by a comment listing the names it defines. Outside the
+markers (pragmas, module header, imports of other bundled modules) is dropped, so all bodies
+share one namespace with the engine: internal names carry a prefix (`weights_<array>_<k>`,
+`genZeroChunk`, `genZero3`) and no binder uses an engine name such as `forced`. `FixedVec` is
+`vecgen.py`'s output plus the markers. Checked by bundling the medium net's modules with
+`Decode` into one Safe module, which compiles and runs.
+
 The Rust side of the same arithmetic is `export::scalar` (`Weights::evaluate`), checked
 against burn's forward pass; the export report prints the quantisation error of the
 rounded weights over the reference positions.
 
-Measured (GHC 9.10.3, `-O2 -XSafe`, one core), including `FixedVec`:
+Measured (GHC 9.10.3, `-O2 -XSafe`, one core), including `FixedVec`, on 2026-10-26:
 
 | model | params | int16 stream | quantisation error (wdl / policy) | compile | self-test | µs per eval after the fold |
 |---|---|---|---|---|---|---|
-| `nnue 64 128 32 2` | 0.99M | 2.0 MB, 59 literals | 1.8e-4 / 3.6e-4 | 12 s, 0.35 GB | max dev 9e-6 | 7–10 |
-| `nnue 64 512 128 4` | 1.59M | 3.2 MB, 84 literals | 2.8e-4 / 1.5e-3 | 60 s, 1.8–2.3 GB | max dev 1e-5 | 100–140 |
+| `nnue 64 128 32 2` | 0.99M | 2.0 MB, 59 literals | 1.8e-4 / 3.6e-4 | 6–7 s | max dev 6e-6 | 6 |
+| `nnue 64 512 128 4` | 1.59M | 3.2 MB, 84 literals | 2.8e-4 / 1.5e-3 | 13–17 s | max dev 1e-5 | 61–71 (noisy) |
 
 The chunked layout (8 x `Vec64` for A 512) is what makes the medium net cheap to compile
 and fast to run: flat 512-wide functions were 60 s / 2.3 GB to compile and ~100 µs per

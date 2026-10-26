@@ -10,6 +10,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::haskell::{BODY_BEGIN, BODY_END, IMPORTS_BEGIN, IMPORTS_END};
+
 /// Soft line width for wrapped field lists.
 const LINE: usize = 92;
 
@@ -205,9 +207,15 @@ impl VecSpec {
         out.join(" ")
     }
 
-    /// The module's text.
+    /// The module's text, as `gen/vecgen.py` writes it.
     pub fn generate(&self) -> String {
-        Gen::new(self).generate()
+        Gen::new(self).generate(false)
+    }
+
+    /// The module's text with its imports and declarations inside the bundler's markers
+    /// (otherwise the same as [`VecSpec::generate`]).
+    pub fn generate_bundled(&self) -> String {
+        Gen::new(self).generate(true)
     }
 }
 
@@ -912,7 +920,7 @@ impl<'a> Gen<'a> {
 
     // ------------------------------------------------------------ driver
 
-    fn generate(mut self) -> String {
+    fn generate(mut self, bundle: bool) -> String {
         let spec = self.spec;
         let mut floats: BTreeSet<usize> = spec.floats.clone();
         let dense = spec.dense.clone();
@@ -953,8 +961,12 @@ impl<'a> Gen<'a> {
         };
         sums.sort_by_key(|&(k, n)| (n, k));
 
+        self.push("{-# LANGUAGE Safe #-}");
         self.push(format!("module {} where", spec.module));
         self.push("");
+        if bundle {
+            self.push(IMPORTS_BEGIN);
+        }
         if floats.iter().any(|&n| n <= 64 && self.chunks(n).is_none()) {
             self.push("import Data.Bits (testBit)");
         }
@@ -968,7 +980,19 @@ impl<'a> Gen<'a> {
             }
             self.push(format!("import Data.Int ({})", types.join(", ")));
         }
+        if bundle {
+            self.push(IMPORTS_END);
+        }
         self.push("");
+        if bundle {
+            self.push(
+                "-- Top-level names: the vector families of gen/vecgen.py, every name ending in its",
+            );
+            self.push(
+                "-- widths (Vec64, Rows9_128, fromListRest512, dot64, linear9_128, concat8_64, ...).",
+            );
+            self.push(BODY_BEGIN);
+        }
         self.push("-- BEGIN GENERATED VEC  (gen/vecgen.py; do not edit by hand)");
         self.push("{- FOURMOLU_DISABLE -}");
         self.push("");
@@ -1001,6 +1025,9 @@ impl<'a> Gen<'a> {
         }
         self.push("{- FOURMOLU_ENABLE -}");
         self.push("-- END GENERATED VEC");
+        if bundle {
+            self.push(BODY_END);
+        }
         let mut text = self.out.join("\n");
         text.push('\n');
         text
