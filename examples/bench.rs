@@ -1,6 +1,8 @@
 //! Throughput numbers for the engine, agents and (with the `nn` feature) network evaluators.
-//! Run with `cargo run --release --all-features --example bench`.
+//! Run with `cargo run --release --all-features --example bench [-- FILTER...]`: with
+//! filters, only the cases whose label contains one of them.
 
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use brut3::agent::{GreedyAgent, MinimaxAgent, RandomAgent, UtttAgent};
@@ -9,7 +11,22 @@ use brut3::mcts::{Mcts, MctsConfig};
 use brut3::selfplay::{SelfPlayConfig, self_play};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
-fn time<R>(label: &str, f: impl FnOnce() -> (R, u64, &'static str)) -> R {
+/// Whether a case labelled `label` is selected by the command line's filters.
+fn wanted(label: &str) -> bool {
+    static FILTERS: OnceLock<Vec<String>> = OnceLock::new();
+    let filters = FILTERS.get_or_init(|| {
+        std::env::args()
+            .skip(1)
+            .filter(|a| !a.starts_with("--"))
+            .collect()
+    });
+    filters.is_empty() || filters.iter().any(|f| label.contains(f.as_str()))
+}
+
+fn time<R: Default>(label: &str, f: impl FnOnce() -> (R, u64, &'static str)) -> R {
+    if !wanted(label) {
+        return R::default();
+    }
     let start = Instant::now();
     let (r, count, unit) = f();
     let secs = start.elapsed().as_secs_f64();
@@ -163,6 +180,10 @@ fn network_benchmarks() {
         runs.push(("nnue 64 512 128 4, unfolded", nnue.clone(), backend, false));
     }
     for (name, words, kind, folded) in runs {
+        if !wanted(&format!("{name} on {kind}")) && !wanted(&format!("self-play {name} on {kind}"))
+        {
+            continue;
+        }
         let spec = ModelSpec::parse(&words).unwrap();
         let agent = NetAgent::new(spec.init(&kind.device()), kind);
         let mut agent = if folded { agent } else { agent.unfolded() };
@@ -173,7 +194,7 @@ fn network_benchmarks() {
             agent.evaluate_batch(&positions[..batch], &mut out);
             time(&format!("{name} on {kind}, batch {batch}"), || {
                 let mut n = 0u64;
-                let rounds = (8192 / batch).max(4);
+                let rounds = (65536 / batch).max(16);
                 for i in 0..rounds {
                     let from = (i * batch) % (positions.len() - batch);
                     out.clear();
@@ -183,15 +204,18 @@ fn network_benchmarks() {
                 ((), n, "leaves")
             });
         }
-        time(&format!("self-play {name}, 64 games x 8, 100 sims"), || {
-            let cfg = SelfPlayConfig {
-                simulations: 100,
-                tree_batch: 8,
-                concurrent: 64,
-                ..Default::default()
-            };
-            let (_, stats) = self_play(&mut agent, 64, &cfg, |_| {});
-            ((), stats.simulations, "simulations")
-        });
+        time(
+            &format!("self-play {name} on {kind}, 64 games x 8, 100 sims"),
+            || {
+                let cfg = SelfPlayConfig {
+                    simulations: 100,
+                    tree_batch: 8,
+                    concurrent: 64,
+                    ..Default::default()
+                };
+                let (_, stats) = self_play(&mut agent, 64, &cfg, |_| {});
+                ((), stats.simulations, "simulations")
+            },
+        );
     }
 }
