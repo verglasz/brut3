@@ -664,17 +664,19 @@ impl Book {
                 continue;
             }
             let (sym, image, key) = canonical(&state);
-            if !seen.insert((key.clone(), x_strict, o_strict)) {
-                continue;
-            }
             // A dropped entry counts as missing: a frontier position, whose stored search
-            // `extend` brings back instead of searching again.
+            // `extend` brings back instead of searching again. Missing positions stay out of
+            // `seen`: another path may reach one through its parent's book move, which
+            // main-lines mode asks for.
             let Some(entry) = self.entries.get(&key).filter(|e| !e.dropped) else {
                 if ply <= cfg.plies && (by_best || !cfg.main_lines) && frontier_keys.insert(key) {
                     frontier.push(image);
                 }
                 continue;
             };
+            if !seen.insert((key, x_strict, o_strict)) {
+                continue;
+            }
             if ply >= cfg.plies {
                 continue;
             }
