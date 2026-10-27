@@ -107,6 +107,12 @@ enum Command {
         ///                    residualM_M = relu (x + bias + rows . x); adds RowsM_N
         ///   --concat K:N,..  concatK_N: K vectors of width N into one of width K * N
         ///   --sum K:N,..     sumK_N: the componentwise sum of K vectors of width N
+        ///   --axpy K:N,..    axpyK_N s0 c0 .. acc = acc + s0 * c0 + .. (K scaled vectors)
+        ///   --cols M:N,..    ColsN_M, the columns of a layer with M outputs and N inputs, and
+        ///                    columnsM_N, their transposition from RowsM_N (run once, at load)
+        ///   --sparse M:N[:K],.. sparseDenseM_N, and when M = N sparseResidualM: denseM_N and
+        ///                    residualM_M computed by columns over the nonzero inputs only,
+        ///                    K columns per pass (default 8); adds the columns and axpys
         ///   --alias NAME=N,.. type NAME = VecN
         #[arg(last = true, verbatim_doc_comment)]
         vec_flags: Vec<String>,

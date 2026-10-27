@@ -12,8 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::haskell::{BODY_BEGIN, BODY_END, IMPORTS_BEGIN, IMPORTS_END};
 
-/// Soft line width for wrapped field lists.
-const LINE: usize = 92;
+/// Columns per pass of a sparse layer unless `--sparse M:N:K` says otherwise (K = 4 measured
+/// the same, K = 1 slower than the dense layer).
+pub const SPARSE_K: usize = 8;
 
 /// What to generate, in the terms of the export's FixedVec flags.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -31,6 +32,14 @@ pub struct VecSpec {
     pub concats: Vec<(usize, usize)>,
     /// `sumK_N`.
     pub sums: Vec<(usize, usize)>,
+    /// `axpyK_N`, as `(k, n)`: `acc + s0 * c0 + .. + s(K-1) * c(K-1)`.
+    pub axpys: Vec<(usize, usize)>,
+    /// Column containers `(m, n)` of a layer with `m` outputs and `n` inputs: `ColsN_M` and
+    /// `columnsM_N`, adding `RowsM_N`.
+    pub cols: Vec<(usize, usize)>,
+    /// Sparse layers `(m, n, k)`: `sparseDenseM_N` (and `sparseResidualM`), computed by
+    /// columns over the nonzero inputs, `k` columns per pass; adds the columns and axpys.
+    pub sparse: Vec<(usize, usize, usize)>,
     /// `type NAME = VecN`.
     pub aliases: Vec<(String, usize)>,
     pub module: String,
@@ -107,6 +116,23 @@ impl VecSpec {
                     }
                 }
                 "--rows" => spec.rows.extend(pairs(value(i)?)?),
+                "--axpy" => spec.axpys.extend(pairs(value(i)?)?),
+                "--cols" => spec.cols.extend(pairs(value(i)?)?),
+                "--sparse" => {
+                    for part in value(i)?.split(',').filter(|p| !p.is_empty()) {
+                        let nums: Vec<usize> =
+                            part.split(':').map(num).collect::<Result<_, _>>()?;
+                        match nums[..] {
+                            [m, n] => spec.sparse.push((m, n, SPARSE_K)),
+                            [m, n, k] if k > 0 => spec.sparse.push((m, n, k)),
+                            _ => {
+                                return Err(format!(
+                                    "FixedVec flags: expected M:N or M:N:K, got {part:?}"
+                                ));
+                            }
+                        }
+                    }
+                }
                 "--dense" => spec.dense.extend(pairs(value(i)?)?),
                 "--concat" => spec.concats.extend(pairs(value(i)?)?),
                 "--sum" => spec.sums.extend(pairs(value(i)?)?),
@@ -139,11 +165,18 @@ impl VecSpec {
             (&mut self.dense, &other.dense),
             (&mut self.concats, &other.concats),
             (&mut self.sums, &other.sums),
+            (&mut self.axpys, &other.axpys),
+            (&mut self.cols, &other.cols),
         ] {
             for p in src {
                 if !dst.contains(p) {
                     dst.push(*p);
                 }
+            }
+        }
+        for p in &other.sparse {
+            if !self.sparse.contains(p) {
+                self.sparse.push(*p);
             }
         }
         for a in &other.aliases {
@@ -190,10 +223,26 @@ impl VecSpec {
             ("--dense", &self.dense),
             ("--concat", &self.concats),
             ("--sum", &self.sums),
+            ("--axpy", &self.axpys),
+            ("--cols", &self.cols),
         ] {
             if !v.is_empty() {
                 out.push(format!("{flag} {}", pairs(v)));
             }
+        }
+        if !self.sparse.is_empty() {
+            let sparse: Vec<String> = self
+                .sparse
+                .iter()
+                .map(|&(m, n, k)| {
+                    if k == SPARSE_K {
+                        format!("{m}:{n}")
+                    } else {
+                        format!("{m}:{n}:{k}")
+                    }
+                })
+                .collect();
+            out.push(format!("--sparse {}", sparse.join(",")));
         }
         if !self.aliases.is_empty() {
             let aliases: Vec<String> = self
@@ -248,23 +297,30 @@ fn names(prefix: &str, n: usize) -> Vec<String> {
         .collect()
 }
 
-/// Lays `items` out on lines of at most `LINE` characters.
-pub(super) fn wrap(items: &[String], indent: usize, first_indent: Option<usize>) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut cur = " ".repeat(first_indent.unwrap_or(indent));
-    let body_indent = " ".repeat(indent);
-    for it in items {
-        if cur.trim().is_empty() {
-            cur.push_str(it);
-        } else if cur.len() + 1 + it.len() > LINE {
-            lines.push(std::mem::replace(&mut cur, format!("{body_indent}{it}")));
-        } else {
-            cur.push(' ');
-            cur.push_str(it);
-        }
+/// `items` on one line at `indent`: a pattern or an expression is never broken across lines
+/// (they read best whole, however long).
+pub(super) fn line(items: &[String], indent: usize) -> String {
+    format!("{}{}", " ".repeat(indent), items.join(" "))
+}
+
+/// Elements longer than this put an application's elements one per line.
+const LONG_ELEMENT: usize = 30;
+
+/// An application `head e1 e2 ..` (`items = [head, e1, ..]`) at `indent`: on one line, or,
+/// when an element is a long computation of its own, the head on its line and each element
+/// on its own line two deeper. An element is never broken across lines.
+pub(super) fn apply(items: &[String], indent: usize) -> Vec<String> {
+    let (head, elements) = items.split_first().expect("a head");
+    if elements.iter().all(|e| e.len() <= LONG_ELEMENT) {
+        return vec![line(items, indent)];
     }
-    lines.push(cur);
-    lines
+    let mut out = vec![format!("{}{head}", " ".repeat(indent))];
+    out.extend(
+        elements
+            .iter()
+            .map(|e| format!("{}{e}", " ".repeat(indent + 2))),
+    );
+    out
 }
 
 /// Sums `terms` as a balanced tree, `((t0 + t1) + (t2 + t3)) + ..`: GHC never reassociates
@@ -332,15 +388,18 @@ impl<'a> Gen<'a> {
         self.out.push(line.into());
     }
 
-    fn wrap(&mut self, items: &[String], indent: usize, first_indent: Option<usize>) {
-        self.out.extend(wrap(items, indent, first_indent));
+    fn line(&mut self, items: &[String], indent: usize) {
+        self.out.push(line(items, indent));
+    }
+
+    fn apply(&mut self, items: &[String], indent: usize) {
+        self.out.extend(apply(items, indent));
     }
 
     fn chunks(&self, n: usize) -> Option<(usize, usize)> {
         self.spec.nest.get(&n).copied()
     }
 
-    /// `case scrut of` at indent `d`, the single alternative `con fields ->` on the next line.
     /// `case (s0, s1, ..) of` at indent `d`, its one alternative matching every scrutinee
     /// against its pattern, one pattern per line however long (they read best whole); the
     /// body goes at indent `d + 4` (continuations `d + 6`). GHC never builds the tuple.
@@ -371,9 +430,10 @@ impl<'a> Gen<'a> {
             "{{- A fixed-width vector of {n} {elem} values, one strict unpacked field per"
         ));
         self.push("   coordinate (coordinate i is field i, counting from 0). -}");
-        self.push(format!("data {t}"));
-        self.push(format!("  = {t}"));
-        self.wrap(&vec![format!("{{-# UNPACK #-}} !{elem}"); n], 6, None);
+        self.push(format!(
+            "data {t} = {t} {}",
+            vec![format!("{{-# UNPACK #-}} !{elem}"); n].join(" ")
+        ));
         self.push("");
         let (fl, tl, ix) = (f("fromList"), f("toList"), f("index"));
         self.push(format!("{{- {fl} xs"));
@@ -382,10 +442,10 @@ impl<'a> Gen<'a> {
             "   PRE: length xs >= {n}; extra elements are ignored -}}"
         ));
         self.push(format!("{fl} :: [{elem}] -> {t}"));
-        self.wrap(&[format!("{fl} ({}:_) =", a.join(":"))], 2, Some(0));
+        self.line(&[format!("{fl} ({}:_) =", a.join(":"))], 0);
         let mut items = vec![t.clone()];
         items.extend(a.iter().cloned());
-        self.wrap(&items, 4, Some(2));
+        self.apply(&items, 2);
         self.push(format!("{fl} _ = error \"{fl}: list too short\""));
         self.push("");
         let fr = f("fromListRest");
@@ -393,20 +453,16 @@ impl<'a> Gen<'a> {
             "-- {fr} xs: the {t} of the first {n} elements of xs, and the rest of xs"
         ));
         self.push(format!("{fr} :: [{elem}] -> ({t}, [{elem}])"));
-        self.wrap(&[format!("{fr} ({}:rest) =", a.join(":"))], 2, Some(0));
+        self.line(&[format!("{fr} ({}:rest) =", a.join(":"))], 0);
         let mut items = vec![format!("({t}")];
         items.extend(a[..last].iter().cloned());
         items.push(format!("{}, rest)", a[last]));
-        self.wrap(&items, 4, Some(2));
+        self.apply(&items, 2);
         self.push(format!("{fr} _ = error \"{fr}: list too short\""));
         self.push("");
         self.push(format!("-- {tl} v: the coordinates of v in order"));
         self.push(format!("{tl} :: {t} -> [{elem}]"));
-        self.wrap(
-            &self.pattern_head(&format!("{tl} ({t}"), &a, ") ="),
-            2,
-            Some(0),
-        );
+        self.line(&self.pattern_head(&format!("{tl} ({t}"), &a, ") ="), 0);
         let mut items = vec![format!("[{}{}", a[0], if n > 1 { "," } else { "" })];
         for x in &a[1..last.max(1)] {
             items.push(format!("{x},"));
@@ -416,17 +472,13 @@ impl<'a> Gen<'a> {
         } else {
             items.push("]".to_string());
         }
-        self.wrap(&items, 4, Some(2));
+        self.apply(&items, 2);
         self.push("");
         self.push(format!(
             "-- {ix} i v: coordinate i of v (a jump table).  PRE: 0 <= i < {n}"
         ));
         self.push(format!("{ix} :: Int -> {t} -> {elem}"));
-        self.wrap(
-            &self.pattern_head(&format!("{ix} i ({t}"), &a, ") ="),
-            2,
-            Some(0),
-        );
+        self.line(&self.pattern_head(&format!("{ix} i ({t}"), &a, ") ="), 0);
         self.push("  case i of");
         for (i, x) in a.iter().enumerate() {
             self.push(format!("    {i} -> {x}"));
@@ -440,21 +492,17 @@ impl<'a> Gen<'a> {
         self.push(format!("{rp} :: {elem} -> {t}"));
         let mut items = vec![format!("{rp} x = {t}")];
         items.extend(std::iter::repeat_n("x".to_string(), n));
-        self.wrap(&items, 2, Some(0));
+        self.apply(&items, 0);
         self.push("");
         self.push(format!(
             "-- {mp} f v: f applied to every coordinate (INLINE so f is known at the call site)"
         ));
         self.push(format!("{{-# INLINE {mp} #-}}"));
         self.push(format!("{mp} :: ({elem} -> {elem}) -> {t} -> {t}"));
-        self.wrap(
-            &self.pattern_head(&format!("{mp} f ({t}"), &a, ") ="),
-            2,
-            Some(0),
-        );
+        self.line(&self.pattern_head(&format!("{mp} f ({t}"), &a, ") ="), 0);
         let mut items = vec![t.clone()];
         items.extend(a.iter().map(|x| format!("(f {x})")));
-        self.wrap(&items, 4, Some(2));
+        self.apply(&items, 2);
         self.push("");
         self.push(format!(
             "-- {cb} f u v: f applied coordinatewise to u and v (both forced before matching)"
@@ -474,18 +522,14 @@ impl<'a> Gen<'a> {
         );
         let mut items = vec![t.clone()];
         items.extend(a.iter().zip(&b).map(|(x, y)| format!("(f {x} {y})")));
-        self.wrap(&items, 8, Some(6));
+        self.apply(&items, 6);
         self.push("");
         self.emit_arith(n, elem, &t, &mp, &cb);
         let (sm, dt) = (f("sum"), f("dot"));
         self.push(format!("-- {sm} v: the sum of the coordinates of v"));
         self.push(format!("{sm} :: {t} -> {elem}"));
-        self.wrap(
-            &self.pattern_head(&format!("{sm} ({t}"), &a, ") ="),
-            2,
-            Some(0),
-        );
-        self.wrap(&split_words(&sum_tree(&a)), 4, Some(2));
+        self.line(&self.pattern_head(&format!("{sm} ({t}"), &a, ") ="), 0);
+        self.line(&split_words(&sum_tree(&a)), 2);
         if n >= 32 {
             self.push(format!("{{-# NOINLINE {sm} #-}}"));
         }
@@ -508,7 +552,7 @@ impl<'a> Gen<'a> {
             .zip(&b)
             .map(|(x, y)| format!("{x} * {y}"))
             .collect();
-        self.wrap(&split_words(&sum_tree(&products)), 8, Some(6));
+        self.line(&split_words(&sum_tree(&products)), 6);
         self.push(format!("{{-# NOINLINE {dt} #-}}"));
         self.push("");
         if !int_vec && n <= 64 {
@@ -517,14 +561,13 @@ impl<'a> Gen<'a> {
                 "   RETURNS: the maximum of acc and the coordinates v_i for which bit i of mask is clear -}",
             );
             self.push(format!("maskedMax{n} :: Int -> {t} -> Float -> Float"));
-            self.wrap(
+            self.line(
                 &self.pattern_head(
                     &format!("maskedMax{n} m ({t}"),
                     &a,
                     &format!(") acc{} =", pad_index(0, n + 1)),
                 ),
-                2,
-                Some(0),
+                0,
             );
             self.push("  let");
             for (i, x) in a.iter().enumerate() {
@@ -541,10 +584,9 @@ impl<'a> Gen<'a> {
                 "   RETURNS: the vector with coordinate i = exp (v_i - c) where bit i of mask is clear, 0 where set -}",
             );
             self.push(format!("maskedExp{n} :: Int -> Float -> {t} -> {t}"));
-            self.wrap(
+            self.line(
                 &self.pattern_head(&format!("maskedExp{n} m c ({t}"), &a, ") ="),
-                2,
-                Some(0),
+                0,
             );
             let mut items = vec![t.clone()];
             items.extend(
@@ -552,7 +594,7 @@ impl<'a> Gen<'a> {
                     .enumerate()
                     .map(|(i, x)| format!("(if testBit m {i} then 0 else exp ({x} - c))")),
             );
-            self.wrap(&items, 4, Some(2));
+            self.apply(&items, 2);
             self.push("");
         }
     }
@@ -674,7 +716,7 @@ impl<'a> Gen<'a> {
         self.push(format!("{mp} f ({t} {}) =", c.join(" ")));
         let mut items = vec![t.clone()];
         items.extend(c.iter().map(|ci| format!("({} f {ci})", g("map"))));
-        self.wrap(&items, 4, Some(2));
+        self.apply(&items, 2);
         self.push("");
         self.push(format!("{{-# INLINE {cb} #-}}"));
         self.push(format!(
@@ -695,7 +737,7 @@ impl<'a> Gen<'a> {
                 .zip(&d)
                 .map(|(ci, di)| format!("({} f {ci} {di})", g("combine"))),
         );
-        self.wrap(&items, 8, Some(6));
+        self.apply(&items, 6);
         self.push("");
         // Arithmetic as one call per chunk (the chunk functions are NOINLINE).
         for base in ["add", "sub"] {
@@ -716,7 +758,7 @@ impl<'a> Gen<'a> {
                     .zip(&d)
                     .map(|(ci, di)| format!("({} {ci} {di})", g(base))),
             );
-            self.wrap(&items, 8, Some(6));
+            self.apply(&items, 6);
             self.push("");
         }
         if elem == "Float" {
@@ -724,13 +766,13 @@ impl<'a> Gen<'a> {
             self.push(format!("scale{n} s ({t} {}) =", c.join(" ")));
             let mut items = vec![t.clone()];
             items.extend(c.iter().map(|ci| format!("(scale{m} s {ci})")));
-            self.wrap(&items, 4, Some(2));
+            self.apply(&items, 2);
             self.push("");
             self.push(format!("relu{n} :: {t} -> {t}"));
             self.push(format!("relu{n} ({t} {}) =", c.join(" ")));
             let mut items = vec![t.clone()];
             items.extend(c.iter().map(|ci| format!("(relu{m} {ci})")));
-            self.wrap(&items, 4, Some(2));
+            self.apply(&items, 2);
             self.push("");
         }
         let (sm, dt) = (f("sum"), f("dot"));
@@ -756,7 +798,7 @@ impl<'a> Gen<'a> {
             .zip(&d)
             .map(|(ci, di)| format!("{} {ci} {di}", g("dot")))
             .collect();
-        self.wrap(&split_words(&sum_tree(&dots)), 8, Some(6));
+        self.line(&split_words(&sum_tree(&dots)), 6);
         self.push(format!("{{-# NOINLINE {dt} #-}}"));
         self.push("");
     }
@@ -788,10 +830,7 @@ impl<'a> Gen<'a> {
                 let mut toks = vec![format!("Vec{n}")];
                 for i in 0..k {
                     let inner = self.con(m, &es[i * m..(i + 1) * m]);
-                    let last = inner.len() - 1;
-                    toks.push(format!("({}", inner[0]));
-                    toks.extend(inner[1..last].iter().cloned());
-                    toks.push(format!("{})", inner[last]));
+                    toks.push(format!("({})", inner.join(" ")));
                 }
                 toks
             }
@@ -804,18 +843,18 @@ impl<'a> Gen<'a> {
         self.push(format!(
             "{{- {m} rows of width {n}: a matrix stored one row per output, row i = field i. -}}"
         ));
-        self.push(format!("data {r_ty}"));
-        self.push(format!("  = {r_ty}"));
-        self.wrap(&vec![format!("!{v_ty}"); m], 6, None);
+        self.push(format!(
+            "data {r_ty} = {r_ty} {}",
+            vec![format!("!{v_ty}"); m].join(" ")
+        ));
         self.push("");
         self.push(format!(
             "-- sel{m}_{n} i rows: row i (a jump table).  PRE: 0 <= i < {m}"
         ));
         self.push(format!("sel{m}_{n} :: Int -> {r_ty} -> {v_ty}"));
-        self.wrap(
+        self.line(
             &self.pattern_head(&format!("sel{m}_{n} i ({r_ty}"), &r, ") ="),
-            2,
-            Some(0),
+            0,
         );
         self.push("  case i of");
         for (i, ri) in r.iter().enumerate() {
@@ -827,14 +866,10 @@ impl<'a> Gen<'a> {
             "-- fromListRows{m}_{n} rs: the matrix whose row i is rs !! i.  PRE: length rs >= {m}"
         ));
         self.push(format!("fromListRows{m}_{n} :: [{v_ty}] -> {r_ty}"));
-        self.wrap(
-            &[format!("fromListRows{m}_{n} ({}:_) =", r.join(":"))],
-            2,
-            Some(0),
-        );
+        self.line(&[format!("fromListRows{m}_{n} ({}:_) =", r.join(":"))], 0);
         let mut items = vec![r_ty.clone()];
         items.extend(r.iter().cloned());
-        self.wrap(&items, 4, Some(2));
+        self.apply(&items, 2);
         self.push(format!(
             "fromListRows{m}_{n} _ = error \"fromListRows{m}_{n}: list too short\""
         ));
@@ -883,7 +918,7 @@ impl<'a> Gen<'a> {
                 })
                 .collect();
             let con = self.con(m, &cells);
-            self.wrap(&con, bd + 2, Some(bd));
+            self.apply(&con, bd);
             self.push(format!("{{-# NOINLINE {fun} #-}}"));
             self.push("");
         }
@@ -917,7 +952,7 @@ impl<'a> Gen<'a> {
             .collect();
         self.case_match(&scruts, &pats, 2);
         let con = self.con(k * n, &vs);
-        self.wrap(&con, 8, Some(6));
+        self.apply(&con, 6);
         self.push("");
     }
 
@@ -952,7 +987,7 @@ impl<'a> Gen<'a> {
                         .collect();
                     items.push(format!("(sum{k}_{m} {})", terms.join(" ")));
                 }
-                self.wrap(&items, 8, Some(6));
+                self.apply(&items, 6);
             }
             None => {
                 let pats: Vec<String> = (0..k)
@@ -971,11 +1006,275 @@ impl<'a> Gen<'a> {
                         .collect();
                     items.push(format!("({})", terms.join(" + ")));
                 }
-                self.wrap(&items, 8, Some(6));
+                self.apply(&items, 6);
             }
         }
         self.push(format!("{{-# NOINLINE {fun} #-}}"));
         self.push("");
+    }
+
+    // ------------------------------------------------------------ sparse layers
+
+    /// The input chunking of a layer with `n` inputs: `(g, Some(k))` for `k` chunks of width
+    /// `g`, `(n, None)` for a flat input.
+    fn input_groups(&self, n: usize) -> (usize, Option<usize>) {
+        match self.chunks(n) {
+            Some((k, g)) => (g, Some(k)),
+            None => (n, None),
+        }
+    }
+
+    /// `axpyK_N s0 c0 .. acc`: `acc + s0 * c0 + .. + s(K-1) * c(K-1)` componentwise. Flat it is
+    /// one `NOINLINE` constructor of `N` sums; nested, an `INLINE` call per chunk.
+    fn emit_axpy(&mut self, k: usize, n: usize) {
+        let v = format!("Vec{n}");
+        let fun = format!("axpy{k}_{n}");
+        let (ss, cs) = (names("s", k), names("c", k));
+        self.push(format!(
+            "-- {fun} s0 c0 .. acc: acc + s0 * c0 + .. componentwise ({k} scaled columns)"
+        ));
+        let mut sig: Vec<String> = (0..k)
+            .flat_map(|_| ["Float".to_string(), v.clone()])
+            .collect();
+        sig.extend([v.clone(), v.clone()]);
+        self.push(format!("{fun} :: {}", sig.join(" -> ")));
+        let args: Vec<String> = ss
+            .iter()
+            .zip(&cs)
+            .map(|(s, c)| format!("!{s} !{c}"))
+            .collect();
+        self.push(format!("{fun} {} !acc =", args.join(" ")));
+        let mut scruts: Vec<&str> = cs.iter().map(String::as_str).collect();
+        scruts.push("acc");
+        let (width, chunk) = match self.chunks(n) {
+            Some((kk, m)) => (kk, Some(m)),
+            None => (n, None),
+        };
+        // Fields: chunks of a nested vector, lanes of a flat one.
+        let fields: Vec<Vec<String>> = (0..k)
+            .map(|i| {
+                (0..width)
+                    .map(|j| format!("x{}_{}", pad_index(i, k), pad_index(j, width)))
+                    .collect()
+            })
+            .collect();
+        let acc = names("a", width);
+        let mut pats: Vec<String> = fields
+            .iter()
+            .map(|f| format!("{v} {}", f.join(" ")))
+            .collect();
+        pats.push(format!("{v} {}", acc.join(" ")));
+        self.case_match(&scruts, &pats, 2);
+        let mut items = vec![v.clone()];
+        items.extend((0..width).map(|j| match chunk {
+            Some(m) => {
+                let pairs: Vec<String> = (0..k)
+                    .map(|i| format!("{} {}", ss[i], fields[i][j]))
+                    .collect();
+                format!("(axpy{k}_{m} {} {})", pairs.join(" "), acc[j])
+            }
+            None => {
+                let terms: Vec<String> = std::iter::once(acc[j].clone())
+                    .chain((0..k).map(|i| format!("{} * {}", ss[i], fields[i][j])))
+                    .collect();
+                format!("({})", terms.join(" + "))
+            }
+        }));
+        self.apply(&items, 6);
+        let prag = if chunk.is_some() {
+            "INLINE"
+        } else {
+            "NOINLINE"
+        };
+        self.push(format!("{{-# {prag} {fun} #-}}"));
+        self.push("");
+    }
+
+    /// `ColsG_M`: `g` columns of width `m`, the group a layer's columns come in per input chunk.
+    fn emit_column_group(&mut self, g: usize, m: usize) {
+        let ty = format!("Cols{g}_{m}");
+        self.push(format!(
+            "{{- {g} columns of width {m}: a layer's columns (one per input) for {g} inputs. -}}"
+        ));
+        self.push(format!(
+            "data {ty} = {ty} {}",
+            vec![format!("!Vec{m}"); g].join(" ")
+        ));
+        self.push("");
+    }
+
+    /// `ColsN_M` (for a nested input) and `columnsM_N`, the transposition from the rows.
+    fn emit_cols(&mut self, m: usize, n: usize) {
+        let ty = format!("Cols{n}_{m}");
+        let (g, groups) = self.input_groups(n);
+        if let Some(k) = groups {
+            self.push(format!(
+                "{{- The columns of a layer with {m} outputs and {n} inputs, {k} groups of {g}. -}}"
+            ));
+            self.push(format!(
+                "data {ty} = {ty} {}",
+                vec![format!("!Cols{g}_{m}"); k].join(" ")
+            ));
+            self.push("");
+        }
+        let fun = format!("columns{m}_{n}");
+        self.push(format!(
+            "-- {fun} rows: the layer's columns (one per input) from its rows (one per output);"
+        ));
+        self.push("-- a transposition, meant to run once, at load");
+        self.push(format!("{fun} :: Rows{m}_{n} -> {ty}"));
+        self.push(format!("{fun} rows ="));
+        self.push(format!(
+            "  let rs = [sel{m}_{n} i rows | i <- [0 .. {}]]",
+            m - 1
+        ));
+        self.push(format!(
+            "      col j = fromList{m} [index{n} j r | r <- rs]"
+        ));
+        let mut items = vec![ty.clone()];
+        match groups {
+            Some(k) => {
+                let mut group = vec![format!("group g = Cols{g}_{m}")];
+                group.extend((0..g).map(|j| format!("(col ({g} * g + {j}))")));
+                self.line(&group, 6);
+                items.extend((0..k).map(|i| format!("(group {i})")));
+            }
+            None => items.extend((0..n).map(|j| format!("(col {j})"))),
+        }
+        let mut body = vec!["in".to_string()];
+        body.extend(items);
+        self.line(&body, 3);
+        self.push("");
+    }
+
+    /// `gatherG_M x cols rest`: the `(x_j, column j)` pairs of the nonzero `x_j`, in order,
+    /// consed onto `rest`, each step strict so that only the list cells and pairs allocate.
+    fn emit_gather(&mut self, g: usize, m: usize) {
+        let fun = format!("gather{g}_{m}");
+        let (a, k, r) = (names("a", g), names("k", g), names("r", g));
+        self.push(format!(
+            "-- {fun} x cols rest: the (x_j, column j) pairs of the nonzero x_j, consed onto rest"
+        ));
+        self.push(format!(
+            "{fun} :: Vec{g} -> Cols{g}_{m} -> [(Float, Vec{m})] -> [(Float, Vec{m})]"
+        ));
+        self.push(format!("{fun} !x !cols rest ="));
+        self.case_match(
+            &["x", "cols"],
+            &[
+                format!("Vec{g} {}", a.join(" ")),
+                format!("Cols{g}_{m} {}", k.join(" ")),
+            ],
+            2,
+        );
+        for j in (0..g).rev() {
+            let next = if j + 1 == g { "rest" } else { &r[j + 1] };
+            let lead = if j + 1 == g { "let" } else { "   " };
+            self.push(format!(
+                "      {lead} !{} = if {} == 0 then {next} else ({}, {}) : {next}",
+                r[j], a[j], a[j], k[j]
+            ));
+        }
+        self.push(format!("       in {}", r[0]));
+        self.push(format!("{{-# NOINLINE {fun} #-}}"));
+        self.push("");
+    }
+
+    /// `addColumnsK_M acc pairs`: `acc` plus `s * column` over the pairs, `k` per `axpyK_M`
+    /// call, then one at a time.
+    fn emit_add_columns(&mut self, k: usize, m: usize) {
+        let fun = format!("addColumns{k}_{m}");
+        self.push(format!(
+            "-- {fun} acc pairs: acc plus s * column over the (s, column) pairs, {k} per pass"
+        ));
+        self.push(format!("{fun} :: Vec{m} -> [(Float, Vec{m})] -> Vec{m}"));
+        if k > 1 {
+            let (ss, cs) = (names("s", k), names("c", k));
+            let pairs: Vec<String> = ss
+                .iter()
+                .zip(&cs)
+                .map(|(s, c)| format!("({s}, {c})"))
+                .collect();
+            let args: Vec<String> = ss
+                .iter()
+                .zip(&cs)
+                .map(|(s, c)| format!("{s} {c}"))
+                .collect();
+            self.push(format!(
+                "{fun} !acc ({} : rest) = {fun} (axpy{k}_{m} {} acc) rest",
+                pairs.join(" : "),
+                args.join(" ")
+            ));
+        }
+        self.push(format!(
+            "{fun} !acc ((s, c) : rest) = {fun} (axpy1_{m} s c acc) rest"
+        ));
+        self.push(format!("{fun} !acc [] = acc"));
+        self.push("");
+    }
+
+    /// `sparseDenseM_N` and, for `m == n`, `sparseResidualM`: the dense layers computed by
+    /// columns over the nonzero inputs only.
+    fn emit_sparse(&mut self, m: usize, n: usize, k: usize) {
+        let (g, groups) = self.input_groups(n);
+        let gathers = |groups: Option<usize>| -> String {
+            match groups {
+                Some(c) => {
+                    let mut expr = "[]".to_string();
+                    for i in (0..c).rev() {
+                        let (xi, gi) = (
+                            format!("x{}", pad_index(i, c)),
+                            format!("g{}", pad_index(i, c)),
+                        );
+                        expr = if expr == "[]" {
+                            format!("gather{g}_{m} {xi} {gi} []")
+                        } else {
+                            format!("gather{g}_{m} {xi} {gi} ({expr})")
+                        };
+                    }
+                    expr
+                }
+                None => format!("gather{n}_{m} x cols []"),
+            }
+        };
+        let mut kinds = vec![(
+            format!("sparseDense{m}_{n}"),
+            "relu (bias + sum over the nonzero x_j of x_j * column j), as dense",
+            "bias".to_string(),
+        )];
+        if m == n {
+            kinds.push((
+                format!("sparseResidual{m}"),
+                "relu (x + bias + sum over the nonzero x_j of x_j * column j), as residual",
+                format!("(add{m} x bias)"),
+            ));
+        }
+        for (fun, what, start) in kinds {
+            self.push(format!("{{- {fun} cols bias x"));
+            self.push(format!(
+                "   RETURNS: {what}{m}_{n} up to rounding, adding {k} columns per pass -}}"
+            ));
+            self.push(format!(
+                "{fun} :: Cols{n}_{m} -> Vec{m} -> Vec{n} -> Vec{m}"
+            ));
+            self.push(format!("{fun} !cols !bias !x ="));
+            let body = format!("relu{m} (addColumns{k}_{m} {start} ({}))", gathers(groups));
+            match groups {
+                Some(c) => {
+                    self.case_match(
+                        &["cols", "x"],
+                        &[
+                            format!("Cols{n}_{m} {}", names("g", c).join(" ")),
+                            format!("Vec{n} {}", names("x", c).join(" ")),
+                        ],
+                        2,
+                    );
+                    self.line(&split_words(&body), 6);
+                }
+                None => self.line(&split_words(&body), 2),
+            }
+            self.push("");
+        }
     }
 
     // ------------------------------------------------------------ driver
@@ -988,6 +1287,20 @@ impl<'a> Gen<'a> {
         rows.extend(dense.iter().copied());
         let concats = spec.concats.clone();
         let mut sums = spec.sums.clone();
+        // Sparse layers imply their columns, axpys (K and 1 per pass) and rows.
+        let mut sparse: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+        for &(m, n, k) in &spec.sparse {
+            sparse.entry((m, n)).or_insert(k);
+        }
+        let mut cols: BTreeSet<(usize, usize)> = spec.cols.iter().copied().collect();
+        let mut axpys: BTreeSet<(usize, usize)> = spec.axpys.iter().copied().collect();
+        for (&(m, n), &k) in &sparse {
+            cols.insert((m, n));
+            axpys.extend([(k, m), (1, m)]);
+        }
+        rows.extend(cols.iter().copied());
+        floats.extend(cols.iter().flat_map(|&(m, n)| [m, n]));
+        floats.extend(axpys.iter().map(|&(_, n)| n));
         floats.extend(rows.iter().map(|&(_, n)| n));
         floats.extend(dense.iter().map(|&(m, _)| m));
         floats.extend(concats.iter().map(|&(_, n)| n));
@@ -1011,6 +1324,11 @@ impl<'a> Gen<'a> {
                         sums.push((k, m));
                         changed = true;
                     }
+                }
+            }
+            for (k, n) in axpys.clone() {
+                if let Some((_, m)) = self.chunks(n) {
+                    changed |= axpys.insert((k, m));
                 }
             }
         }
@@ -1080,6 +1398,32 @@ impl<'a> Gen<'a> {
         }
         for &(k, n) in &sums {
             self.emit_sum(k, n);
+        }
+        for &(k, n) in &axpys {
+            self.emit_axpy(k, n);
+        }
+        let groups: BTreeSet<(usize, usize)> = cols
+            .iter()
+            .map(|&(m, n)| (self.input_groups(n).0, m))
+            .collect();
+        for &(g, m) in &groups {
+            self.emit_column_group(g, m);
+        }
+        for &(m, n) in &cols {
+            self.emit_cols(m, n);
+        }
+        if !sparse.is_empty() {
+            for &(g, m) in &groups {
+                self.emit_gather(g, m);
+            }
+            let adds: BTreeSet<(usize, usize)> =
+                sparse.iter().map(|(&(m, _), &k)| (k, m)).collect();
+            for &(k, m) in &adds {
+                self.emit_add_columns(k, m);
+            }
+            for (&(m, n), &k) in &sparse {
+                self.emit_sparse(m, n, k);
+            }
         }
         self.push("{- FOURMOLU_ENABLE -}");
         self.push("-- END GENERATED VEC");

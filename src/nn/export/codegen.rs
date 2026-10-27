@@ -15,6 +15,7 @@ use std::fmt::Write as _;
 use super::haskell::{bundle_body_begin, bundle_body_end, bundle_imports};
 use super::vecgen::VecSpec;
 
+use super::vecgen::SPARSE_K;
 use crate::game::LINES;
 use crate::nn::model::MOVES;
 use crate::nn::nnue::{
@@ -109,6 +110,11 @@ pub fn vec_spec(names: &Names, prefix: &str) -> VecSpec {
     spec.rows = names.selected();
     spec.dense = names.dense();
     spec.sums = vec![(ACC_INPUTS, names.a)];
+    // The hidden layers by columns over their nonzero inputs (sparseHiddenOf).
+    spec.sparse = vec![(names.h, names.a, SPARSE_K)];
+    if names.layers > 1 {
+        spec.sparse.push((names.h, names.h, SPARSE_K));
+    }
     spec.concats = vec![(names.pieces(), CHUNK)];
     spec
 }
@@ -157,7 +163,8 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
         &mut s,
         "VecE, VecA, VecH, FoldPiece, OpenClosed (ocOpen, ocFull, ocWonByUs, ocWonByThem), \
          Net (every field starts with net), net, genZeroChunk, genZero3, \
-         foldRow, lineFeature, accumulateRows, hiddenOf, wdlOf, policyLogits",
+         foldRow, lineFeature, accumulateRows, hiddenOf, HiddenColumns (constructor \
+         HiddenColumns), hiddenColumns, sparseHiddenOf, wdlOf, policyLogits",
     );
     let _ = writeln!(
         s,
@@ -576,11 +583,11 @@ data OpenClosed a = OpenClosed
         rows.join(", "),
         lines.join(", ")
     );
-    let mut items = vec![format!("relu{a}"), format!("(sum{ACC_INPUTS}_{a}")];
+    let mut items = vec![format!("relu{a} (sum{ACC_INPUTS}_{a}")];
     items.extend(terms);
     let last = items.pop().expect("terms");
     items.push(format!("{last})"));
-    for line in super::vecgen::wrap(&items, 6, Some(4)) {
+    for line in super::vecgen::apply(&items, 4) {
         let _ = writeln!(s, "{line}");
     }
     let _ = writeln!(
@@ -595,6 +602,46 @@ data OpenClosed a = OpenClosed
         expr = format!("residual{h}_{h} (netHidden{i} n) (netHidden{i}Bias n) ({expr})");
     }
     let _ = writeln!(s, "hiddenOf n acc = {expr}\n");
+    // The same layers by columns, over the nonzero inputs only.
+    let col_types: Vec<String> = (0..names.layers)
+        .map(|i| format!("!Cols{}_{h}", if i == 0 { a } else { h }))
+        .collect();
+    let _ = writeln!(
+        s,
+        "-- | The hidden layers' columns, for sparseHiddenOf: build them once (hiddenColumns) and\n\
+         -- keep them with the other precomputed data.\n\
+         data HiddenColumns = HiddenColumns {}\n",
+        col_types.join(" ")
+    );
+    let built: Vec<String> = (0..names.layers)
+        .map(|i| {
+            let d_in = if i == 0 { a } else { h };
+            format!("(columns{h}_{d_in} (netHidden{i} n))")
+        })
+        .collect();
+    let _ = writeln!(
+        s,
+        "-- | The hidden layers' columns, transposed from their rows.\n\
+         hiddenColumns :: Net -> HiddenColumns\n\
+         hiddenColumns n = HiddenColumns {}\n",
+        built.join(" ")
+    );
+    let cs = vars("c", names.layers);
+    let mut sparse_expr = format!("sparseDense{h}_{a} {} (netHidden0Bias n) acc", cs[0]);
+    for i in 1..names.layers {
+        sparse_expr = format!(
+            "sparseResidual{h} {} (netHidden{i}Bias n) ({sparse_expr})",
+            cs[i]
+        );
+    }
+    let _ = writeln!(
+        s,
+        "-- | hiddenOf by columns over the nonzero inputs (equal to it up to rounding).\n\
+         sparseHiddenOf :: Net -> HiddenColumns -> VecA -> VecH\n\
+         sparseHiddenOf n (HiddenColumns {}) acc =\n\
+         \x20 {sparse_expr}\n",
+        cs.join(" ")
+    );
     let _ = writeln!(s, "-- | Win, draw and loss logits.");
     let _ = writeln!(s, "wdlOf :: Net -> VecA -> VecH -> Vec3");
     let _ = writeln!(
@@ -716,12 +763,14 @@ maxAbsDiff :: [Float] -> [Float] -> Float
 maxAbsDiff xs ys = maximum (0 : zipWith (\x y -> abs (x - y)) xs ys)
 
 -- | Compares every reference position; prints the largest deviations and whether they are
--- within tolerance (1e-2 on pre-activation sums, 1e-3 on probabilities).
+-- within tolerance (1e-2 on pre-activation sums, 1e-3 on probabilities and between
+-- sparseHiddenOf and hiddenOf, which sum in different orders).
 selfTest :: IO Bool
 selfTest = do
   let n = net
+      cols = hiddenColumns n
       results =
-        [ [maxAbsDiff (toList{a} acc) (refAcc r), maxAbsDiff (toList{h} hid) (refHidden r), maxAbsDiff (toList3 wdl) (refWdlLogits r), maxAbsDiff (softmax (toList3 wdl)) (refWdl r), maxAbsDiff logits refLogits, maxAbsDiff (softmax logits) refProbs]
+        [ [maxAbsDiff (toList{a} acc) (refAcc r), maxAbsDiff (toList{h} hid) (refHidden r), maxAbsDiff (toList{h} (sparseHiddenOf n cols acc)) (toList{h} hid), maxAbsDiff (toList3 wdl) (refWdlLogits r), maxAbsDiff (softmax (toList3 wdl)) (refWdl r), maxAbsDiff logits refLogits, maxAbsDiff (softmax logits) refProbs]
         | r <- refs
         , let (acc, hid, wdl) = evalIds n (refIds r)
         , let moves = [m | (m, _, _) <- refPolicy r]
@@ -730,41 +779,49 @@ selfTest = do
         , let logits = map (moveLogit n (refIds r) hid) moves
         ]
       worst = foldr1 (zipWith max) results
-      labels = ["acc", "hidden", "wdl logits", "wdl", "policy logits", "policy"]
-      limits = [1e-2, 1e-2, 1e-2, 1e-3, 1e-2, 1e-3]
+      labels = ["acc", "hidden", "sparse vs dense hidden", "wdl logits", "wdl", "policy logits", "policy"]
+      limits = [1e-2, 1e-2, 1e-3, 1e-2, 1e-3, 1e-2, 1e-3]
       ok = and (zipWith (<) worst limits)
   putStrLn ("self-test over " ++ show (length refs) ++ " positions, largest deviations: " ++ unwords [l ++ " " ++ show w | (l, w) <- zip labels worst])
   putStrLn (if ok then "self-test passed" else "self-test FAILED")
   return ok
 
 -- | Times the per-evaluation work after the fold (accumulator, hidden layers, value head and
--- one board's policy logits) over the reference positions, printing microseconds per
--- evaluation.
+-- one board's policy logits) over the reference positions, with the dense hidden layers
+-- (hiddenOf) and with the sparse ones (sparseHiddenOf), printing microseconds per evaluation.
 bench :: Int -> IO ()
 bench iters = do
   let n = net
+      cols = hiddenColumns n
       inputs = [(foldedRows n (refIds r), refIds r) | r <- refs]
       count = length inputs
-      step :: Int -> Float -> Float
-      step i total =
+      step :: (VecA -> VecH) -> Int -> Float -> Float
+      step hiddenFn i total =
         let (rows, ids) = inputs !! (i `mod` count)
             acc = accumulateIds n rows ids
-            hid = hiddenOf n acc
+            hid = hiddenFn acc
             wdl = wdlOf n acc hid
             pol = sum9 (policyLogits n hid (i `mod` 9))
          in total + index3 0 wdl + pol
-      loop :: Int -> Float -> Float
-      loop i total | i >= iters = total
-                   | otherwise = let total' = step i total in total' `seq` loop (i + 1) total'
+      loop :: (VecA -> VecH) -> Int -> Float -> Float
+      loop hiddenFn i total
+        | i >= iters = total
+        | otherwise = let total' = step hiddenFn i total in total' `seq` loop hiddenFn (i + 1) total'
+      time :: String -> (VecA -> VecH) -> Float -> IO ()
+      time label hiddenFn warm = do
+        t0 <- getMonotonicTimeNSec
+        total <- return $! loop hiddenFn 0 warm
+        t1 <- getMonotonicTimeNSec
+        putStrLn ("bench: " ++ show (fromIntegral (t1 - t0) / 1000 / fromIntegral iters :: Double) ++ " us per evaluation, " ++ label ++ " hidden layers (checksum " ++ show total ++ ")")
   -- Decode everything first: the strict fields of Net force a list-valued table only to its
   -- first element, so without this most of the decoding would land inside the timed loop.
   let walkLists = sum (map (index{e} 0) (ocOpen (netContent n) ++ netCells n)) + sum (ocOpen (netSend n)) + sum (map (index9 0) (ocOpen (netLocal n))) + sum [index{e} 0 (sel{CHUNK}_{e} 0 p) | ps <- netForced n : netMix n, p <- ps]
       walkRefs = sum [index3 0 wdl + index{a} 0 acc + index{h} 0 hid | r <- refs, let (acc, hid, wdl) = evalIds n (refIds r)]
-  warm <- return $! walkLists + walkRefs + sum (map (\(rows, _) -> sum (map (index{a} 0) rows)) inputs)
-  t0 <- getMonotonicTimeNSec
-  total <- return $! loop 0 warm
-  t1 <- getMonotonicTimeNSec
-  putStrLn ("bench: " ++ show (fromIntegral (t1 - t0) / 1000 / fromIntegral iters :: Double) ++ " us per evaluation (checksum " ++ show total ++ ")")
+      -- The columns are built once, outside the timed loop, as the engine keeps them.
+      walkCols = sum [index{h} 0 (sparseHiddenOf n cols acc) | r <- refs, let (acc, _, _) = evalIds n (refIds r)]
+  warm <- return $! walkLists + walkRefs + walkCols + sum (map (\(rows, _) -> sum (map (index{a} 0) rows)) inputs)
+  time "dense" (hiddenOf n) warm
+  time "sparse" (sparseHiddenOf n cols) warm
 "#,
         last_content = CONTENTS - 1
     );
