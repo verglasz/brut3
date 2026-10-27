@@ -5,10 +5,10 @@
 //! A book key ([`crate::book::Key`], from the side to move's view) becomes nine board codes,
 //! an open board's nine digits (0 empty, 1 the side to move's, 2 the opponent's) as a base-3
 //! number with square 0 most significant (0..19682) or 19683, 19684, 19685 for a board won by
-//! the side to move, won by the opponent or full, plus the forced board (9 = free). In
-//! Haskell a key is three `Word64`s, each packing three codes in base 19686, the last one
-//! times ten plus the forced board. Comparing the words in order is the same as comparing the
-//! key strings, so "the smallest image" means the same thing on both sides.
+//! the side to move, won by the opponent or full, plus the forced board (9 = free). An entry
+//! stores them as they are. The Haskell key is a record of five `Word32`s, each two of those
+//! fields side by side (`hi << 16 | lo`), whose derived order is the key strings' order:
+//! "the smallest image" means the same thing on both sides.
 
 use std::fmt::Write as _;
 
@@ -189,31 +189,40 @@ pub fn book_modules(
     banner(
         &mut s,
         &format!("{prefix}.Book"),
-        "(BookKey, bookKeyOfBoards, bookEntries, squarePermutations)",
+        "(BookKey (..), bookKeyOfBoards, bookEntries, squarePermutations)",
     );
     let _ = writeln!(s, "import Decode (decodeBytes)");
     let _ = writeln!(s, "import {prefix}.BookContent (bookText)");
-    bundle_imports(&mut s, &["import Data.Word (Word64, Word8)"]);
+    bundle_imports(
+        &mut s,
+        &[
+            "import Data.Bits (shiftL, (.|.))",
+            "import Data.Word (Word32, Word8)",
+        ],
+    );
     bundle_body_begin(
         &mut s,
-        "BookKey, bookKeyOfBoards, squarePermutations, bookEntries",
+        "BookKey (constructor BookKey), bookKeyOfBoards, squarePermutations, bookEntries",
     );
     s.push_str(
-        r#"-- | A position's key, from the side to move's view: its nine board codes and its forced
--- board (0..8, or 9 when free), as three words that each pack three codes in base 19686, the
--- last one times ten plus the forced board. A board's code: an open board's nine cells (0
--- empty, 1 the side to move's, 2 the opponent's) as a base-3 number, square 0 most
--- significant (0..19682); 19683 if the side to move won it, 19684 if the opponent did, 19685
--- if it is full. Keys compare like the Rust book's key strings. Positions that differ only
--- inside decided boards, or only by swapping colours along with the side to move, share a
--- key.
-type BookKey = (Word64, Word64, Word64)
+        r#"-- | A position's key, from the side to move's view: the nine boards' codes and the forced
+-- board (0..8, or 9 when free), two per word, the first in the high 16 bits. A board's code:
+-- an open board's nine cells (0 empty, 1 the side to move's, 2 the opponent's) as a base-3
+-- number, square 0 most significant (0..19682); 19683 if the side to move won it, 19684 if
+-- the opponent did, 19685 if it is full. The derived order is the Rust book's key-string
+-- order. Positions that differ only inside decided boards, or only by swapping colours along
+-- with the side to move, share a key.
+data BookKey = BookKey !Word32 !Word32 !Word32 !Word32 !Word32
+  deriving (Eq, Ord, Show)
 
 -- | The key of nine board codes (by board) and the forced board.
 bookKeyOfBoards :: [Int] -> Int -> BookKey
-bookKeyOfBoards codes forcedBoard =
-  let word = foldl (\acc c -> acc * 19686 + fromIntegral c) 0
-   in (word (take 3 codes), word (take 3 (drop 3 codes)), word (drop 6 codes) * 10 + fromIntegral forcedBoard)
+bookKeyOfBoards codes forcedBoard = case map fromIntegral codes of
+  [c0, c1, c2, c3, c4, c5, c6, c7, c8] ->
+    BookKey (pair c0 c1) (pair c2 c3) (pair c4 c5) (pair c6 c7) (pair c8 (fromIntegral forcedBoard))
+  _ -> error "bookKeyOfBoards: not nine boards"
+  where
+    pair hi lo = hi `shiftL` 16 .|. lo
 
 -- | Image of square i under each of the eight symmetries (identity first). A symmetry maps
 -- the cell at (board b, square q) to (p !! b, p !! q) and the forced board b to p !! b.
@@ -375,18 +384,16 @@ mod tests {
     use super::*;
     use crate::book::canonical;
 
-    /// The three words of a key, as `bookKeyOfBoards` packs them.
-    fn words(key: &Key) -> [u64; 3] {
+    /// The five words of a key, as `bookKeyOfBoards` builds them.
+    fn words(key: &Key) -> [u32; 5] {
         let (codes, forced) = board_codes(key);
-        let word = |bs: &[u16]| bs.iter().fold(0u64, |acc, &c| acc * 19686 + u64::from(c));
-        [
-            word(&codes[0..3]),
-            word(&codes[3..6]),
-            word(&codes[6..9]) * 10 + u64::from(forced),
-        ]
+        let mut fields = codes.map(u32::from).to_vec();
+        fields.push(u32::from(forced));
+        std::array::from_fn(|i| (fields[2 * i] << 16) | fields[2 * i + 1])
     }
 
-    /// Board-code order and word order are key order, decided boards included.
+    /// Board-code order and word order (the Haskell key's derived order) are key order,
+    /// decided boards included.
     #[test]
     fn key_words_order_like_keys() {
         let mut rng = SmallRng::seed_from_u64(3);

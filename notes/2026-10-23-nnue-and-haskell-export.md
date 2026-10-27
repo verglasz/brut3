@@ -270,8 +270,10 @@ runs and prune passes and adds one per run.
   `squarePermutations`. An entry is 20 bytes: nine little-endian `Word16` board codes (an
   open board's digits from the side to move's view as a base-3 number, square 0 most
   significant, 0..19682; 19683 won by the side to move, 19684 won by the opponent, 19685
-  full), the forced board, the move index. A `BookKey` is three `Word64`s packing three
-  codes each in base 19686, the last times 10 plus the forced board. The engine should
+  full), the forced board, the move index. A `BookKey` is a strict record of five
+  `Word32`s holding those fields two by two (`hi << 16 | lo`, the forced board last), whose
+  derived order is the key-string order; 32 bytes on the heap with GHC 9.10 (as are three
+  `Word64`s, or nine `Word16`s and a `Word8`: small strict fields are packed). The engine should
   build a balanced tree from `bookEntries` and compute board codes from its own bitboards.
   Bytes go through `Word8`, so `Decode.decodeBytes` may return `Int8` or `Word8`.
 - `BookContent.hs`: only the data, `bookText`, the sorted byte stream in base64 literals.
