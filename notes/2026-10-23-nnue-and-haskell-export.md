@@ -277,7 +277,10 @@ runs and prune passes and adds one per run.
   build a balanced tree from `bookEntries` and compute board codes from its own bitboards.
   `bookEntries` reads the stream with `Decode.decodeU16lePiecesWith` as ten `Word16` per
   entry (the forced board and the move share the last one, low byte and high byte);
-  `bookKeyOfBoards :: [Word16] -> Word8 -> BookKey`.
+  `bookKeyOfBoards :: [Word16] -> Word8 -> BookKey` is `INLINE`: `bookEntries` matches the
+  ten values and calls it on a literal list, which the optimised Core turns into the
+  `BookKey` built straight from the words (no list, no `map`; key and move are bound
+  strictly, so an entry holds no thunk).
 - `BookContent.hs`: only the data, `bookText`, the sorted byte stream in base64 literals.
 - Every exported item carries a one-line Haddock comment (`FixedVec.hs` excepted: it
   follows `gen/vecgen.py`). `Weights.hs` and `BookContent.hs` open their bodies with a

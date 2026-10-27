@@ -215,8 +215,10 @@ pub fn book_modules(
 data BookKey = BookKey !Word32 !Word32 !Word32 !Word32 !Word32
   deriving (Eq, Ord, Show)
 
--- | The key of nine board codes (by board) and the forced board.
+-- | The key of nine board codes (by board) and the forced board. Inlined, a call on a
+-- list of known length builds the key with no list in between.
 bookKeyOfBoards :: [Word16] -> Word8 -> BookKey
+{-# INLINE bookKeyOfBoards #-}
 bookKeyOfBoards codes forcedBoard = case map fromIntegral codes of
   [c0, c1, c2, c3, c4, c5, c6, c7, c8] ->
     BookKey (pair c0 c1) (pair c2 c3) (pair c4 c5) (pair c6 c7) (pair c8 (fromIntegral forcedBoard))
@@ -242,12 +244,12 @@ squarePermutations :: [[Int]]
 bookEntries :: [(BookKey, Int)]
 bookEntries = go (decodeU16lePiecesWith id bookText)
   where
+    go (c0 : c1 : c2 : c3 : c4 : c5 : c6 : c7 : c8 : forcedAndMove : rest) =
+      let !key = bookKeyOfBoards [c0, c1, c2, c3, c4, c5, c6, c7, c8] (fromIntegral (forcedAndMove .&. 0xFF))
+          !move = fromIntegral (forcedAndMove .>>. 8)
+       in (key, move) : go rest
     go [] = []
-    go ws = case splitAt 9 ws of
-      (codes, forcedAndMove : rest)
-        | length codes == 9 ->
-            (bookKeyOfBoards codes (fromIntegral (forcedAndMove .&. 0xFF)), fromIntegral (forcedAndMove .>>. 8)) : go rest
-      _ -> error "bookEntries: ragged book stream"
+    go _ = error "bookEntries: ragged book stream"
 "#,
     );
     bundle_body_end(&mut s);
