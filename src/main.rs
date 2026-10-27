@@ -99,7 +99,8 @@ enum Command {
         ///                    masked)
         ///   --int16 N ..     I16VecN of Int16: i16FromListN .. i16DotN, likewise
         ///   --nest N=KxM,..  VecN as K boxed chunks of VecM, its functions built from VecM's
-        ///                    (GHC compiles wide flat vectors badly: nest widths above 64)
+        ///                    (GHC compiles wide flat vectors badly: nest widths above 64,
+        ///                    in 32-lane chunks as the model's export does)
         ///   --rows M:N,..    RowsM_N, M rows of VecN (one row per output), with
         ///                    fromListRowsM_N and selM_N i (row i)
         ///   --dense M:N,..   layers from N inputs to M outputs: linearM_N rows bias x =
@@ -112,7 +113,8 @@ enum Command {
         ///                    columnsM_N, their transposition from RowsM_N (run once, at load)
         ///   --sparse M:N[:K],.. sparseDenseM_N, and when M = N sparseResidualM: denseM_N and
         ///                    residualM_M computed by columns over the nonzero inputs only,
-        ///                    K columns per pass (default 8); adds the columns and axpys
+        ///                    K columns per pass (default 8), the leftovers in passes of
+        ///                    K/2, K/4, .., 1; adds the columns, their PairsM list and the axpys
         ///   --alias NAME=N,.. type NAME = VecN
         #[arg(last = true, verbatim_doc_comment)]
         vec_flags: Vec<String>,

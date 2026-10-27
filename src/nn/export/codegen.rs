@@ -4,7 +4,7 @@
 //!
 //! The vector types come from `<prefix>.FixedVec`, written by the same export from
 //! [`vec_spec`] through [`super::vecgen`] (strict records `VecN`, wide ones nested as chunks
-//! of `Vec64`, row containers `RowsM_N`, `dotN`, `selM_N`, `linearM_N`/`denseM_N`/
+//! of `Vec32`, row containers `RowsM_N`, `dotN`, `selM_N`, `linearM_N`/`denseM_N`/
 //! `residualM_M`, `concatK_N`, ...); the generated modules import it and alias the role
 //! widths (`type VecA = Vec512`). The layout follows the Haskell project's vector codegen notes: the fold
 //! runs in 64-row pieces, the feature table is split by row range into four tables indexed
@@ -45,8 +45,15 @@ use crate::nn::nnue::{
 /// rows.
 const ACC_INPUTS: usize = 1 + TOKENS + FEATURE_IDS;
 
-/// Width of a chunk of a wide vector, and of the fold's row pieces.
+/// Width of the fold's row pieces, and the widest vector kept flat.
 pub const CHUNK: usize = 64;
+
+/// Width of the chunks the wider vectors (the accumulator, and the hidden layers when wider
+/// than [`CHUNK`]) are nested in. Every chunk function builds one result with all its lanes
+/// live, and GHC's native code generator spills most of 64 (round 4 of the Haskell project's
+/// exporter notes: 15% fewer cycles per search with 32 than with 64; 16 is 3% faster again
+/// but costs a third more compile time, and stays reachable with `--nest`).
+pub const NEST: usize = 32;
 
 /// Rows of the four feature tables, in row order: forced board, the eight lines, decided
 /// boards, marks on open boards.
@@ -120,9 +127,9 @@ pub fn vec_spec(names: &Names, prefix: &str) -> VecSpec {
     let mut spec = VecSpec::new(&format!("{prefix}.FixedVec"));
     spec.floats
         .extend([3, CELLS, CHUNK, names.e, names.a, names.h]);
-    spec.nest.insert(names.a, (names.pieces(), CHUNK));
+    spec.nest.insert(names.a, (names.a / NEST, NEST));
     if names.h > CHUNK {
-        spec.nest.insert(names.h, (names.h / CHUNK, CHUNK));
+        spec.nest.insert(names.h, (names.h / NEST, NEST));
     }
     spec.rows = names.selected();
     spec.dense = names.dense();

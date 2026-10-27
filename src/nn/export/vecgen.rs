@@ -4,8 +4,8 @@
 //!
 //! A flat `VecN` is a strict record of `N` unpacked `Float` (or `Int32`/`Int16`). A nested
 //! `VecN` (`N = K x M`) is a strict record of `K` boxed `VecM` chunks whose helpers delegate
-//! to the `VecM` ones: GHC's native code generator spills badly on functions that bind more
-//! than ~64 floats at once. Matrices (`RowsM_N`) are records of row vectors, one row per
+//! to the `VecM` ones: GHC's native code generator spills badly on functions that bind many
+//! floats at once (64-lane chunks spilled most of their lanes; 32 measured 15% faster). Matrices (`RowsM_N`) are records of row vectors, one row per
 //! output.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,6 +15,17 @@ use super::haskell::{BODY_BEGIN, BODY_END, IMPORTS_BEGIN, IMPORTS_END};
 /// Columns per pass of a sparse layer unless `--sparse M:N:K` says otherwise (K = 4 measured
 /// the same, K = 1 slower than the dense layer).
 pub const SPARSE_K: usize = 8;
+
+/// Columns per pass of a sparse layer with `k` per pass: `k`, then `k/2`, `k/4`, .., 1 for
+/// the leftovers. Every pass rebuilds the whole accumulator, and with ~20-30 nonzero inputs
+/// most passes were single leftover columns before (`axpy1` alone was 7.6% of a search).
+fn passes(k: usize) -> Vec<usize> {
+    let mut sizes = vec![k];
+    while let Some(&p) = sizes.last().filter(|&&p| p > 1) {
+        sizes.push(p / 2);
+    }
+    sizes
+}
 
 /// What to generate, in the terms of the export's FixedVec flags.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1291,8 +1302,8 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// `axpyK_N s0 c0 .. acc`: `acc + s0 * c0 + .. + s(K-1) * c(K-1)` componentwise. Flat it is
-    /// one `NOINLINE` constructor of `N` sums; nested, an `INLINE` call per chunk.
+    /// `axpyK_N s0 c0 .. acc`: `acc + (s0 * c0 + .. + s(K-1) * c(K-1))` componentwise. Flat it
+    /// is one `NOINLINE` constructor of `N` sums; nested, an `INLINE` call per chunk.
     fn emit_axpy(&mut self, k: usize, n: usize) {
         let v = format!("Vec{n}");
         let fun = format!("axpy{k}_{n}");
@@ -1340,11 +1351,12 @@ impl<'a> Gen<'a> {
                     .collect();
                 format!("(axpy{k}_{m} {} {})", pairs.join(" "), acc[j])
             }
+            // The products summed as a balanced tree (see `sum_tree`), the accumulator last.
             None => {
-                let terms: Vec<String> = std::iter::once(acc[j].clone())
-                    .chain((0..k).map(|i| format!("{} * {}", ss[i], fields[i][j])))
+                let products: Vec<String> = (0..k)
+                    .map(|i| format!("{} * {}", ss[i], fields[i][j]))
                     .collect();
-                format!("({})", terms.join(" + "))
+                format!("({} + {})", acc[j], sum_tree(&products).as_child())
             }
         }));
         self.apply(&items, 6);
@@ -1418,9 +1430,24 @@ impl<'a> Gen<'a> {
         self.push("");
     }
 
+    /// `PairsM`: the `(x_j, column j)` pairs of a sparse layer's nonzero inputs as a strict
+    /// list with the `Float` unboxed in the cell, 4 words against 8 for a list of tuples
+    /// (measured: ~10% less allocation per search, and cheaper to compile than the tuple
+    /// patterns). The constructors carry the width so that several column widths can coexist.
+    fn emit_pairs(&mut self, m: usize) {
+        self.push(format!(
+            "{{- The (x_j, column j) pairs of a sparse layer's nonzero inputs, columns of width {m}:"
+        ));
+        self.push("   a strict list with the Float unboxed in the cell. -}");
+        self.push(format!(
+            "data Pairs{m} = NoPairs{m} | Pair{m} {{-# UNPACK #-}} !Float !Vec{m} !Pairs{m}"
+        ));
+        self.push("");
+    }
+
     /// `gatherG_M x cols rest`: the `(x_j, column j)` pairs of the nonzero `x_j`, in order,
     /// consed onto `rest`, all strict (`rest` too, so a chain of gathers allocates no thunks):
-    /// only the list cells and pairs allocate.
+    /// only the cells allocate.
     fn emit_gather(&mut self, g: usize, m: usize) {
         let fun = format!("gather{g}_{m}");
         let (a, k, r) = (names("a", g), names("k", g), names("r", g));
@@ -1428,7 +1455,7 @@ impl<'a> Gen<'a> {
             "-- {fun} x cols rest: the (x_j, column j) pairs of the nonzero x_j, consed onto rest"
         ));
         self.push(format!(
-            "{fun} :: Vec{g} -> Cols{g}_{m} -> [(Float, Vec{m})] -> [(Float, Vec{m})]"
+            "{fun} :: Vec{g} -> Cols{g}_{m} -> Pairs{m} -> Pairs{m}"
         ));
         self.push(format!("{fun} !x !cols !rest ="));
         self.case_match(
@@ -1443,7 +1470,7 @@ impl<'a> Gen<'a> {
             let next = if j + 1 == g { "rest" } else { &r[j + 1] };
             let lead = if j + 1 == g { "let" } else { "   " };
             self.push(format!(
-                "      {lead} !{} = if {} == 0 then {next} else ({}, {}) : {next}",
+                "      {lead} !{} = if {} == 0 then {next} else Pair{m} {} {} {next}",
                 r[j], a[j], a[j], k[j]
             ));
         }
@@ -1453,35 +1480,49 @@ impl<'a> Gen<'a> {
     }
 
     /// `addColumnsK_M acc pairs`: `acc` plus `s * column` over the pairs, `k` per `axpyK_M`
-    /// call, then one at a time.
+    /// call, the leftovers in passes of `k/2`, `k/4`, .., 1 (see [`passes`]).
     fn emit_add_columns(&mut self, k: usize, m: usize) {
         let fun = format!("addColumns{k}_{m}");
+        let sizes = passes(k);
+        let rest = match &sizes[1..] {
+            [] => String::new(),
+            smaller => format!(
+                ", the rest in passes of {}",
+                smaller
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
         self.push(format!(
-            "-- {fun} acc pairs: acc plus s * column over the (s, column) pairs, {k} per pass"
+            "-- {fun} acc pairs: acc plus s * column over the (s, column) pairs, {k} per pass{rest}"
         ));
-        self.push(format!("{fun} :: Vec{m} -> [(Float, Vec{m})] -> Vec{m}"));
-        if k > 1 {
-            let (ss, cs) = (names("s", k), names("c", k));
-            let pairs: Vec<String> = ss
+        self.push(format!("{fun} :: Vec{m} -> Pairs{m} -> Vec{m}"));
+        for p in sizes {
+            let (ss, cs) = if p == 1 {
+                (vec!["s".to_string()], vec!["c".to_string()])
+            } else {
+                (names("s", p), names("c", p))
+            };
+            let pattern = ss
                 .iter()
                 .zip(&cs)
-                .map(|(s, c)| format!("({s}, {c})"))
-                .collect();
+                .rev()
+                .fold("rest".to_string(), |tail, (s, c)| {
+                    format!("(Pair{m} {s} {c} {tail})")
+                });
             let args: Vec<String> = ss
                 .iter()
                 .zip(&cs)
                 .map(|(s, c)| format!("{s} {c}"))
                 .collect();
             self.push(format!(
-                "{fun} !acc ({} : rest) = {fun} (axpy{k}_{m} {} acc) rest",
-                pairs.join(" : "),
+                "{fun} !acc {pattern} = {fun} (axpy{p}_{m} {} acc) rest",
                 args.join(" ")
             ));
         }
-        self.push(format!(
-            "{fun} !acc ((s, c) : rest) = {fun} (axpy1_{m} s c acc) rest"
-        ));
-        self.push(format!("{fun} !acc [] = acc"));
+        self.push(format!("{fun} !acc NoPairs{m} = acc"));
         self.push("");
     }
 
@@ -1498,13 +1539,13 @@ impl<'a> Gen<'a> {
                         format!("g{}", pad_index(i, c)),
                     );
                     if i + 1 == c {
-                        format!("gather{g}_{m} {xi} {gi} []")
+                        format!("gather{g}_{m} {xi} {gi} NoPairs{m}")
                     } else {
                         format!("gather{g}_{m} {xi} {gi} $")
                     }
                 })
                 .collect(),
-            None => vec![format!("gather{n}_{m} x cols []")],
+            None => vec![format!("gather{n}_{m} x cols NoPairs{m}")],
         };
         let mut kinds = vec![(
             format!("sparseDense{m}_{n}"),
@@ -1563,7 +1604,7 @@ impl<'a> Gen<'a> {
         rows.extend(dense.iter().copied());
         let concats = spec.concats.clone();
         let mut sums = spec.sums.clone();
-        // Sparse layers imply their columns, axpys (K and 1 per pass) and rows.
+        // Sparse layers imply their columns, axpys (one per pass size) and rows.
         let mut sparse: BTreeMap<(usize, usize), usize> = BTreeMap::new();
         for &(m, n, k) in &spec.sparse {
             sparse.entry((m, n)).or_insert(k);
@@ -1572,7 +1613,7 @@ impl<'a> Gen<'a> {
         let mut axpys: BTreeSet<(usize, usize)> = spec.axpys.iter().copied().collect();
         for (&(m, n), &k) in &sparse {
             cols.insert((m, n));
-            axpys.extend([(k, m), (1, m)]);
+            axpys.extend(passes(k).into_iter().map(|p| (p, m)));
         }
         rows.extend(cols.iter().copied());
         floats.extend(cols.iter().flat_map(|&(m, n)| [m, n]));
@@ -1693,6 +1734,10 @@ impl<'a> Gen<'a> {
             self.emit_cols(m, n);
         }
         if !sparse.is_empty() {
+            let widths: BTreeSet<usize> = groups.iter().map(|&(_, m)| m).collect();
+            for &m in &widths {
+                self.emit_pairs(m);
+            }
             for &(g, m) in &groups {
                 self.emit_gather(g, m);
             }
@@ -1789,5 +1834,32 @@ mod tests {
             "nested widths have no masked helpers"
         );
         assert!(text.contains("maskedMax8"));
+    }
+
+    #[test]
+    fn sparse_layers_use_pair_lists_leftover_passes_and_tree_sums() {
+        assert_eq!(passes(8), [8, 4, 2, 1]);
+        assert_eq!(passes(6), [6, 3, 1]);
+        assert_eq!(passes(1), [1]);
+        let text = VecSpec::parse_args(&["--sparse", "8:8"])
+            .unwrap()
+            .generate();
+        for needle in [
+            "data Pairs8 = NoPairs8 | Pair8 {-# UNPACK #-} !Float !Vec8 !Pairs8",
+            "gather8_8 :: Vec8 -> Cols8_8 -> Pairs8 -> Pairs8",
+            "!r7 = if a7 == 0 then rest else Pair8 a7 k7 rest",
+            "gather8_8 x cols NoPairs8",
+            "addColumns8_8 :: Vec8 -> Pairs8 -> Vec8",
+            "addColumns8_8 !acc (Pair8 s0 c0 (Pair8 s1 c1 (Pair8 s2 c2 (Pair8 s3 c3 rest)))) = \
+             addColumns8_8 (axpy4_8 s0 c0 s1 c1 s2 c2 s3 c3 acc) rest",
+            "addColumns8_8 !acc (Pair8 s c rest) = addColumns8_8 (axpy1_8 s c acc) rest",
+            "addColumns8_8 !acc NoPairs8 = acc",
+            "(a0 + (((s0 * x0_0 + s1 * x1_0) + (s2 * x2_0 + s3 * x3_0)) \
+             + ((s4 * x4_0 + s5 * x5_0) + (s6 * x6_0 + s7 * x7_0))))",
+            "(a0 + (s0 * x0_0 + s1 * x1_0))",
+            "(a0 + s0 * x0_0)",
+        ] {
+            assert!(text.contains(needle), "missing {needle}");
+        }
     }
 }
