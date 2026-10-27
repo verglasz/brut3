@@ -36,7 +36,7 @@ pub struct ExportOptions {
     pub chunk: usize,
     /// Reference book lookups to emit.
     pub lookups: usize,
-    /// Extra `FixedVec` shapes beyond the model's, in `vecgen.py` flag syntax.
+    /// Extra `FixedVec` shapes beyond the model's (the export's `--vec-extra` flags).
     pub vec_extra: Option<VecSpec>,
     /// Whether to write `<prefix>/FixedVec.hs` at all.
     pub fixed_vec: bool,
@@ -63,10 +63,9 @@ pub struct Report {
     /// Bytes of int16 weights and the number of base64 string literals holding them.
     pub stream_bytes: usize,
     pub chunks: usize,
-    /// The `gen/vecgen.py` command that makes the `FixedVec` module the code needs.
-    pub vecgen: String,
-    /// Its shape flags: the `--vec-extra` that makes the same module without a model.
-    pub vec_flags: String,
+    /// The `FixedVec` module's shapes, if one was generated: the `--vec-extra` flags that make
+    /// the same module without a model.
+    pub vec_flags: Option<String>,
     /// Largest deviations of the dequantised weights from the exact ones over the reference
     /// positions: win/draw/loss probability, `p_win - p_loss`, legal-move probability.
     pub wdl_error: f32,
@@ -145,8 +144,7 @@ pub fn write_all(
         }
     };
     if let Some(spec) = vec_spec {
-        report.vecgen = spec.command();
-        report.vec_flags = spec.flags();
+        report.vec_flags = Some(spec.flags());
         if opts.fixed_vec {
             emit("FixedVec", spec.generate_bundled())?;
         }

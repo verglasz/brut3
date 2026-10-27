@@ -237,13 +237,13 @@ runs and prune passes and adds one per run.
   literals are updatable CAFs whose unpacked characters stay alive during decoding (53 MB
   peak residency instead of 18).
 - `FixedVec.hs` (module `Gen.FixedVec`): the fixed-width vector family for exactly the
-  shapes the model needs, from `export::vecgen`, a line-for-line port of the Haskell
-  project's `gen/vecgen.py` (verified identical on both nets, with `--int32`, `--int16`,
-  `--sum`, `--rows` and `--alias` extras). Hand-written code that needs more shapes passes
-  them in vecgen flag syntax: `--vec-extra "--int32 512 --rows 9:128"`; `--no-fixed-vec`
-  keeps a hand-generated module instead. Without `--model`, `export --vec-extra "..." --out
-  <dir>` writes FixedVec.hs for the extra shapes alone. The export prints the equivalent
-  vecgen command and the `--vec-extra` flags that make the same module without a model.
+  shapes the model needs, from `export::vecgen`. Hand-written code that needs more shapes
+  passes them with `--vec-extra "--int32 512 --rows 9:128"` (the flags are listed in
+  `export --help`: `--float`, `--int32`, `--int16`, `--nest`, `--rows`, `--dense`,
+  `--concat`, `--sum`, `--alias`); `--no-fixed-vec` keeps a hand-written module instead.
+  Without `--model`, `export --vec-extra "..." --out <dir>` writes FixedVec.hs for the
+  extra shapes alone. The export prints the `--vec-extra` flags that make the same module
+  without a model, and `Net.hs` names them in its header.
 - `Net.hs`: the `Net` record decoded from the arrays on first use (`net`), `foldRow`,
   `accumulateRows`, `hiddenOf`, `wdlOf`, `policyLogits`. Imports `Gen.FixedVec` and aliases
   `VecE`/`VecA`/`VecH`. Layout per the project's vector codegen notes
@@ -284,8 +284,7 @@ runs and prune passes and adds one per run.
   `BookKey` built straight from the words (no list, no `map`; key and move are bound
   strictly, so an entry holds no thunk).
 - `BookContent.hs`: only the data, `bookText`, the sorted byte stream in base64 literals.
-- Every exported item carries a one-line Haddock comment (`FixedVec.hs` excepted: it
-  follows `gen/vecgen.py`). `Weights.hs` and `BookContent.hs` open their bodies with a
+- Every exported item carries a one-line Haddock comment (`FixedVec.hs` excepted). `Weights.hs` and `BookContent.hs` open their bodies with a
   DATA BLOB WARNING giving a rough size (from the data's shape), so readers skip them.
 - `BookTest.hs` (verification only): the reference `boardCode`, `canonicalKey`/`lookupBook` by linear
   search, and `bookRefs`/`bookTest`: book positions under random symmetries plus a few
@@ -301,8 +300,7 @@ single contest file (its `notes/2026-10-26-exporter-changes.md`): `{- BUNDLE IMP
 declarations, each body preceded by a comment listing the names it defines. Outside the
 markers (pragmas, module header, imports of other bundled modules) is dropped, so all bodies
 share one namespace with the engine: internal names carry a prefix (`weights_<array>_<k>`,
-`genZeroChunk`, `genZero3`) and no binder uses an engine name such as `forced`. `FixedVec` is
-`vecgen.py`'s output plus the markers. Checked by bundling the medium net's modules with
+`genZeroChunk`, `genZero3`) and no binder uses an engine name such as `forced`. Checked by bundling the medium net's modules with
 `Decode` into one Safe module, which compiles and runs.
 
 The Rust side of the same arithmetic is `export::scalar` (`Weights::evaluate`), checked

@@ -1,6 +1,5 @@
-//! `FixedVec.hs`: the fixed-width vector family, a port of the Haskell project's
-//! `gen/vecgen.py` (same output, line for line) so that the export writes the module for
-//! exactly the shapes the generated network needs.
+//! `FixedVec.hs`: the fixed-width vector family, for exactly the shapes the generated
+//! network needs plus the ones hand-written code asks for (`export --vec-extra`).
 //!
 //! A flat `VecN` is a strict record of `N` unpacked `Float` (or `Int32`/`Int16`). A nested
 //! `VecN` (`N = K x M`) is a strict record of `K` boxed `VecM` chunks whose helpers delegate
@@ -15,7 +14,7 @@ use super::haskell::{BODY_BEGIN, BODY_END, IMPORTS_BEGIN, IMPORTS_END};
 /// Soft line width for wrapped field lists.
 const LINE: usize = 92;
 
-/// What to generate, in the terms of `vecgen.py`'s command line.
+/// What to generate, in the terms of the `--vec-extra` flags.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct VecSpec {
     pub floats: BTreeSet<usize>,
@@ -44,7 +43,7 @@ impl VecSpec {
         }
     }
 
-    /// Parses `vecgen.py`'s flags: `--float N..`, `--int32 N..`, `--int16 N..`,
+    /// Parses the `--vec-extra` flags: `--float N..`, `--int32 N..`, `--int16 N..`,
     /// `--nest N=KxM,..`, `--rows M:N,..`, `--dense M:N,..`, `--concat K:N,..`, `--sum K:N,..`,
     /// `--alias NAME=N,..`, `--module NAME`.
     pub fn parse_args(words: &[&str]) -> Result<Self, String> {
@@ -52,7 +51,7 @@ impl VecSpec {
         let mut i = 0;
         let num = |w: &str| {
             w.parse::<usize>()
-                .map_err(|_| format!("vecgen: expected a number, got {w:?}"))
+                .map_err(|_| format!("--vec-extra: expected a number, got {w:?}"))
         };
         let pairs = |w: &str| -> Result<Vec<(usize, usize)>, String> {
             w.split(',')
@@ -60,7 +59,7 @@ impl VecSpec {
                 .map(|p| {
                     let (a, b) = p
                         .split_once(':')
-                        .ok_or_else(|| format!("vecgen: expected M:N, got {p:?}"))?;
+                        .ok_or_else(|| format!("--vec-extra: expected M:N, got {p:?}"))?;
                     Ok((num(a)?, num(b)?))
                 })
                 .collect()
@@ -71,7 +70,7 @@ impl VecSpec {
                 words
                     .get(i + 1)
                     .copied()
-                    .ok_or_else(|| format!("vecgen: {flag} needs a value"))
+                    .ok_or_else(|| format!("--vec-extra: {flag} needs a value"))
             };
             match flag {
                 "--float" | "--int32" | "--int16" => {
@@ -86,7 +85,7 @@ impl VecSpec {
                         j += 1;
                     }
                     if j == i + 1 {
-                        return Err(format!("vecgen: {flag} needs at least one width"));
+                        return Err(format!("--vec-extra: {flag} needs at least one width"));
                     }
                     i = j;
                     continue;
@@ -95,13 +94,13 @@ impl VecSpec {
                     for part in value(i)?.split(',').filter(|p| !p.is_empty()) {
                         let (n, km) = part
                             .split_once('=')
-                            .ok_or_else(|| format!("vecgen: expected N=KxM, got {part:?}"))?;
+                            .ok_or_else(|| format!("--vec-extra: expected N=KxM, got {part:?}"))?;
                         let (k, m) = km
                             .split_once('x')
-                            .ok_or_else(|| format!("vecgen: expected N=KxM, got {part:?}"))?;
+                            .ok_or_else(|| format!("--vec-extra: expected N=KxM, got {part:?}"))?;
                         let (n, k, m) = (num(n)?, num(k)?, num(m)?);
                         if k * m != n {
-                            return Err(format!("vecgen: --nest {part}: {k}x{m} != {n}"));
+                            return Err(format!("--vec-extra: --nest {part}: {k}x{m} != {n}"));
                         }
                         spec.nest.insert(n, (k, m));
                     }
@@ -114,12 +113,12 @@ impl VecSpec {
                     for part in value(i)?.split(',').filter(|p| !p.is_empty()) {
                         let (name, w) = part
                             .split_once('=')
-                            .ok_or_else(|| format!("vecgen: expected NAME=N, got {part:?}"))?;
+                            .ok_or_else(|| format!("--vec-extra: expected NAME=N, got {part:?}"))?;
                         spec.aliases.push((name.to_string(), num(w)?));
                     }
                 }
                 "--module" => spec.module = value(i)?.to_string(),
-                other => return Err(format!("vecgen: unknown flag {other:?}")),
+                other => return Err(format!("--vec-extra: unknown flag {other:?}")),
             }
             i += 2;
         }
@@ -153,19 +152,7 @@ impl VecSpec {
         }
     }
 
-    /// The equivalent `gen/vecgen.py` command line.
-    pub fn command(&self) -> String {
-        let flags = self.flags();
-        let flags = if flags.is_empty() {
-            String::new()
-        } else {
-            format!(" {flags}")
-        };
-        format!("python3 gen/vecgen.py{flags} --module {}", self.module)
-    }
-
-    /// The shape flags of [`VecSpec::command`], without the module: what `--vec-extra` takes
-    /// to make the same module on its own.
+    /// The shapes as `--vec-extra` flags: what makes the same module on its own.
     pub fn flags(&self) -> String {
         let nums = |s: &BTreeSet<usize>| {
             s.iter()
@@ -218,7 +205,7 @@ impl VecSpec {
         out.join(" ")
     }
 
-    /// The module's text, as `gen/vecgen.py` writes it.
+    /// The module's text, without the bundler's markers.
     pub fn generate(&self) -> String {
         Gen::new(self).generate(false)
     }
@@ -996,15 +983,13 @@ impl<'a> Gen<'a> {
         }
         self.push("");
         if bundle {
-            self.push(
-                "-- Top-level names: the vector families of gen/vecgen.py, every name ending in its",
-            );
+            self.push("-- Top-level names: the vector families, every name ending in its");
             self.push(
                 "-- widths (Vec64, Rows9_128, fromListRest512, dot64, linear9_128, concat8_64, ...).",
             );
             self.push(BODY_BEGIN);
         }
-        self.push("-- BEGIN GENERATED VEC  (gen/vecgen.py; do not edit by hand)");
+        self.push("-- BEGIN GENERATED VEC  (ultimate-ttt-burn export; do not edit by hand)");
         self.push("{- FOURMOLU_DISABLE -}");
         self.push("");
         if !spec.aliases.is_empty() {
@@ -1072,8 +1057,8 @@ mod tests {
         .unwrap();
         assert_eq!(spec.nest[&512], (8, 64));
         assert_eq!(
-            spec.command(),
-            "python3 gen/vecgen.py --float 3 9 64 128 512 --nest 128=2x64,512=8x64 --rows 10:512 --dense 64:64,128:512 --concat 8:64 --module FixedVec"
+            spec.flags(),
+            "--float 3 9 64 128 512 --nest 128=2x64,512=8x64 --rows 10:512 --dense 64:64,128:512 --concat 8:64"
         );
         assert!(VecSpec::parse_args(&["--nest", "512=7x64"]).is_err());
         assert!(VecSpec::parse_args(&["--bogus"]).is_err());

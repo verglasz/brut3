@@ -79,10 +79,26 @@ enum Command {
         /// Reference book lookups to emit for the port's tests.
         #[arg(long, default_value_t = 40)]
         lookups: usize,
-        /// Extra FixedVec shapes for hand-written code, in vecgen.py flag syntax, e.g.
+        /// Extra FixedVec.hs shapes for hand-written code, on top of the model's, e.g.
         /// `--vec-extra "--int32 512 --rows 9:128"`. Without --model, FixedVec.hs holds only
-        /// these.
-        #[arg(long, allow_hyphen_values = true)]
+        /// these. Widths that a flag needs get their vector type too. Flags:
+        ///   --float N ..     VecN of Float: fromListN, fromListRestN, toListN, indexN,
+        ///                    replicateN, mapN, combineN, addN, subN, sumN, dotN, scaleN,
+        ///                    reluN, and for flat N <= 64 maskedMaxN, maskedExpN
+        ///   --int32 N ..     I32VecN of Int32: i32FromListN .. i32DotN (no scale, relu,
+        ///                    masked)
+        ///   --int16 N ..     I16VecN of Int16: i16FromListN .. i16DotN, likewise
+        ///   --nest N=KxM,..  VecN as K boxed chunks of VecM, its functions built from VecM's
+        ///                    (GHC compiles wide flat vectors badly: nest widths above 64)
+        ///   --rows M:N,..    RowsM_N, M rows of VecN (one row per output), with
+        ///                    fromListRowsM_N and selM_N i (row i)
+        ///   --dense M:N,..   layers from N inputs to M outputs: linearM_N rows bias x =
+        ///                    bias + rows . x, denseM_N = relu of that, and when M = N
+        ///                    residualM_M = relu (x + bias + rows . x); adds RowsM_N
+        ///   --concat K:N,..  concatK_N: K vectors of width N into one of width K * N
+        ///   --sum K:N,..     sumK_N: the componentwise sum of K vectors of width N
+        ///   --alias NAME=N,.. type NAME = VecN
+        #[arg(long, allow_hyphen_values = true, verbatim_doc_comment)]
         vec_extra: Option<String>,
         /// Do not write FixedVec.hs (keep a hand-generated one).
         #[arg(long)]
@@ -1119,12 +1135,8 @@ fn export(
             report.policy_error
         );
     }
-    if !report.vecgen.is_empty() {
-        println!("FixedVec: {}", report.vecgen);
-        println!(
-            "  the same module without a model: export --vec-extra \"{}\"",
-            report.vec_flags
-        );
+    if let Some(flags) = &report.vec_flags {
+        println!("FixedVec shapes (without a model: --vec-extra \"{flags}\")");
     }
     if let Some(stats) = &report.book {
         println!(

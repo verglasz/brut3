@@ -138,8 +138,9 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
     header(&mut s, &format!("{prefix}.Net"), "", "-O2 -fobject-code");
     let _ = writeln!(
         s,
-        "-- {prefix}.FixedVec is written by the same export (equivalently, gen/vecgen.py with:\n--   {}\n-- plus the bundle markers).\n",
-        vec_spec(names, prefix).command()
+        "-- {prefix}.FixedVec is written by the same export; without a model, the same module is\n\
+         -- `export --vec-extra \"{}\"`.\n",
+        vec_spec(names, prefix).flags()
     );
     let _ = writeln!(s, "import Decode (chunksOf, decodeFloats, decodeRowsWith)");
     let _ = writeln!(s, "import {prefix}.FixedVec");
