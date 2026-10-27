@@ -241,7 +241,9 @@ runs and prune passes and adds one per run.
   project's `gen/vecgen.py` (verified identical on both nets, with `--int32`, `--int16`,
   `--sum`, `--rows` and `--alias` extras). Hand-written code that needs more shapes passes
   them in vecgen flag syntax: `--vec-extra "--int32 512 --rows 9:128"`; `--no-fixed-vec`
-  keeps a hand-generated module instead. The export prints the equivalent vecgen command.
+  keeps a hand-generated module instead. Without `--model`, `export --vec-extra "..." --out
+  <dir>` writes FixedVec.hs for the extra shapes alone. The export prints the equivalent
+  vecgen command.
 - `Net.hs`: the `Net` record decoded from the arrays on first use (`net`), `foldRow`,
   `accumulateRows`, `hiddenOf`, `wdlOf`, `policyLogits`. Imports `Gen.FixedVec` and aliases
   `VecE`/`VecA`/`VecH`. Layout per the project's vector codegen notes

@@ -74,8 +74,10 @@ pub struct Report {
     pub book: Option<super::book::BookStats>,
 }
 
-/// Writes every generated module under `out`: the network's modules for `weights` and the
-/// opening book's for `book`. Both import the Haskell project's hand-written `Decode`.
+/// Writes every generated module under `out`: the network's modules for `weights`, the
+/// opening book's for `book`, and `FixedVec` for the network's shapes plus `opts.vec_extra`
+/// (without a network, for the extra shapes alone, if any). The network and book modules
+/// import the Haskell project's hand-written `Decode`.
 pub fn write_all(
     weights: Option<&Weights>,
     book: Option<&Book>,
@@ -112,14 +114,6 @@ pub fn write_all(
         emit("SelfTest", codegen::selftest_module(&names, &opts.prefix))?;
         report.stream_bytes = stream_bytes;
         report.chunks = chunks;
-        let mut vec_spec = codegen::vec_spec(&names, &opts.prefix);
-        if let Some(extra) = &opts.vec_extra {
-            vec_spec.merge(extra);
-        }
-        report.vecgen = vec_spec.command();
-        if opts.fixed_vec {
-            emit("FixedVec", vec_spec.generate_bundled())?;
-        }
         for (_, state) in &positions {
             let exact = weights.evaluate(state);
             let other = rounded.evaluate(state);
@@ -132,6 +126,26 @@ pub fn write_all(
             for (a, b) in exact.policy.iter().zip(&other.policy) {
                 report.policy_error = report.policy_error.max((a.2 - b.2).abs());
             }
+        }
+    }
+    // FixedVec: the network's shapes, plus the extra ones for hand-written code.
+    let vec_spec = match (weights, &opts.vec_extra) {
+        (None, None) => None,
+        (weights, extra) => {
+            let mut spec = match weights {
+                Some(w) => codegen::vec_spec(&codegen::Names::new(&w.config), &opts.prefix),
+                None => VecSpec::new(&format!("{}.FixedVec", opts.prefix)),
+            };
+            if let Some(extra) = extra {
+                spec.merge(extra);
+            }
+            Some(spec)
+        }
+    };
+    if let Some(spec) = vec_spec {
+        report.vecgen = spec.command();
+        if opts.fixed_vec {
+            emit("FixedVec", spec.generate_bundled())?;
         }
     }
     if let Some(book) = book {

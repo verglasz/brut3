@@ -56,7 +56,7 @@ enum Command {
     #[cfg(feature = "nn")]
     Export {
         /// Model stem (`<stem>.bpk` + `<stem>.json`), an nnue model.
-        #[arg(long, required_unless_present = "book")]
+        #[arg(long, required_unless_present_any = ["book", "vec_extra"])]
         model: Option<std::path::PathBuf>,
         /// Opening book file (from `book`) to export as Gen/Book.hs.
         #[arg(long)]
@@ -80,7 +80,8 @@ enum Command {
         #[arg(long, default_value_t = 40)]
         lookups: usize,
         /// Extra FixedVec shapes for hand-written code, in vecgen.py flag syntax, e.g.
-        /// `--vec-extra "--int32 512 --rows 9:128"`.
+        /// `--vec-extra "--int32 512 --rows 9:128"`. Without --model, FixedVec.hs holds only
+        /// these.
         #[arg(long, allow_hyphen_values = true)]
         vec_extra: Option<String>,
         /// Do not write FixedVec.hs (keep a hand-generated one).
@@ -1117,6 +1118,8 @@ fn export(
             report.value_error,
             report.policy_error
         );
+    }
+    if !report.vecgen.is_empty() {
         println!("FixedVec: {}", report.vecgen);
     }
     if let Some(stats) = &report.book {
