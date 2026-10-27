@@ -135,9 +135,10 @@ pub fn write_all(
         }
     }
     if let Some(book) = book {
-        let (text, test, stats) =
+        let (text, content, test, stats) =
             super::book::book_modules(book, &opts.prefix, opts.chunk, opts.seed, opts.lookups);
         emit("Book", text)?;
+        emit("BookContent", content)?;
         emit("BookTest", test)?;
         report.book = Some(stats);
     }
@@ -164,19 +165,29 @@ pub fn weights_module(
         "Array (arrayName, arrayRows, arrayCols, arrayScale, arrayText), arrays, and per array \
          weights_<array>_text with its literals weights_<array>_<k>",
     );
+    // Four base64 characters per three bytes of int16 values.
+    data_warning(
+        &mut s,
+        &format!("the network's {} int16 weights", weights.parameters()),
+        weights.parameters() * 2 * 4 / 3,
+    );
     s.push_str(
         "-- | One weight array: rows * cols little-endian Int16 values, each worth q * scale,\n\
          -- matrices one row per output, as base64 text (standard alphabet, padded) split into\n\
          -- pieces to concatenate.\n\
          data Array = Array\n\
-         \x20 { arrayName :: String\n\
-         \x20 , arrayRows :: Int\n\
-         \x20 , arrayCols :: Int\n\
-         \x20 , arrayScale :: Float\n\
-         \x20 , arrayText :: [String]\n\
+         \x20 { arrayName :: String -- ^ the array's name, checked by the decoder\n\
+         \x20 , arrayRows :: Int -- ^ rows: outputs of a matrix, ids of a table, 1 for a bias\n\
+         \x20 , arrayCols :: Int -- ^ values per row\n\
+         \x20 , arrayScale :: Float -- ^ what one Int16 step is worth\n\
+         \x20 , arrayText :: [String] -- ^ the base64 text, in pieces\n\
          \x20 }\n\n",
     );
     let mut literals = 0;
+    let _ = writeln!(
+        s,
+        "-- | Every weight array, in the order the generated decoder in Net expects."
+    );
     let _ = writeln!(s, "arrays :: [Array]");
     let _ = writeln!(s, "arrays =");
     for (i, a) in arrays.iter().enumerate() {
@@ -288,6 +299,33 @@ pub(super) fn bundle_body_begin(out: &mut String, names: &str) {
     let _ = writeln!(out, "{BODY_BEGIN}");
 }
 
+/// A warning opening the body of a module that is mostly data: what the data is and roughly
+/// how much text it takes, so that a reader knows to skip it rather than read it.
+pub(super) fn data_warning(out: &mut String, what: &str, text_bytes: usize) {
+    let warning = format!(
+        "DATA BLOB WARNING: this module is mostly {what} as base64 string literals, about {} \
+         of text. Read the declarations up to the first literal and skip the rest; the code \
+         that decodes the data is in other modules.",
+        rough_size(text_bytes)
+    );
+    for line in wrap(&warning, 96) {
+        let _ = writeln!(out, "-- {line}");
+    }
+    out.push('\n');
+}
+
+/// A size to one or two significant digits: `2.6 MB`, `140 KB`.
+fn rough_size(bytes: usize) -> String {
+    let b = bytes as f64;
+    if b >= 1e6 {
+        format!("{:.1} MB", b / 1e6)
+    } else if b >= 1e3 {
+        format!("{:.0} KB", b / 1e3)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 pub(super) fn bundle_body_end(out: &mut String) {
     if !out.ends_with('\n') {
         out.push('\n');
@@ -380,8 +418,8 @@ pub fn spec_module(weights: &Weights, prefix: &str) -> String {
     top_level.extend(["bigLines", "openCodesChecksum", "parameters", "foldedMacs"]);
     bundle_body_begin(&mut s, &top_level.join(", "));
     for (comment, items) in &groups {
-        for line in wrap(comment, 96) {
-            let _ = writeln!(s, "-- {line}");
+        for (i, line) in wrap(comment, 96).iter().enumerate() {
+            let _ = writeln!(s, "-- {}{line}", if i == 0 { "| " } else { "" });
         }
         let names: Vec<&str> = items.iter().map(|(n, _)| *n).collect();
         let _ = writeln!(s, "{} :: Int", names.join(", "));
@@ -390,7 +428,7 @@ pub fn spec_module(weights: &Weights, prefix: &str) -> String {
         }
         s.push('\n');
     }
-    let _ = writeln!(s, "-- The big-board lines, in feature order.");
+    let _ = writeln!(s, "-- | The big-board lines, in feature order.");
     let _ = writeln!(s, "bigLines :: [[Int]]");
     let _ = writeln!(
         s,
@@ -400,7 +438,7 @@ pub fn spec_module(weights: &Weights, prefix: &str) -> String {
     s.push('\n');
     let _ = writeln!(
         s,
-        "-- Checksum of the open raw codes in increasing order: h <- (h * 1000003 + code) \
+        "-- | Checksum of the open raw codes in increasing order: h <- (h * 1000003 + code) \
          `mod` 2^32, from 0."
     );
     let _ = writeln!(s, "openCodesChecksum :: Int");
@@ -408,7 +446,7 @@ pub fn spec_module(weights: &Weights, prefix: &str) -> String {
     s.push('\n');
     let _ = writeln!(
         s,
-        "-- Trained parameters and multiply-adds per evaluation once folded."
+        "-- | Trained parameters and multiply-adds per evaluation once folded."
     );
     let _ = writeln!(s, "parameters, foldedMacs :: Int");
     let _ = writeln!(s, "parameters = {}", weights.parameters());
@@ -492,22 +530,26 @@ pub fn reference_module(
     let mut s = String::new();
     banner(&mut s, &format!("{prefix}.Reference"), "(Ref (..), refs)");
     s.push_str(
-        "-- A position and what the shipped (int16-rounded) network computes for it, from the\n\
+        "-- | A position and what the shipped (int16-rounded) network computes for it, from the\n\
          -- side to move's view.\n\
          data Ref = Ref\n\
-         \x20 { refName :: String\n\
-         \x20 , refCells :: [Int]      -- 81 cells by board * 9 + square: 0 empty, 1 X, 2 O\n\
-         \x20 , refToMove :: Int       -- 0 X, 1 O\n\
-         \x20 , refLastMove :: Int     -- board * 9 + square of the last move, -1 if none\n\
-         \x20 , refForced :: Int       -- forced board, 9 if free\n\
-         \x20 , refRawCodes :: [Int]   -- the nine boards' raw content codes\n\
-         \x20 , refIds :: [Int]        -- the idsPerPosition input ids\n\
-         \x20 , refAcc :: [Float]      -- accumulator after the ReLU\n\
-         \x20 , refHidden :: [Float]   -- last hidden layer\n\
-         \x20 , refWdlLogits :: [Float]\n\
-         \x20 , refWdl :: [Float]      -- softmax of the logits: win, draw, loss\n\
-         \x20 , refPolicy :: [(Int, Float, Float)]  -- legal move index, logit, probability\n\
+         \x20 { refName :: String -- ^ where the position comes from, e.g. game17-ply2\n\
+         \x20 , refCells :: [Int] -- ^ 81 cells by board * 9 + square: 0 empty, 1 X, 2 O\n\
+         \x20 , refToMove :: Int -- ^ 0 X, 1 O\n\
+         \x20 , refLastMove :: Int -- ^ board * 9 + square of the last move, -1 if none\n\
+         \x20 , refForced :: Int -- ^ forced board, 9 if free\n\
+         \x20 , refRawCodes :: [Int] -- ^ the nine boards' raw content codes\n\
+         \x20 , refIds :: [Int] -- ^ the idsPerPosition input ids\n\
+         \x20 , refAcc :: [Float] -- ^ accumulator after the ReLU\n\
+         \x20 , refHidden :: [Float] -- ^ last hidden layer\n\
+         \x20 , refWdlLogits :: [Float] -- ^ win, draw, loss logits\n\
+         \x20 , refWdl :: [Float] -- ^ softmax of the logits: win, draw, loss\n\
+         \x20 , refPolicy :: [(Int, Float, Float)] -- ^ legal move index, logit, probability\n\
          \x20 }\n\n",
+    );
+    let _ = writeln!(
+        s,
+        "-- | The reference positions, the initial position first."
     );
     let _ = writeln!(s, "refs :: [Ref]");
     let _ = writeln!(s, "refs =");

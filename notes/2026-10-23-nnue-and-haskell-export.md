@@ -214,9 +214,10 @@ runs and prune passes and adds one per run.
   int16-quantised with one scale per array, little-endian, base64 in string literals of
   64 KB (lines of 1024 characters joined by string gaps). Matrices are one row per output
   (burn's `[d_in, d_out]` transposed), `W_mix` split into `mix0..mix8`. The per-content
-  tables are shipped in the parts the `Net` record holds them in: `content_open` (11093
-  rows), `content_decided` (3), `no_forced`, `cells` (27), `cell_pad`, and `local_open` /
-  `local_decided`, `send_open` / `send_decided`. Each part has its own scale.
+  tables are cut after the open contents, so the decoder never splits a long list:
+  `content_open` (11093 rows) and `content_rest` (32: full, won by us, won by them,
+  no-forced, the 27 cell rows, the pad), `local_open` / `local_rest` and `send_open` /
+  `send_rest` (3 each). Each part has its own scale.
 - The literal decoder is not generated: the Haskell project's hand-written `Decode` module
   (`lib/Decode.hs`, streaming one pass over the pieces) provides `decodeRowsWith`,
   `decodeFloats`, `decodeBytes`, `chunksOf`; `Net.hs` builds rows with `decodeRowsWith` and
@@ -241,8 +242,9 @@ runs and prune passes and adds one per run.
   The per-content tables (`netContent`, `netLocal`, `netSend`) are `OpenClosed` values: the
   open contents in raw-code order (`ocOpen`) and one entry each for full, won by the side to
   move and won by the opponent; the content array's other rows are `netNoForced`,
-  `netCells` (27, at `3 * cell + v`) and `netPad`. Each field decodes from its own array,
-  so the usual shape check of every array is the only length check.
+  `netCells` (27, at `3 * cell + v`) and `netPad` (the padding row a decided board's or
+  no-forced token adds nine times in place of cell rows). `content_rest` is taken apart
+  by pattern; the shape check of every array is the only length check.
 - `Reference.hs`: positions with cells, side to move, last move, forced board, raw codes,
   the input ids, accumulator, hidden layer, W/D/L logits and probabilities, and every legal
   move's logit and probability, as computed by the **int16-rounded** weights (so the port
@@ -251,10 +253,15 @@ runs and prune passes and adds one per run.
   numbering), `tokenOf` (tokens by list lookup), `selfTest`, which
   replays the references from their ids through `Net` and checks the deviations, and
   `bench n`, which times accumulator + MLP + value head + nine policy logits.
-- `Book.hs` (with `--book models/book.txt`, with or without a model): the canonical entries
-  as a sorted byte stream (25 bytes each: three little-endian `Word64` key words, then the
-  move index) in base64 literals, `bookKey` and the eight `squarePermutations`. The engine
-  should build a balanced tree from `bookEntries` and compute keys from its own bitboards.
+- `Book.hs` (with `--book models/book.txt`, with or without a model): `bookEntries`, the
+  decoded canonical entries (25 bytes each: three little-endian `Word64` key words, then
+  the move index), `bookKey` and the eight `squarePermutations`. The engine should build
+  a balanced tree from `bookEntries` and compute keys from its own bitboards. Bytes go
+  through `Word8`, so `Decode.decodeBytes` may return `Int8` or `Word8`.
+- `BookContent.hs`: only the data, `bookText`, the sorted byte stream in base64 literals.
+- Every exported item carries a one-line Haddock comment (`FixedVec.hs` excepted: it
+  follows `gen/vecgen.py`). `Weights.hs` and `BookContent.hs` open their bodies with a
+  DATA BLOB WARNING giving a rough size (from the data's shape), so readers skip them.
 - `BookTest.hs` (verification only): a reference `canonicalKey`/`lookupBook` by linear
   search, and `bookRefs`/`bookTest`: book positions under random symmetries plus a few
   off-book ones, with the move Rust's `Book::lookup` gives. Key words: the 81 cell
@@ -282,8 +289,8 @@ Measured (GHC 9.10.3, `-O2 -XSafe`, one core), including `FixedVec`, on 2026-10-
 
 | model | params | int16 stream | quantisation error (wdl / policy) | compile | self-test | µs per eval after the fold |
 |---|---|---|---|---|---|---|
-| `nnue 64 128 32 2` | 0.99M | 2.0 MB, 65 literals | 1.3e-4 / 2.7e-4 | 6–7 s | max dev 6e-6 | 6 |
-| `nnue 64 512 128 4` | 1.59M | 3.2 MB, 90 literals | 3.1e-4 / 1.5e-3 | 13–17 s | max dev 1e-5 | 61–71 (noisy) |
+| `nnue 64 128 32 2` | 0.99M | 2.0 MB, 62 literals | 1.2e-4 / 2.5e-4 | 6–7 s | max dev 6e-6 | 6 |
+| `nnue 64 512 128 4` | 1.59M | 3.2 MB, 87 literals | 2.5e-4 / 1.6e-3 | 13–17 s | max dev 1e-5 | 61–71 (noisy) |
 
 The chunked layout (8 x `Vec64` for A 512) is what makes the medium net cheap to compile
 and fast to run: flat 512-wide functions were 60 s / 2.3 GB to compile and ~100 µs per

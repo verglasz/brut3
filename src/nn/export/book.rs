@@ -1,6 +1,6 @@
-//! `Book.hs`: the opening book as a sorted byte stream of canonical keys and moves, the
-//! square permutations of the eight symmetries, and reference lookups that pin down the
-//! canonicalisation.
+//! The opening book as a sorted byte stream of canonical keys and moves (`BookContent.hs`),
+//! its decoding and the square permutations of the eight symmetries (`Book.hs`), and
+//! reference lookups that pin down the canonicalisation (`BookTest.hs`).
 //!
 //! A key is three `Word64`s: the 81 cell digits (0 empty, 1 X, 2 O, by `board * 9 + square`)
 //! as three base-3 numbers of 27 digits each, most significant first, with the last word
@@ -13,7 +13,9 @@ use std::fmt::Write as _;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
-use super::haskell::{banner, bundle_body_begin, bundle_body_end, bundle_imports, hs_list};
+use super::haskell::{
+    banner, bundle_body_begin, bundle_body_end, bundle_imports, data_warning, hs_list,
+};
 use super::quant::base64;
 use crate::book::{Book, Key, key_of};
 use crate::game::{BitState, GameState, Move, Player, Square, Symmetry};
@@ -125,14 +127,15 @@ pub struct BookStats {
     pub lookups: usize,
 }
 
-/// `Book.hs` (what the engine needs) and `BookTest.hs` (its verification).
+/// `Book.hs` (what the engine needs), `BookContent.hs` (the entries it decodes) and
+/// `BookTest.hs` (its verification).
 pub fn book_modules(
     book: &Book,
     prefix: &str,
     chunk: usize,
     seed: u64,
     lookups: usize,
-) -> (String, String, BookStats) {
+) -> (String, String, String, BookStats) {
     let entries = entries(book);
     let bytes = encode(&entries);
     let encoded = base64(&bytes);
@@ -151,27 +154,23 @@ pub fn book_modules(
     };
     let refs = reference_lookups(book, seed, lookups);
 
-    let mut s = String::with_capacity(encoded.len() + 8192);
+    let mut s = String::with_capacity(8192);
     banner(
         &mut s,
         &format!("{prefix}.Book"),
         "(BookKey, bookKey, bookEntries, squarePermutations)",
     );
     let _ = writeln!(s, "import Decode (decodeBytes)");
-    bundle_imports(&mut s, &["import Data.Word (Word64)"]);
-    bundle_body_begin(
-        &mut s,
-        &format!(
-            "BookKey, bookKey, squarePermutations, bookEntries, bookText, book_0 .. book_{}",
-            pieces.len() - 1
-        ),
-    );
+    let _ = writeln!(s, "import {prefix}.BookContent (bookText)");
+    bundle_imports(&mut s, &["import Data.Word (Word64, Word8)"]);
+    bundle_body_begin(&mut s, "BookKey, bookKey, squarePermutations, bookEntries");
     s.push_str(
         r#"-- | A position's key: the 81 cell digits (0 empty, 1 X, 2 O, by board * 9 + square) as
 -- three base-3 numbers of 27 digits, most significant first, the last times ten plus the
 -- forced board (0..8, or 9 when free). Keys compare like the digit strings.
 type BookKey = (Word64, Word64, Word64)
 
+-- | The key of 81 cells and a forced board (9 when free), in the frame they are given in.
 bookKey :: [Int] -> Int -> BookKey
 bookKey cells forcedBoard =
   let word = foldl (\acc d -> acc * 3 + fromIntegral d) 0
@@ -191,8 +190,10 @@ squarePermutations :: [[Int]]
     s.push_str(
         r#"-- | Every entry (canonical key, best move index in the canonical frame), ascending by key.
 bookEntries :: [(BookKey, Int)]
-bookEntries = go (decodeBytes (concat bookText))
+bookEntries = go (map (\b -> fromIntegral (fromIntegral b :: Word8)) (decodeBytes (concat bookText)))
   where
+    -- the bytes as 0..255, whether decodeBytes gives Int8 or Word8
+    go :: [Int] -> [(BookKey, Int)]
     go [] = []
     go bytes =
       let (entry, rest) = splitAt 25 bytes
@@ -200,24 +201,38 @@ bookEntries = go (decodeBytes (concat bookText))
        in if length entry == 25
             then ((word 0, word 1, word 2), entry !! 24) : go rest
             else error "bookEntries: ragged book stream"
-
 "#,
     );
+    bundle_body_end(&mut s);
+
+    // The data: the entries' base64 text.
+    let mut c = String::with_capacity(encoded.len() + 4096);
+    banner(&mut c, &format!("{prefix}.BookContent"), "(bookText)");
+    bundle_imports(&mut c, &[]);
+    bundle_body_begin(
+        &mut c,
+        &format!("bookText, book_0 .. book_{}", pieces.len() - 1),
+    );
+    data_warning(
+        &mut c,
+        &format!("the opening book's {} entries", entries.len()),
+        entries.len() * ENTRY_BYTES * 4 / 3,
+    );
     let _ = writeln!(
-        s,
+        c,
         "-- | {} entries of 25 bytes each (three little-endian Word64 then the move), base64.",
         entries.len()
     );
     let names: Vec<String> = (0..pieces.len()).map(|i| format!("book_{i}")).collect();
-    let _ = writeln!(s, "bookText :: [String]");
-    let _ = writeln!(s, "bookText = [{}]\n", names.join(", "));
+    let _ = writeln!(c, "bookText :: [String]");
+    let _ = writeln!(c, "bookText = [{}]\n", names.join(", "));
     for (name, text) in names.iter().zip(&pieces) {
-        let _ = writeln!(s, "{name} :: String");
-        let _ = writeln!(s, "{name} =");
-        super::haskell::write_string_literal(&mut s, text, super::haskell::LITERAL_WIDTH);
-        s.push('\n');
+        let _ = writeln!(c, "{name} :: String");
+        let _ = writeln!(c, "{name} =");
+        super::haskell::write_string_literal(&mut c, text, super::haskell::LITERAL_WIDTH);
+        c.push('\n');
     }
-    bundle_body_end(&mut s);
+    bundle_body_end(&mut c);
     // The verification module: a reference canonicalisation and lookup, and the positions
     // to check them against.
     let mut t = String::with_capacity(16384);
@@ -296,7 +311,7 @@ bookTest = do
         literals: pieces.len(),
         lookups: refs.len(),
     };
-    (s_main, s, stats)
+    (s_main, c, s, stats)
 }
 
 #[cfg(test)]

@@ -18,9 +18,9 @@ use super::vecgen::VecSpec;
 use crate::game::LINES;
 use crate::nn::model::MOVES;
 use crate::nn::nnue::{
-    BOARDS, CELL_BASE, CELL_PAD, CELLS, CONTENTS, DECIDED_BASE, FEATURE_ROWS, FORCED_BASE, FULL,
-    IDS_PER_BOARD, LINE_BASE, LINE_STATES, NO_FORCED, NnueConfig, OPEN_CONTENTS, OPEN_MARKS_BASE,
-    WON_BY_ME, WON_BY_THEM,
+    BOARDS, CELL_BASE, CELL_PAD, CELLS, CONTENT_ROWS, CONTENTS, DECIDED_BASE, FEATURE_ROWS,
+    FORCED_BASE, FULL, IDS_PER_BOARD, LINE_BASE, LINE_STATES, NO_FORCED, NnueConfig, OPEN_CONTENTS,
+    OPEN_MARKS_BASE, WON_BY_ME, WON_BY_THEM,
 };
 
 /// Width of a chunk of a wide vector, and of the fold's row pieces.
@@ -151,8 +151,17 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
          Net (every field starts with net), net, genZeroChunk, genZero3, \
          foldRow, lineFeature, accumulateRows, hiddenOf, wdlOf, policyLogits",
     );
+    let _ = writeln!(
+        s,
+        "-- | A content-table row and a board token (width dEmbed)."
+    );
     let _ = writeln!(s, "type VecE = {}", Names::vec(e));
+    let _ = writeln!(
+        s,
+        "-- | The accumulator and a folded first-layer row (width dAcc)."
+    );
     let _ = writeln!(s, "type VecA = {}", Names::vec(a));
+    let _ = writeln!(s, "-- | A hidden layer's output (width dHidden).");
     let _ = writeln!(s, "type VecH = {}", Names::vec(h));
     let _ = writeln!(
         s,
@@ -164,10 +173,10 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
         r#"-- | A per-content table: the open contents (ids 0..{last_open}, raw-code order) and the three
 -- decided kinds (ids {FULL} fullId, {WON_BY_ME} wonByMe, {WON_BY_THEM} wonByThem).
 data OpenClosed a = OpenClosed
-  {{ ocOpen :: [a]
-  , ocFull :: !a
-  , ocWonByUs :: !a
-  , ocWonByThem :: !a
+  {{ ocOpen :: [a] -- ^ the open contents, by compact id
+  , ocFull :: !a -- ^ a full board without a line
+  , ocWonByUs :: !a -- ^ a board won by the side to move
+  , ocWonByThem :: !a -- ^ a board won by the opponent
   }}
   deriving (Functor)
 "#,
@@ -176,56 +185,64 @@ data OpenClosed a = OpenClosed
 
     // The record.
     let content_ids = format!("content rows, ids 0..{}", CONTENTS - 1);
-    let no_forced_id = format!("id {NO_FORCED} (noForced)");
+    let no_forced_id =
+        format!("the forced token's content row when the move is free, id {NO_FORCED} (noForced)");
     let cell_ids = format!(
-        "{} rows, ids {CELL_BASE}..{}, at 3 * cell + v (v: 0 empty, 1 mine, 2 theirs)",
+        "{} cell rows, ids {CELL_BASE}..{}, at 3 * cell + v (v: 0 empty, 1 mine, 2 theirs)",
         CELL_PAD - CELL_BASE,
         CELL_PAD - 1
     );
-    let pad_id = format!("id {CELL_PAD} (cellPad)");
+    let pad_id = format!(
+        "the cell padding row, id {CELL_PAD} (cellPad): a decided board's or no-forced token adds it nine times instead of cell rows"
+    );
+    let _ = writeln!(
+        s,
+        "-- | The weights, laid out for the evaluation: first layer, features, hidden, heads."
+    );
     let _ = writeln!(s, "data Net = Net");
-    let mut fields: Vec<(String, String, &str)> = vec![
-        (
-            "netContent".into(),
-            "(OpenClosed VecE)".into(),
-            &content_ids,
-        ),
-        ("netNoForced".into(), "VecE".into(), &no_forced_id),
-        ("netCells".into(), "[VecE]".into(), &cell_ids),
-        ("netPad".into(), "VecE".into(), &pad_id),
+    let mut fields: Vec<(String, String, String)> = vec![
+        ("netContent".into(), "(OpenClosed VecE)".into(), content_ids),
+        ("netNoForced".into(), "VecE".into(), no_forced_id),
+        ("netCells".into(), "[VecE]".into(), cell_ids),
+        ("netPad".into(), "VecE".into(), pad_id),
         (
             "netMix".into(),
             "[[FoldPiece]]".into(),
-            "board k's first-layer slice, transposed, in pieces of 64 rows",
+            "board k's first-layer slice, transposed, in pieces of 64 rows".into(),
         ),
-        ("netMixBias".into(), "VecA".into(), ""),
+        (
+            "netMixBias".into(),
+            "VecA".into(),
+            "the first layer's bias".into(),
+        ),
         (
             "netForced".into(),
             "[FoldPiece]".into(),
-            "the forced board's slice",
+            "the forced board's slice".into(),
         ),
         (
             "netForcedFeature".into(),
             Names::rows(FORCED_FEATURES, a),
-            "feature rows by forced board (9 = free)",
+            "feature rows by forced board (9 = free)".into(),
         ),
     ];
     for l in 0..LINES.len() {
         fields.push((
             format!("netLineFeature{l}"),
             Names::rows(LINE_STATES, a),
-            "feature rows of a big-board line by 16 a + 4 b + c (0 open, 1 mine, 2 theirs, 3 full)",
+            "feature rows of a big-board line by 16 a + 4 b + c (0 open, 1 mine, 2 theirs, 3 full)"
+                .into(),
         ));
     }
     fields.push((
         "netDecidedFeature".into(),
         Names::rows(DECIDED_FEATURES, a),
-        "feature rows by number of decided boards",
+        "feature rows by number of decided boards".into(),
     ));
     fields.push((
         "netMarksFeature".into(),
         Names::rows(MARKS_FEATURES, a),
-        "feature rows by marks on open boards",
+        "feature rows by marks on open boards".into(),
     ));
     for i in 0..names.layers {
         let shape = if i == 0 {
@@ -233,42 +250,62 @@ data OpenClosed a = OpenClosed
         } else {
             Names::rows(h, h)
         };
-        fields.push((format!("netHidden{i}"), shape, ""));
-        fields.push((format!("netHidden{i}Bias"), "VecH".into(), ""));
+        let what = if i == 0 {
+            "hidden layer 0, from the accumulator".to_string()
+        } else {
+            format!("hidden layer {i}, residual")
+        };
+        fields.push((format!("netHidden{i}"), shape, what));
+        fields.push((
+            format!("netHidden{i}Bias"),
+            "VecH".into(),
+            format!("hidden layer {i}'s bias"),
+        ));
     }
     fields.extend([
-        ("netValue".into(), Names::rows(3, h), ""),
-        ("netValueBias".into(), Names::vec(3), ""),
-        ("netSkip".into(), Names::rows(3, a), ""),
+        (
+            "netValue".into(),
+            Names::rows(3, h),
+            "win/draw/loss logits from the last hidden layer".into(),
+        ),
+        (
+            "netValueBias".into(),
+            Names::vec(3),
+            "win/draw/loss bias".into(),
+        ),
+        (
+            "netSkip".into(),
+            Names::rows(3, a),
+            "win/draw/loss logits straight from the accumulator".into(),
+        ),
     ]);
     for b in 0..BOARDS {
         fields.push((
             format!("netPolicy{b}"),
             Names::rows(CELLS, h),
-            "global policy rows of board b's nine squares",
+            format!("global policy rows of board {b}'s nine squares"),
         ));
-        fields.push((format!("netPolicyBias{b}"), Names::vec(CELLS), ""));
+        fields.push((
+            format!("netPolicyBias{b}"),
+            Names::vec(CELLS),
+            format!("global policy bias of board {b}'s nine squares"),
+        ));
     }
     fields.extend([
         (
             "netLocal".into(),
             format!("(OpenClosed {})", Names::vec(CELLS)),
-            "each content's own cell logits",
+            "each content's own cell logits".into(),
         ),
         (
             "netSend".into(),
             "(OpenClosed Float)".into(),
-            "each content's send logit",
+            "each content's send logit".into(),
         ),
     ]);
     for (i, (name, ty, comment)) in fields.iter().enumerate() {
         let sep = if i == 0 { "{" } else { "," };
-        let comment = if comment.is_empty() {
-            String::new()
-        } else {
-            format!("  -- {comment}")
-        };
-        let _ = writeln!(s, "  {sep} {name} :: !{ty}{comment}");
+        let _ = writeln!(s, "  {sep} {name} :: !{ty} -- ^ {comment}");
     }
     let _ = writeln!(s, "  }}\n");
 
@@ -304,12 +341,9 @@ data OpenClosed a = OpenClosed
     );
     let _ = writeln!(
         s,
-        "      table name open decided = case decided of\n\
+        "      table name open rest = case rest of\n\
          \x20       [full, me, them] -> OpenClosed open full me them\n\
-         \x20       _ -> error (\"net: array \" ++ name ++ \"_decided is not 3 rows\")\n\
-         \x20     single name xs = case xs of\n\
-         \x20       [x] -> x\n\
-         \x20       _ -> error (\"net: array \" ++ name ++ \" is not 1 row\")"
+         \x20       _ -> error (\"net: array \" ++ name ++ \"_rest is not 3 rows\")"
     );
     let _ = writeln!(s, "      expected = {}", hs_strings(manifest_names));
     let _ = writeln!(s, "   in case arrays of");
@@ -356,21 +390,25 @@ data OpenClosed a = OpenClosed
         step += 1;
         i
     };
+    // The content table: the open rows, then one short array with the decided kinds, no-forced,
+    // the cell rows and the pad, taken apart by pattern.
+    let (open_index, rest_index) = (next(), next());
+    let _ = writeln!(
+        s,
+        "              (contentTable, noForcedRow, cellRows, padRow) = case rows {} {e} fromListRest{e} a{rest_index} of\n\
+         \x20               full : me : them : noF : rest | (cells, [pad]) <- splitAt {} rest ->\n\
+         \x20                 (OpenClosed (rows {OPEN_CONTENTS} {e} fromListRest{e} a{open_index}) full me them, noF, cells, pad)\n\
+         \x20               _ -> error \"net: array content_rest is not {} rows\"",
+        CONTENT_ROWS - OPEN_CONTENTS,
+        CELL_PAD - CELL_BASE,
+        CONTENT_ROWS - OPEN_CONTENTS
+    );
     let _ = writeln!(s, "           in Net");
-    // The content table in its parts: open, decided, no-forced, the cell rows and the pad.
-    let content_rows = |rows: usize, i: usize| format!("rows {rows} {e} fromListRest{e} a{i}");
     let mut inits = vec![
-        format!(
-            "netContent = table \"content\" ({}) ({})",
-            content_rows(OPEN_CONTENTS, next()),
-            content_rows(CONTENTS - OPEN_CONTENTS, next())
-        ),
-        format!(
-            "netNoForced = single \"no_forced\" ({})",
-            content_rows(1, next())
-        ),
-        format!("netCells = {}", content_rows(CELL_PAD - CELL_BASE, next())),
-        format!("netPad = single \"cell_pad\" ({})", content_rows(1, next())),
+        "netContent = contentTable".to_string(),
+        "netNoForced = noForcedRow".to_string(),
+        "netCells = cellRows".to_string(),
+        "netPad = padRow".to_string(),
     ];
     let mix_list: Vec<String> = (0..BOARDS)
         .map(|_| format!("pieces (rows {a} {e} fromListRest{e} a{})", next()))
@@ -448,8 +486,13 @@ data OpenClosed a = OpenClosed
     );
 
     // Forward pieces.
+    let _ = writeln!(s, "-- | A zero chunk: the bias of the fold's dot products.");
     let _ = writeln!(s, "genZeroChunk :: Vec{CHUNK}");
     let _ = writeln!(s, "genZeroChunk = replicate{CHUNK} 0\n");
+    let _ = writeln!(
+        s,
+        "-- | Three zeros: the bias of the skip connection's logits."
+    );
     let _ = writeln!(s, "genZero3 :: Vec3");
     let _ = writeln!(s, "genZero3 = replicate3 0\n");
     let _ = writeln!(
@@ -600,6 +643,7 @@ foldedRows n ids =
       toks = [tokenOf n (take idsPerBoard (drop (k * idsPerBoard) tokenIds)) | k <- [0 .. tokens - 1]]
    in zipWith (foldRow n) [0 ..] toks
 
+-- | The accumulator from a position's folded rows and its feature ids.
 accumulateIds :: Net -> [VecA] -> [Int] -> VecA
 accumulateIds n rows ids =
   let (forced, lineCodes, decided, marks) = localFeatures ids
@@ -620,9 +664,11 @@ moveLogit n ids hid m =
       content b = ids !! (b * idsPerBoard)
    in index9 square (policyLogits n hid board) + index9 square (byId (netLocal n) (content board)) + byId (netSend n) (content square)
 
+-- | Softmax, shifted by the maximum for stability.
 softmax :: [Float] -> [Float]
 softmax zs = let m = maximum zs; es = map (\z -> exp (z - m)) zs; t = sum es in map (/ t) es
 
+-- | Largest absolute difference between two lists, 0 for empty ones.
 maxAbsDiff :: [Float] -> [Float] -> Float
 maxAbsDiff xs ys = maximum (0 : zipWith (\x y -> abs (x - y)) xs ys)
 

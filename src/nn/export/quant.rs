@@ -61,13 +61,7 @@ impl Weights {
                 parts.into_iter().flat_map(|p| p.2).collect(),
             )
         };
-        let content = stacked(&[
-            "content_open",
-            "content_decided",
-            "no_forced",
-            "cells",
-            "cell_pad",
-        ]);
+        let content = stacked(&["content_open", "content_rest"]);
         let mut matrix = |name: &str| stacked(&[name]);
         let mix: Vec<Matrix> = (0..self.mix.len())
             .map(|k| matrix(&format!("mix{k}")))
@@ -90,8 +84,8 @@ impl Weights {
             weight: matrix("policy"),
             bias: matrix("policy_bias").data,
         };
-        let local = stacked(&["local_open", "local_decided"]);
-        let send = stacked(&["send_open", "send_decided"]).data;
+        let local = stacked(&["local_open", "local_rest"]);
+        let send = stacked(&["send_open", "send_rest"]).data;
         assert!(arrays.next().is_none(), "every array mapped");
         Self {
             config: self.config.clone(),

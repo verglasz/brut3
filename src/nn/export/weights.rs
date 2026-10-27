@@ -9,8 +9,8 @@ use burn::prelude::*;
 
 use crate::nn::model::MOVES;
 use crate::nn::nnue::{
-    BOARDS, CELL_BASE, CELL_PAD, CELLS, CONTENT_ROWS, CONTENTS, FEATURE_ROWS, IDS_PER_BOARD,
-    NO_FORCED, Nnue, NnueConfig, OPEN_CONTENTS,
+    BOARDS, CELLS, CONTENT_ROWS, CONTENTS, FEATURE_ROWS, IDS_PER_BOARD, Nnue, NnueConfig,
+    OPEN_CONTENTS,
 };
 use std::ops::Range;
 
@@ -175,8 +175,9 @@ impl Weights {
     }
 
     /// Every array in a fixed order: the matrices one row per output, the biases as one row.
-    /// The per-content tables are cut where the Haskell record cuts them: the open contents,
-    /// the three decided kinds, and for the content table also no-forced, cells and pad.
+    /// The per-content tables are cut after the open contents: `_open` holds those rows and
+    /// `_rest` the few rows after them (the decided kinds, and for the content table also
+    /// no-forced, the cell rows and the pad), so the decoder never splits a long list.
     pub fn arrays(&self) -> Vec<Array<'_>> {
         fn m<'a>(name: &str, m: &'a Matrix) -> Array<'a> {
             Array {
@@ -205,10 +206,7 @@ impl Weights {
         let (open, decided) = (0..OPEN_CONTENTS, OPEN_CONTENTS..CONTENTS);
         let mut out = vec![
             part("content_open", &self.content, open.clone()),
-            part("content_decided", &self.content, decided.clone()),
-            part("no_forced", &self.content, NO_FORCED..NO_FORCED + 1),
-            part("cells", &self.content, CELL_BASE..CELL_PAD),
-            part("cell_pad", &self.content, CELL_PAD..CONTENT_ROWS),
+            part("content_rest", &self.content, OPEN_CONTENTS..CONTENT_ROWS),
         ];
         for (k, w) in self.mix.iter().enumerate() {
             out.push(m(&format!("mix{k}"), w));
@@ -226,7 +224,7 @@ impl Weights {
         out.push(m("policy", &self.policy.weight));
         out.push(v("policy_bias", &self.policy.bias));
         out.push(part("local_open", &self.local, open.clone()));
-        out.push(part("local_decided", &self.local, decided.clone()));
+        out.push(part("local_rest", &self.local, decided.clone()));
         // One value per content: a column, not a row.
         out.push(Array {
             name: "send_open".into(),
@@ -235,7 +233,7 @@ impl Weights {
             data: &self.send[open],
         });
         out.push(Array {
-            name: "send_decided".into(),
+            name: "send_rest".into(),
             rows: decided.len(),
             cols: 1,
             data: &self.send[decided],
