@@ -26,7 +26,7 @@ fn solo_play<A: UtttAgent<State = BitState>>(agent: &mut A, games: u64) -> u64 {
     for _ in 0..games {
         let mut s = BitState::initial();
         while s.outcome().is_none() {
-            s.apply(agent.choose_move(&s));
+            s.apply(agent.choose_move(&s).into());
             moves += 1;
         }
     }

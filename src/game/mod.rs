@@ -9,10 +9,12 @@ pub mod position;
 pub mod symmetry;
 
 use std::fmt;
+use std::hash::Hash;
 use std::str::FromStr;
 
-pub use bitboard::{BitMoveSet, BitState};
+pub use bitboard::{BitMove, BitMoveSet, BitState};
 pub use position::Position;
+use rand::RngCore;
 pub use symmetry::Symmetry;
 
 /// One of the two players. `X` moves first.
@@ -248,18 +250,35 @@ pub fn board_status_of(cells: &[Option<Player>; 9]) -> BoardStatus {
     }
 }
 
-/// A set of moves. The API speaks only in [`Move`]s; the representation is the
+/// What generic code needs from an implementation's own move type ([`GameState::Move`]): a
+/// small copyable value that converts to and from the explicit [`Move`]. Its layout is the
+/// implementation's business; the search and the playouts only pass it around, so that
+/// monomorphised for an implementation they run on its native moves without conversions.
+pub trait GameMove: Copy + Eq + Hash + fmt::Debug + From<Move> + Into<Move> {
+    /// [`Move::index`] of the move, without a detour through [`Move`]: prior rows are laid
+    /// out by it.
+    fn index(self) -> usize;
+}
+
+impl GameMove for Move {
+    #[inline]
+    fn index(self) -> usize {
+        Move::index(self)
+    }
+}
+
+/// A set of one implementation's moves (its iterator's items). The representation is the
 /// implementation's business (a bitset for [`BitMoveSet`], a plain `Vec<Move>` as reference).
-pub trait MoveSet: Clone + IntoIterator<Item = Move> {
+pub trait MoveSet: Clone + IntoIterator<Item: GameMove> {
     fn empty() -> Self;
-    fn contains(&self, mv: Move) -> bool;
+    fn contains(&self, mv: Self::Item) -> bool;
     fn len(&self) -> usize;
-    fn insert(&mut self, mv: Move);
-    fn remove(&mut self, mv: Move);
-    fn iter(&self) -> impl Iterator<Item = Move> + '_;
+    fn insert(&mut self, mv: Self::Item);
+    fn remove(&mut self, mv: Self::Item);
+    fn iter(&self) -> impl Iterator<Item = Self::Item> + '_;
 
     /// The `k`-th move in [`MoveSet::iter`] order, if there are more than `k`.
-    fn nth(&self, k: usize) -> Option<Move> {
+    fn nth(&self, k: usize) -> Option<Self::Item> {
         self.iter().nth(k)
     }
 
@@ -267,8 +286,9 @@ pub trait MoveSet: Clone + IntoIterator<Item = Move> {
         self.len() == 0
     }
 
+    /// The moves as explicit [`Move`]s, in iteration order: for tests and display.
     fn to_vec(&self) -> Vec<Move> {
-        self.iter().collect()
+        self.iter().map(Into::into).collect()
     }
 }
 
@@ -343,8 +363,11 @@ impl FromIterator<Move> for MoveList {
 /// Implementations choose their own internal representation; [`Position`] is the readable
 /// reference, [`BitState`] the fast one.
 pub trait GameState: Clone {
+    /// How this implementation represents a move: what the search and the playouts pass
+    /// around. Code holding an explicit [`Move`] converts with `.into()`.
+    type Move: GameMove;
     /// How this implementation represents a set of moves.
-    type Moves: MoveSet;
+    type Moves: MoveSet<Item = Self::Move>;
 
     /// The empty board, `X` to move.
     fn initial() -> Self;
@@ -358,17 +381,33 @@ pub trait GameState: Clone {
     fn legal_moves(&self) -> Self::Moves;
 
     /// Plays `mv` for the side to move. Must be legal (checked in debug builds).
-    fn apply(&mut self, mv: Move);
+    fn apply(&mut self, mv: Self::Move);
 
     /// `None` while the game is ongoing.
     fn outcome(&self) -> Option<Outcome>;
 
     /// [`GameState::outcome`] after playing `mv`, without keeping the new position. `mv` must
     /// be legal, so the game is not over yet.
-    fn outcome_after(&self, mv: Move) -> Option<Outcome> {
+    fn outcome_after(&self, mv: Self::Move) -> Option<Outcome> {
         let mut next = self.clone();
         next.apply(mv);
         next.outcome()
+    }
+
+    /// Plays `mv` like [`GameState::apply`] and returns the outcome if the game ended with it.
+    /// The game must not be over before the move.
+    fn play(&mut self, mv: Self::Move) -> Option<Outcome> {
+        self.apply(mv);
+        self.outcome()
+    }
+
+    /// A uniformly random legal move (by [`uniform_index`]). The game must not be over.
+    /// Implementations override this to pick without building the whole move set.
+    fn random_move<R: RngCore + ?Sized>(&self, rng: &mut R) -> Self::Move {
+        let legal = self.legal_moves();
+        legal
+            .nth(uniform_index(rng, legal.len()))
+            .expect("random_move on a finished game")
     }
 
     /// The same position seen through a symmetry of the board: every mark, the forced board
@@ -383,6 +422,15 @@ pub trait GameState: Clone {
     fn legal_moves_vec(&self) -> Vec<Move> {
         self.legal_moves().to_vec()
     }
+}
+
+/// A uniform index in `0..n` from one 32-bit draw, as `(r * n) >> 32`: a multiplication where
+/// `r % n` would need a division, and no rejection loop. Each index's probability is off by at
+/// most `1 / 2^32` (relatively `n / 2^32`, about 2e-8 for 81 moves).
+#[inline]
+pub fn uniform_index<R: RngCore + ?Sized>(rng: &mut R, n: usize) -> usize {
+    debug_assert!(n > 0 && n <= u32::MAX as usize, "uniform_index over {n}");
+    ((u64::from(rng.next_u32()) * n as u64) >> 32) as usize
 }
 
 #[cfg(test)]

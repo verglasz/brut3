@@ -80,6 +80,7 @@ impl Position {
 }
 
 impl GameState for Position {
+    type Move = Move;
     type Moves = MoveList;
 
     fn initial() -> Self {

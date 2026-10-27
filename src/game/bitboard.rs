@@ -4,8 +4,13 @@
 //! of 9-bit masks of won boards. Win detection is a 512-entry table lookup. All of this is
 //! private: the public surface is the [`GameState`] trait with its explicit [`Move`]s.
 
+use std::fmt;
+
+use rand::RngCore;
+
 use super::{
     BoardStatus,
+    GameMove,
     GameState,
     LINES,
     Move,
@@ -15,6 +20,7 @@ use super::{
     Position,
     Square,
     Symmetry,
+    uniform_index,
 };
 
 /// All nine squares set.
@@ -71,12 +77,94 @@ const SQUARES: [[u8; 10]; 512] = {
     table
 };
 
+/// [`BitState`]'s move: board and square as the indices `0..9` the masks use, so that playing
+/// one needs no arithmetic. Converts to and from the explicit [`Move`] by table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BitMove {
+    board: u8,
+    square: u8,
+}
+
+impl BitMove {
+    #[inline]
+    const fn new(board: usize, square: usize) -> Self {
+        Self {
+            board: board as u8,
+            square: square as u8,
+        }
+    }
+
+    #[inline]
+    const fn board(self) -> usize {
+        self.board as usize
+    }
+
+    #[inline]
+    const fn square(self) -> usize {
+        self.square as usize
+    }
+
+    /// [`Move::index`] of the move.
+    #[inline]
+    pub const fn index(self) -> usize {
+        self.board() * 9 + self.square()
+    }
+}
+
+/// Every move by [`Move::index`], both ways of writing it.
+const MOVES: [Move; Move::COUNT] = {
+    let mut table = [Move::from_index(0); Move::COUNT];
+    let mut i = 0;
+    while i < Move::COUNT {
+        table[i] = Move::from_index(i);
+        i += 1;
+    }
+    table
+};
+const BIT_MOVES: [BitMove; Move::COUNT] = {
+    let mut table = [BitMove::new(0, 0); Move::COUNT];
+    let mut i = 0;
+    while i < Move::COUNT {
+        table[i] = BitMove::new(i / 9, i % 9);
+        i += 1;
+    }
+    table
+};
+
+impl From<Move> for BitMove {
+    #[inline]
+    fn from(mv: Move) -> Self {
+        Self::new(mv.board.index(), mv.square.index())
+    }
+}
+
+impl From<BitMove> for Move {
+    #[inline]
+    fn from(mv: BitMove) -> Self {
+        MOVES[mv.index()]
+    }
+}
+
+impl GameMove for BitMove {
+    #[inline]
+    fn index(self) -> usize {
+        BitMove::index(self)
+    }
+}
+
+impl fmt::Display for BitMove {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Move::from(*self).fmt(f)
+    }
+}
+
 /// A set of moves as one bit per [`Move::index`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct BitMoveSet(u128);
 
 impl BitMoveSet {
-    const fn bit(mv: Move) -> u128 {
+    #[inline]
+    fn bit(mv: BitMove) -> u128 {
         1u128 << mv.index()
     }
 }
@@ -87,7 +175,7 @@ impl MoveSet for BitMoveSet {
     }
 
     #[inline]
-    fn contains(&self, mv: Move) -> bool {
+    fn contains(&self, mv: BitMove) -> bool {
         self.0 & Self::bit(mv) != 0
     }
 
@@ -97,23 +185,23 @@ impl MoveSet for BitMoveSet {
     }
 
     #[inline]
-    fn insert(&mut self, mv: Move) {
+    fn insert(&mut self, mv: BitMove) {
         self.0 |= Self::bit(mv);
     }
 
     #[inline]
-    fn remove(&mut self, mv: Move) {
+    fn remove(&mut self, mv: BitMove) {
         self.0 &= !Self::bit(mv);
     }
 
-    fn iter(&self) -> impl Iterator<Item = Move> + '_ {
+    fn iter(&self) -> impl Iterator<Item = BitMove> + '_ {
         BitMoveIter(self.0)
     }
 
     /// Steps through the boards' 9-bit chunks from the first one holding a move (in a forced
     /// position the only one), counting and selecting with [`SQUARES`].
     #[inline]
-    fn nth(&self, mut k: usize) -> Option<Move> {
+    fn nth(&self, mut k: usize) -> Option<BitMove> {
         if self.0 == 0 {
             return None;
         }
@@ -122,10 +210,7 @@ impl MoveSet for BitMoveSet {
             let row = &SQUARES[(self.0 >> (board * 9)) as usize & FULL as usize];
             let n = row[9] as usize;
             if k < n {
-                return Some(Move::new(
-                    Square::from_index(board),
-                    Square::from_index(row[k] as usize),
-                ));
+                return Some(BitMove::new(board, row[k] as usize));
             }
             k -= n;
             board += 1;
@@ -135,7 +220,7 @@ impl MoveSet for BitMoveSet {
 }
 
 impl IntoIterator for BitMoveSet {
-    type Item = Move;
+    type Item = BitMove;
     type IntoIter = BitMoveIter;
 
     fn into_iter(self) -> BitMoveIter {
@@ -143,8 +228,8 @@ impl IntoIterator for BitMoveSet {
     }
 }
 
-impl FromIterator<Move> for BitMoveSet {
-    fn from_iter<I: IntoIterator<Item = Move>>(iter: I) -> Self {
+impl FromIterator<BitMove> for BitMoveSet {
+    fn from_iter<I: IntoIterator<Item = BitMove>>(iter: I) -> Self {
         let mut set = Self::empty();
         for mv in iter {
             set.insert(mv);
@@ -157,16 +242,16 @@ impl FromIterator<Move> for BitMoveSet {
 pub struct BitMoveIter(u128);
 
 impl Iterator for BitMoveIter {
-    type Item = Move;
+    type Item = BitMove;
 
     #[inline]
-    fn next(&mut self) -> Option<Move> {
+    fn next(&mut self) -> Option<BitMove> {
         if self.0 == 0 {
             return None;
         }
         let index = self.0.trailing_zeros() as usize;
         self.0 &= self.0 - 1;
-        Some(Move::from_index(index))
+        Some(BIT_MOVES[index])
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -185,7 +270,7 @@ pub struct BitState {
     big: [u16; 2],
     /// 9-bit mask of boards that are decided (won or full).
     done: u16,
-    last_move: Option<Move>,
+    last_move: Option<BitMove>,
     to_move: Player,
 }
 
@@ -202,7 +287,7 @@ impl BitState {
 
     #[inline]
     fn forced_index(&self) -> Option<usize> {
-        let board = self.last_move?.square.index();
+        let board = self.last_move?.square();
         (!self.board_done(board)).then_some(board)
     }
 
@@ -218,14 +303,18 @@ impl BitState {
     }
 
     pub fn is_legal(&self, mv: Move) -> bool {
-        let board = mv.board.index();
+        self.legal(mv.into())
+    }
+
+    fn legal(&self, mv: BitMove) -> bool {
+        let board = mv.board();
         if self.board_done(board) {
             return false;
         }
         if self.forced_index().is_some_and(|forced| forced != board) {
             return false;
         }
-        self.occupied(board) >> mv.square.index() & 1 == 0
+        self.occupied(board) >> mv.square() & 1 == 0
     }
 
     pub fn cell(&self, mv: Move) -> Option<Player> {
@@ -253,7 +342,7 @@ impl BitState {
     }
 
     pub fn last_move(&self) -> Option<Move> {
-        self.last_move
+        self.last_move.map(Move::from)
     }
 
     // --- Mask accessors for in-crate heuristics. Not public: the bit layout is private. ---
@@ -272,6 +361,7 @@ impl BitState {
 }
 
 impl GameState for BitState {
+    type Move = BitMove;
     type Moves = BitMoveSet;
 
     fn initial() -> Self {
@@ -304,7 +394,7 @@ impl GameState for BitState {
                 s.done |= 1 << b;
             }
         }
-        s.last_move = position.last_move();
+        s.last_move = position.last_move().map(BitMove::from);
         s.to_move = position.to_move();
         s
     }
@@ -318,7 +408,7 @@ impl GameState for BitState {
             }
         }
         p.set_to_move(self.to_move);
-        p.set_last_move(self.last_move);
+        p.set_last_move(self.last_move());
         p
     }
 
@@ -342,19 +432,53 @@ impl GameState for BitState {
         }
     }
 
-    fn apply(&mut self, mv: Move) {
-        debug_assert!(self.is_legal(mv), "illegal move {mv}");
-        let p = self.to_move.index();
-        let b = mv.board.index();
-        self.marks[p][b] |= 1 << mv.square.index();
+    /// [`GameState::play`] without its result, which the compiler then drops.
+    #[inline]
+    fn apply(&mut self, mv: BitMove) {
+        let _ = self.play(mv);
+    }
+
+    /// Only a move that decides its own board can end the game, so every other move returns
+    /// right after updating that board.
+    #[inline]
+    fn play(&mut self, mv: BitMove) -> Option<Outcome> {
+        debug_assert!(self.legal(mv), "illegal move {mv}");
+        let mover = self.to_move;
+        let (p, b) = (mover.index(), mv.board());
+        self.marks[p][b] |= 1 << mv.square();
+        self.last_move = Some(mv);
+        self.to_move = mover.other();
         if WIN[self.marks[p][b] as usize] {
             self.big[p] |= 1 << b;
             self.done |= 1 << b;
+            if WIN[self.big[p] as usize] {
+                return Some(Outcome::Win(mover));
+            }
         } else if self.occupied(b) == FULL {
             self.done |= 1 << b;
+        } else {
+            return None;
         }
-        self.last_move = Some(mv);
-        self.to_move = self.to_move.other();
+        (self.done == FULL).then_some(Outcome::Draw)
+    }
+
+    /// Sent to one board, the move comes straight from that board's free squares through
+    /// [`SQUARES`], without building the move set; free to choose a board, from the set.
+    #[inline]
+    fn random_move<R: RngCore + ?Sized>(&self, rng: &mut R) -> BitMove {
+        debug_assert!(self.outcome().is_none(), "random_move on a finished game");
+        match self.forced_index() {
+            Some(board) => {
+                let row = &SQUARES[(!self.occupied(board) & FULL) as usize];
+                BitMove::new(board, row[uniform_index(rng, row[9] as usize)] as usize)
+            }
+            None => {
+                let legal = self.legal_moves();
+                legal
+                    .nth(uniform_index(rng, legal.len()))
+                    .expect("random_move on a finished game")
+            }
+        }
     }
 
     #[inline]
@@ -373,11 +497,11 @@ impl GameState for BitState {
     /// Only a move that decides its own board can end the game, so every other move is
     /// answered from that board's masks alone.
     #[inline]
-    fn outcome_after(&self, mv: Move) -> Option<Outcome> {
-        debug_assert!(self.is_legal(mv), "illegal move {mv}");
+    fn outcome_after(&self, mv: BitMove) -> Option<Outcome> {
+        debug_assert!(self.legal(mv), "illegal move {mv}");
         let p = self.to_move.index();
-        let b = mv.board.index();
-        let bit = 1 << mv.square.index();
+        let b = mv.board();
+        let bit = 1 << mv.square();
         let big = if WIN[(self.marks[p][b] | bit) as usize] {
             self.big[p] | 1 << b
         } else if self.occupied(b) | bit == FULL {
@@ -402,7 +526,9 @@ impl GameState for BitState {
                 symmetry.permute_mask(self.big[1]),
             ],
             done: symmetry.permute_mask(self.done),
-            last_move: self.last_move.map(|mv| symmetry.apply_move(mv)),
+            last_move: self
+                .last_move
+                .map(|mv| symmetry.apply_move(mv.into()).into()),
             to_move: self.to_move,
         };
         for (b, board) in Square::ALL.iter().enumerate() {
@@ -439,17 +565,19 @@ mod tests {
         let b = Move::from_index(80);
         let mut set = BitMoveSet::empty();
         assert!(set.is_empty());
-        set.insert(b);
-        set.insert(a);
-        set.insert(a);
+        set.insert(b.into());
+        set.insert(a.into());
+        set.insert(a.into());
         assert_eq!(set.len(), 2);
-        assert!(set.contains(a) && set.contains(b));
-        assert!(!set.contains(Move::from_index(40)));
+        assert!(set.contains(a.into()) && set.contains(b.into()));
+        assert!(!set.contains(Move::from_index(40).into()));
         assert_eq!(set.to_vec(), vec![a, b]);
         assert_eq!(set.into_iter().len(), 2);
-        set.remove(a);
+        set.remove(a.into());
         assert_eq!(set.to_vec(), vec![b]);
-        let all: BitMoveSet = (0..81).map(Move::from_index).collect();
+        let all: BitMoveSet = (0..81)
+            .map(|i| BitMove::from(Move::from_index(i)))
+            .collect();
         assert_eq!(all.len(), 81);
         assert_eq!(all, BitState::initial().legal_moves());
     }
@@ -467,7 +595,7 @@ mod tests {
         let mut b = BitState::initial();
         let first = Move::new(sq(1, 1), sq(2, 0));
         assert!(b.is_legal(first));
-        b.apply(first);
+        b.apply(first.into());
         assert_eq!(b.to_move(), Player::O);
         assert!(b.is_legal(Move::new(sq(2, 0), sq(0, 0))));
         assert!(!b.is_legal(Move::new(sq(0, 0), sq(0, 0))));
@@ -508,20 +636,56 @@ mod tests {
                     assert_eq!(t_bit.transform(sym.inverse()), bit, "{sym:?} inverse");
                 }
                 for mv in &ref_moves {
-                    assert!(bit_moves.contains(*mv) && bit.is_legal(*mv));
+                    assert!(bit_moves.contains((*mv).into()) && bit.is_legal(*mv));
                     let mut next = pos.clone();
                     next.apply(*mv);
-                    assert_eq!(bit.outcome_after(*mv), next.outcome(), "{mv}\n{pos}");
+                    assert_eq!(
+                        bit.outcome_after((*mv).into()),
+                        next.outcome(),
+                        "{mv}\n{pos}"
+                    );
                 }
                 // `ref_moves` is sorted, which is the bit set's iteration order.
                 for k in 0..=ref_moves.len() {
-                    assert_eq!(bit_moves.nth(k), ref_moves.get(k).copied(), "{k}\n{pos}");
+                    assert_eq!(
+                        bit_moves.nth(k).map(Move::from),
+                        ref_moves.get(k).copied(),
+                        "{k}\n{pos}"
+                    );
                 }
                 let mv = ref_moves[rng.random_range(0..ref_moves.len())];
                 pos.apply(mv);
-                bit.apply(mv);
+                bit.apply(mv.into());
             }
         }
+    }
+
+    /// Random games by `random_move` and `play`, the reference following along: every move
+    /// is legal there, converts back and forth, and `play` reports what `outcome` says.
+    #[test]
+    fn random_move_and_play_follow_the_reference() {
+        let mut rng = SmallRng::seed_from_u64(3);
+        let mut picked = [0u32; Move::COUNT];
+        for _ in 0..2000 {
+            let mut pos = Position::initial();
+            let mut bit = BitState::initial();
+            loop {
+                let mv = bit.random_move(&mut rng);
+                let explicit = Move::from(mv);
+                assert_eq!(BitMove::from(explicit), mv);
+                assert_eq!(GameMove::index(mv), explicit.index());
+                assert!(pos.legal_moves().contains(explicit), "{explicit}\n{pos}");
+                picked[explicit.index()] += 1;
+                pos.apply(explicit);
+                let ended = bit.play(mv);
+                assert_eq!(ended, pos.outcome(), "{explicit}\n{pos}");
+                assert_eq!(bit.to_position(), pos);
+                if ended.is_some() {
+                    break;
+                }
+            }
+        }
+        assert!(picked.iter().all(|&n| n > 0), "every move gets picked");
     }
 
     #[test]

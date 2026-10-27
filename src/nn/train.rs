@@ -272,7 +272,7 @@ pub fn generate(
             }
             let (mv, policy) = agent.choose_move_with_policy(&state);
             positions.push((state, policy));
-            state.apply(mv);
+            state.apply(mv.into());
         };
         for (state, policy) in positions.drain(..) {
             data.samples
@@ -947,7 +947,7 @@ pub(crate) mod tests {
                     .unwrap();
                 data.samples.push(Sample {
                     state,
-                    policy: vec![(best, 1.0)],
+                    policy: vec![(best.into(), 1.0)],
                     game,
                     wdl: Some(Verdict::from_index(verdict).one_hot()),
                     search_value: None,

@@ -106,7 +106,7 @@ pub fn reference_lookups(book: &Book, seed: u64, n: usize) -> Vec<(BitState, Opt
         for (mv, visits) in &entry.visits {
             if *visits as f32 / total as f32 >= 0.01 {
                 let mut child = state;
-                child.apply(*mv);
+                child.apply((*mv).into());
                 if !child.is_terminal() {
                     queue.push_back(child);
                 }
@@ -144,7 +144,7 @@ pub fn reference_lookups(book: &Book, seed: u64, n: usize) -> Vec<(BitState, Opt
                 break;
             }
             let legal = state.legal_moves_vec();
-            state.apply(legal[rng.random_range(0..legal.len())]);
+            state.apply(legal[rng.random_range(0..legal.len())].into());
         }
         if !state.is_terminal() {
             let expected = book.lookup(&state).map(|e| e.best);
@@ -416,7 +416,7 @@ mod tests {
                     break;
                 }
                 let legal = state.legal_moves_vec();
-                state.apply(legal[rng.random_range(0..legal.len())]);
+                state.apply(legal[rng.random_range(0..legal.len())].into());
             }
             keys.push(canonical(&state).2);
         }

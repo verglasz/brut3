@@ -35,13 +35,13 @@ impl UtttAgent for GreedyAgent {
             let s = heuristic::score(&next, me);
             if s > best_score {
                 best_score = s;
-                best = mv;
+                best = mv.into();
                 ties = 1;
             } else if s == best_score {
                 // Reservoir sampling keeps each tied move equally likely.
                 ties += 1;
                 if self.rng.random_range(0..ties) == 0 {
-                    best = mv;
+                    best = mv.into();
                 }
             }
         }

@@ -82,7 +82,7 @@ mod tests {
     #[test]
     fn terminal_scores_are_exact() {
         let mut s = x_wins_in_one();
-        s.apply(X_WINNING_MOVE);
+        s.apply(X_WINNING_MOVE.into());
         assert_eq!(score(&s, Player::X), WIN_SCORE);
         assert_eq!(score(&s, Player::O), -WIN_SCORE);
         assert_eq!(value(&s, Player::X), 1.0);
@@ -110,13 +110,13 @@ mod tests {
         let empty = BitState::initial();
         assert_eq!(score(&empty, Player::X), 0);
         let mut centre = empty;
-        centre.apply(Move::new(sq(1, 1), sq(1, 1)));
+        centre.apply(Move::new(sq(1, 1), sq(1, 1)).into());
         assert_eq!(score(&centre, Player::X), CENTRE_SQUARE);
         // Two in a row on a small board is a threat.
         let mut threat = centre;
-        threat.apply(Move::new(sq(1, 1), sq(0, 0))); // O, corner
-        threat.apply(Move::new(sq(0, 0), sq(1, 1))); // X centre of (0,0)
-        threat.apply(Move::new(sq(1, 1), sq(0, 2))); // O, corner, and threatens? no: 0,0 + 0,2 with X at 1,1 -> line 0,1,2 open
+        threat.apply(Move::new(sq(1, 1), sq(0, 0)).into()); // O, corner
+        threat.apply(Move::new(sq(0, 0), sq(1, 1)).into()); // X centre of (0,0)
+        threat.apply(Move::new(sq(1, 1), sq(0, 2)).into()); // O, corner, and threatens? no: 0,0 + 0,2 with X at 1,1 -> line 0,1,2 open
         assert!(score(&threat, Player::O) < 0 || score(&threat, Player::O) > 0); // just well-defined
         assert!(score(&x_wins_in_one(), Player::X) > 2 * WON_BOARD);
     }

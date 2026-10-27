@@ -130,7 +130,7 @@ pub fn parse_line(line: &str) -> Result<Option<Sample>, String> {
             return Err(format!("action index {index}"));
         }
         let mv = Move::from_index(index);
-        if !legal.contains(mv) {
+        if !legal.contains(mv.into()) {
             return Err(format!("action {mv} is not legal in the position"));
         }
         let visits: f32 = num(fields[2])?;

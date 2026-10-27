@@ -30,10 +30,11 @@ the same thing without saving it.
 |---|---|
 | `game/legal_moves` | move generation, forced and free positions |
 | `game/outcome` | result check of a position |
-| `game/copy + apply + outcome`, `game/outcome_after` | the result after a move, the long way and the bitboard shortcut that `expand` uses |
+| `game/copy + apply + outcome`, `game/copy + play`, `game/outcome_after` | the result after a move: the long way, `play` (applies and reports the end, as playouts do) and the shortcut without applying that `expand` uses |
 | `game/transform` | one board symmetry (book and data augmentation) |
-| `rng/random_range` | drawing a move number |
+| `rng/random_range`, `rng/uniform_index` | drawing a move number: `rand`'s way and the multiply-shift that `random_move` uses |
 | `pick/MoveSet::nth(k)` | turning that number into a move |
+| `game/random_move` | a uniform legal move straight from the state, as playouts pick them |
 | `agent/RandomAgent::choose_move` | the two above plus move generation: one playout step |
 | `eval/random playout` | one rollout to the end from a pool position |
 | `eval/heuristic::score` | the static evaluation used by the greedy and minimax agents |

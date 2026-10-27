@@ -17,7 +17,7 @@
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use crate::agent::{Evaluation, Evaluations, UtttAgent};
-use crate::game::{GameState, Move, MoveSet, Outcome, Player};
+use crate::game::{GameMove, GameState, Move, MoveSet, Outcome, Player};
 
 #[derive(Clone, Debug)]
 pub struct MctsConfig {
@@ -123,8 +123,9 @@ struct Node {
 
 /// A legal move out of an expanded node.
 #[derive(Clone, Copy)]
-struct Edge {
-    mv: Move,
+struct Edge<M> {
+    /// In the game state's own move type, converted to [`Move`] only in results.
+    mv: M,
     prior: f32,
     /// The child node, `NO_NODE` until it is first selected.
     child: u32,
@@ -206,7 +207,7 @@ pub struct SearchTree<S: GameState> {
     nodes: Vec<Node>,
     /// `stats[i]` belongs to `nodes[i]`.
     stats: Vec<Stats>,
-    edges: Vec<Edge>,
+    edges: Vec<Edge<S::Move>>,
     c_puct: f32,
     virtual_loss: f32,
     /// Leaves claimed in the current round with their positions, in claim order.
@@ -314,14 +315,14 @@ impl<S: GameState> SearchTree<S> {
 
     /// The known result behind an edge: the child's (possibly proven) outcome if it exists,
     /// else the terminal result recorded at expansion.
-    fn edge_outcome(&self, edge: &Edge) -> Option<Outcome> {
+    fn edge_outcome(&self, edge: &Edge<S::Move>) -> Option<Outcome> {
         match edge.child {
             NO_NODE => edge.terminal,
             child => self.nodes[child as usize].outcome,
         }
     }
 
-    fn edge_visits(&self, edge: &Edge) -> u32 {
+    fn edge_visits(&self, edge: &Edge<S::Move>) -> u32 {
         match edge.child {
             NO_NODE => 0,
             child => self.stats[child as usize].visits,
@@ -357,7 +358,7 @@ impl<S: GameState> SearchTree<S> {
                     Some(_) => 0,
                     None => self.edge_visits(edge),
                 };
-                (edge.mv, n)
+                (edge.mv.into(), n)
             })
             .collect();
         let root_stats = &self.stats[0];
@@ -585,7 +586,7 @@ impl<S: GameState> SearchTree<S> {
     pub(crate) fn root_children(&self) -> Vec<(Move, f32, u32)> {
         self.edges[self.nodes[0].edges()]
             .iter()
-            .map(|edge| (edge.mv, edge.prior, self.edge_visits(edge)))
+            .map(|edge| (edge.mv.into(), edge.prior, self.edge_visits(edge)))
             .collect()
     }
 
@@ -1036,7 +1037,7 @@ mod tests {
     #[test]
     fn priors_are_masked_and_normalised() {
         let mut state = BitState::initial();
-        state.apply(Move::new(sq(0, 0), sq(1, 1))); // O forced to board (1,1)
+        state.apply(Move::new(sq(0, 0), sq(1, 1)).into()); // O forced to board (1,1)
         let mut mcts = Mcts::new(MessyPriors, cfg(1));
         let r = mcts.search(&state);
         assert_eq!(r.root_value, 1.0, "value clamped to 1");
@@ -1077,7 +1078,7 @@ mod tests {
                 } else {
                     random.choose_move(&state)
                 };
-                state.apply(mv);
+                state.apply(mv.into());
             };
             match outcome {
                 Outcome::Win(p) if p == mcts_player => wins += 1,

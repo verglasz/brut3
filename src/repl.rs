@@ -176,7 +176,7 @@ impl<W: Write> Repl<W> {
     fn play(&mut self, mv: Move) -> io::Result<()> {
         let mover = self.state.to_move();
         self.history.push(self.state);
-        self.state.apply(mv);
+        self.state.apply(mv.into());
         writeln!(self.out, "{mover} plays {mv}")?;
         if let Some(outcome) = self.state.outcome() {
             writeln!(self.out, "game over: {outcome:?}")?;

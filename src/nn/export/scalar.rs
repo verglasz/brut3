@@ -173,7 +173,7 @@ mod tests {
                     out.push(state.clone());
                 }
                 let legal = state.legal_moves_vec();
-                state.apply(legal[rng.random_range(0..legal.len())]);
+                state.apply(legal[rng.random_range(0..legal.len())].into());
                 ply += 1;
             }
         }

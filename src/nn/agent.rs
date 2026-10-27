@@ -181,7 +181,7 @@ mod tests {
         let _device = crate::nn::device_lock();
         let mut agent = untrained();
         let mut won = x_wins_in_one();
-        won.apply(X_WINNING_MOVE);
+        won.apply(X_WINNING_MOVE.into());
         assert_eq!(agent.evaluate(&won).value, -1.0);
         let mut out = Evaluations::default();
         agent.evaluate_batch(&[BitState::initial(), won, x_wins_in_one()], &mut out);

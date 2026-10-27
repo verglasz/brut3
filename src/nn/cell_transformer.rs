@@ -229,7 +229,7 @@ pub fn cell_token_ids(state: &BitState, out: &mut CellTokenIds) {
             token[1] = (POSITION_BASE + i) as i32;
             token[2] = status;
             token[3] = forced;
-            token[4] = LEGAL_BASE as i32 + i32::from(legal_moves.contains(mv));
+            token[4] = LEGAL_BASE as i32 + i32::from(legal_moves.contains(mv.into()));
         }
     }
 }

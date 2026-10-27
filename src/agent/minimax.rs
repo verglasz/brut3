@@ -66,12 +66,12 @@ impl UtttAgent for MinimaxAgent {
             let s = -Self::negamax(&next, self.depth - 1, i32::MIN + 1, i32::MAX);
             if s > best_score {
                 best_score = s;
-                best = mv;
+                best = mv.into();
                 ties = 1;
             } else if s == best_score {
                 ties += 1;
                 if self.rng.random_range(0..ties) == 0 {
-                    best = mv;
+                    best = mv.into();
                 }
             }
         }
@@ -114,7 +114,7 @@ mod tests {
         // Not blocking loses by force: X gets a free move and wins. Depth 2 sees it.
         let state = o_must_block();
         let mut next = state;
-        next.apply(Move::new(sq(0, 2), sq(2, 2)));
+        next.apply(Move::new(sq(0, 2), sq(2, 2)).into());
         assert!(next.legal_moves_vec().contains(&X_WINNING_MOVE));
         let v = -MinimaxAgent::negamax(&next, 1, i32::MIN + 1, i32::MAX);
         assert_eq!(v, -heuristic::WIN_SCORE);
@@ -138,7 +138,7 @@ mod tests {
                 } else {
                     r.choose_move(&s)
                 };
-                s.apply(mv);
+                s.apply(mv.into());
             };
             if outcome == Outcome::Win(me) {
                 wins += 1;

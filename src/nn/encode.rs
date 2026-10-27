@@ -82,7 +82,7 @@ mod tests {
     #[test]
     fn perspective_follows_side_to_move() {
         let mut s = BitState::initial();
-        s.apply(Move::new(sq(1, 1), sq(0, 2))); // X at board 4, square 2; O to move, forced to 2
+        s.apply(Move::new(sq(1, 1), sq(0, 2)).into()); // X at board 4, square 2; O to move, forced to 2
         let mut f = vec![0.0; FEATURES];
         encode_into(&s, &mut f);
         assert_eq!(f[THEIRS + 4 * 9 + 2], 1.0, "X's mark is 'theirs' for O");

@@ -532,7 +532,7 @@ pub fn reference_positions(seed: u64, n: usize) -> Vec<(String, BitState)> {
         let mut ply = 0;
         while !state.is_terminal() {
             let legal = state.legal_moves_vec();
-            state.apply(legal[rng.random_range(0..legal.len())]);
+            state.apply(legal[rng.random_range(0..legal.len())].into());
             ply += 1;
             if state.is_terminal() {
                 break;

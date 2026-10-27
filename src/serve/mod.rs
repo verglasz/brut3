@@ -264,7 +264,7 @@ fn replay(moves: &str) -> Result<BitState, String> {
         if state.is_terminal() || !state.is_legal(mv) {
             return Err(format!("move {ply}: {mv} is not legal"));
         }
-        state.apply(mv);
+        state.apply(mv.into());
     }
     Ok(state)
 }

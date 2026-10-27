@@ -4,7 +4,7 @@
 use burn::prelude::*;
 use burn::tensor::activation::log_softmax;
 
-use crate::game::{BitState, GameState, Move, MoveSet, Outcome, Player};
+use crate::game::{BitState, GameMove, GameState, Move, MoveSet, Outcome, Player};
 
 /// Number of distinct moves, one per square of the big board (`Move::index`).
 pub const MOVES: usize = Move::COUNT;
@@ -254,9 +254,12 @@ pub fn predict_host<M: Model>(model: &M, states: &[BitState], device: &Device) -
         prediction.wdl.push(host_wdl(row));
         let legal = state.legal_moves();
         host_policy_into(row, &legal, &mut dense);
-        prediction
-            .policy
-            .push(legal.iter().map(|mv| (mv, dense[mv.index()])).collect());
+        prediction.policy.push(
+            legal
+                .iter()
+                .map(|mv| (mv.into(), dense[mv.index()]))
+                .collect(),
+        );
     }
     prediction
 }

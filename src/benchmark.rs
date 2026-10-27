@@ -135,7 +135,7 @@ pub fn play_match_with(
             } else {
                 agent_b.choose_move(&state)
             };
-            state.apply(mv);
+            state.apply(mv.into());
             result.moves += 1;
         };
         match outcome {

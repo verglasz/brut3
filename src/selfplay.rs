@@ -202,7 +202,7 @@ fn advance(
             .expect("non-terminal position has moves");
         game.positions
             .push((game.state, result.policy(), result.root_value));
-        game.state.apply(mv);
+        game.state.apply(mv.into());
         game.plies += 1;
         match game.state.outcome() {
             Some(outcome) => {
@@ -438,7 +438,7 @@ impl MatchGame {
 
     /// Applies `mv`, counting it and the game's end if it ends the game.
     fn play(&mut self, mv: Move, tally: &mut MatchTally, on_game: &mut impl FnMut(usize)) {
-        self.state.apply(mv);
+        self.state.apply(mv.into());
         self.plies += 1;
         tally.moves += 1;
         if let Some(outcome) = self.state.outcome() {
@@ -723,7 +723,7 @@ mod tests {
                 .iter()
                 .find(|(mv, _)| {
                     let mut next = end;
-                    next.apply(*mv);
+                    next.apply((*mv).into());
                     next.outcome() == Some(record.outcome)
                 })
                 .map(|(mv, _)| *mv);
@@ -731,7 +731,7 @@ mod tests {
                 played.is_some(),
                 "the last move ends the game with the recorded outcome"
             );
-            end.apply(played.unwrap());
+            end.apply(played.unwrap().into());
             assert_eq!(end.outcome(), Some(record.outcome));
         }
     }
@@ -799,7 +799,7 @@ mod tests {
         impl UtttAgent for Flat {
             type State = BitState;
             fn choose_move(&mut self, state: &BitState) -> Move {
-                state.legal_moves().iter().next().unwrap()
+                state.legal_moves().iter().next().unwrap().into()
             }
             fn evaluate(&mut self, _state: &BitState) -> crate::agent::Evaluation {
                 crate::agent::Evaluation::value_only(0.0)

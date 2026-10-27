@@ -142,7 +142,7 @@ pub trait UtttAgent {
                 return Evaluation::value_only(outcome.value_for(me));
             }
             let mv = self.choose_move(&s);
-            s.apply(mv);
+            s.apply(mv.into());
         }
     }
 

@@ -2,10 +2,10 @@
 
 use std::marker::PhantomData;
 
-use rand::{Rng, SeedableRng, rngs::SmallRng};
+use rand::{SeedableRng, rngs::SmallRng};
 
-use super::UtttAgent;
-use crate::game::{GameState, Move, MoveSet};
+use super::{Evaluation, UtttAgent};
+use crate::game::{GameState, Move};
 
 /// Plays a uniformly random legal move. The weakest possible baseline, and the default
 /// playout policy when used as the inner agent of [`crate::mcts::Mcts`].
@@ -27,10 +27,27 @@ impl<S: GameState> UtttAgent for RandomAgent<S> {
     type State = S;
 
     fn choose_move(&mut self, state: &S) -> Move {
-        let legal = state.legal_moves();
-        assert!(!legal.is_empty(), "choose_move called on a terminal state");
-        let k = self.rng.random_range(0..legal.len());
-        legal.nth(k).expect("k < len")
+        assert!(
+            !state.is_terminal(),
+            "choose_move called on a terminal state"
+        );
+        state.random_move(&mut self.rng).into()
+    }
+
+    /// A random playout to the end, in the state's own moves ([`GameState::random_move`] and
+    /// [`GameState::play`]): monomorphised for a state, it is that state's specialised loop.
+    fn evaluate(&mut self, state: &S) -> Evaluation {
+        let me = state.to_move();
+        if let Some(outcome) = state.outcome() {
+            return Evaluation::value_only(outcome.value_for(me));
+        }
+        let mut s = state.clone();
+        loop {
+            let mv = s.random_move(&mut self.rng);
+            if let Some(outcome) = s.play(mv) {
+                return Evaluation::value_only(outcome.value_for(me));
+            }
+        }
     }
 }
 
@@ -48,7 +65,7 @@ mod tests {
             let mv = a.choose_move(&state);
             assert_eq!(mv, b.choose_move(&state));
             assert!(state.is_legal(mv));
-            state.apply(mv);
+            state.apply(mv.into());
         }
     }
 }

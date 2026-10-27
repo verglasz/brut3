@@ -500,7 +500,7 @@ impl Book {
             let back = sym.inverse();
             for (mv, _) in entry.visits.iter().filter(|(_, n)| *n > 0) {
                 let mut child = state;
-                child.apply(back.apply_move(*mv));
+                child.apply(back.apply_move(*mv).into());
                 queue.push_back((child, ply + 1));
             }
         }
@@ -568,7 +568,7 @@ impl Book {
                 };
                 if xl || ol {
                     let mut child = state;
-                    child.apply(mv);
+                    child.apply(mv.into());
                     queue.push_back((child, xl, ol));
                 }
             }
@@ -735,7 +735,7 @@ impl Book {
                 };
                 if xs || os {
                     let mut child = state;
-                    child.apply(mv);
+                    child.apply(mv.into());
                     queue.push_back((child, ply + 1, xs, os, is_best));
                 }
             }
@@ -920,8 +920,8 @@ mod tests {
 
         // Every image of a position canonicalises to the same key.
         let mut s = initial;
-        s.apply(Move::new(sq(0, 1), sq(2, 0)));
-        s.apply(Move::new(sq(2, 0), sq(0, 0)));
+        s.apply(Move::new(sq(0, 1), sq(2, 0)).into());
+        s.apply(Move::new(sq(2, 0), sq(0, 0)).into());
         let (_, image, key) = canonical(&s);
         for sym in Symmetry::ALL {
             let (_, img, k) = canonical(&s.transform(sym));
@@ -1014,7 +1014,7 @@ mod tests {
                     assert_eq!(back.to_move(), state.to_move());
                     assert_eq!(back.legal_moves_vec(), state.legal_moves_vec());
                 }
-                s.apply(agent.choose_move(&s));
+                s.apply(agent.choose_move(&s).into());
             }
         }
         assert!(state_of_cells(&format!("{}9", "0".repeat(81))).is_ok());
@@ -1049,7 +1049,7 @@ mod tests {
         // X in the top-middle square of the top-middle board keeps only the left-right
         // mirror: O's top corners of that board are the same move, its corner and edge not.
         let mut s = empty;
-        s.apply(Move::new(sq(0, 1), sq(0, 1)));
+        s.apply(Move::new(sq(0, 1), sq(0, 1)).into());
         let a = Move::new(sq(0, 1), sq(0, 0));
         let b = Move::new(sq(0, 1), sq(0, 2));
         let edge = Move::new(sq(0, 1), sq(1, 0));
@@ -1076,7 +1076,7 @@ mod tests {
         };
         let play = |s: &BitState, mv: Move| {
             let mut next = *s;
-            next.apply(mv);
+            next.apply(mv.into());
             next
         };
         let root = BitState::initial();
@@ -1115,7 +1115,7 @@ mod tests {
     fn lookup_maps_moves_back_through_the_symmetry() {
         let mut book = Book::default();
         let mut s = BitState::initial();
-        s.apply(Move::new(sq(0, 1), sq(2, 0))); // X top-middle board, bottom-left square
+        s.apply(Move::new(sq(0, 1), sq(2, 0)).into()); // X top-middle board, bottom-left square
         let reply = Move::new(sq(2, 0), sq(1, 1)); // O in the forced board's centre
         book.insert(
             &s,
@@ -1168,7 +1168,7 @@ mod tests {
         let centre = Move::new(sq(1, 1), sq(1, 1));
         let reply = Move::new(sq(1, 1), sq(0, 0));
         let mut after = root;
-        after.apply(centre);
+        after.apply(centre.into());
         let mut book = Book::default();
         for (state, best) in [(root, centre), (after, reply)] {
             book.insert(
@@ -1236,9 +1236,9 @@ mod tests {
         assert_eq!(frontier.len(), 2);
         let keys: HashSet<Key> = frontier.iter().map(key_of).collect();
         let mut after_centre = BitState::initial();
-        after_centre.apply(centre);
+        after_centre.apply(centre.into());
         let mut after_corner = BitState::initial();
-        after_corner.apply(corner);
+        after_corner.apply(corner.into());
         assert!(keys.contains(&canonical(&after_centre).2));
         assert!(keys.contains(&canonical(&after_corner).2));
         assert!(!frontier.iter().any(|s| s.to_move() == Player::X));
@@ -1265,7 +1265,7 @@ mod tests {
             },
         );
         let mut after_reply = after_corner;
-        after_reply.apply(reply);
+        after_reply.apply(reply.into());
         let keys: HashSet<Key> = book.frontier(&main).iter().map(key_of).collect();
         let expected: HashSet<Key> = [canonical(&after_centre).2, canonical(&after_reply).2]
             .into_iter()
@@ -1363,7 +1363,7 @@ mod tests {
         assert_eq!(book.live_len(), book.len());
         // Every book position answers from any symmetric image.
         let mut s = BitState::initial();
-        s.apply(book.best_move(&s).unwrap());
+        s.apply(book.best_move(&s).unwrap().into());
         for sym in Symmetry::ALL {
             assert!(book.best_move(&s.transform(sym)).is_some());
         }

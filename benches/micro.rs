@@ -7,7 +7,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use brut3::agent::{Evaluations, RandomAgent, UtttAgent, heuristic};
-use brut3::game::{BitState, GameState, Move, MoveSet, Symmetry};
+use brut3::game::{BitMove, BitState, GameState, Move, MoveSet, Symmetry, uniform_index};
 use brut3::mcts::{SearchTree, dirichlet};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
@@ -116,7 +116,9 @@ fn pools() -> Pools {
     Pools { all, forced, free }
 }
 
-fn random_move(s: &BitState, rng: &mut SmallRng) -> Move {
+/// The pools' own random moves (`random_range` then `nth`), kept as they were so that the
+/// pools, and the checksums over them, stay the same across commits.
+fn random_move(s: &BitState, rng: &mut SmallRng) -> BitMove {
     let legal = s.legal_moves();
     legal.nth(rng.random_range(0..legal.len())).unwrap()
 }
@@ -168,7 +170,7 @@ fn main() {
             s.legal_moves().len() as u64
         });
     }
-    let with_move: Vec<(BitState, Move)> = p
+    let with_move: Vec<(BitState, BitMove)> = p
         .all
         .iter()
         .map(|s| (*s, random_move(s, &mut rng)))
@@ -180,6 +182,10 @@ fn main() {
         let mut next = *s;
         next.apply(*mv);
         next.outcome().is_some() as u64
+    });
+    h.bench("game/copy + play", 1, &with_move, |(s, mv)| {
+        let mut next = *s;
+        next.play(*mv).is_some() as u64
     });
     h.bench("game/outcome_after", 1, &with_move, |(s, mv)| {
         s.outcome_after(*mv).is_some() as u64
@@ -203,6 +209,10 @@ fn main() {
     h.bench("rng/random_range(0..legal)", 1, &counts, |n| {
         range_rng.random_range(0..*n) as u64
     });
+    let mut index_rng = SmallRng::seed_from_u64(7);
+    h.bench("rng/uniform_index(legal)", 1, &counts, |n| {
+        uniform_index(&mut index_rng, *n) as u64
+    });
     for (pool, name) in [(&p.forced, "forced"), (&p.free, "free")] {
         let picks: Vec<(<BitState as GameState>::Moves, usize)> = pool
             .iter()
@@ -217,6 +227,10 @@ fn main() {
             &picks,
             |(legal, k)| legal.nth(*k).unwrap().index() as u64,
         );
+        let mut move_rng = SmallRng::seed_from_u64(8);
+        h.bench(&format!("game/random_move ({name})"), 1, pool, |s| {
+            s.random_move(&mut move_rng).index() as u64
+        });
         let mut agent = RandomAgent::<BitState>::new(3);
         h.bench(
             &format!("agent/RandomAgent::choose_move ({name})"),
