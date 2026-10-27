@@ -47,3 +47,19 @@ cpu-mlir = ["nn", "burn/cpu"]
 [[bench]]
 name = "micro"
 harness = false
+
+# Release with incremental compilation of this crate, for edit-build cycles:
+# `cargo build --profile quick --all-features` builds target/quick/brut3. A rebuild after an
+# edit takes 2-4 s instead of ~16 s, but the code runs about a third slower (random playouts
+# +28%, search work per simulation +35%), because incremental builds cannot inline across
+# their many small codegen units. Use release for self-play, training and benchmarks.
+# Dependencies are never compiled incrementally; they are built once more for this profile.
+[profile.quick]
+inherits = "release"
+incremental = true
+
+[profile.dev.package."*"]
+# No debug info for dependencies (burn, cubecl, ...), which are rarely stepped into: a full
+# test build takes about a sixth less CPU time and an eighth less peak memory. brut3 itself
+# keeps full debug info.
+debug = false
