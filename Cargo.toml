@@ -42,3 +42,8 @@ wgpu = ["nn", "burn/wgpu"]
 cuda = ["nn", "burn/cuda"]
 # CubeCL CPU backend; downloads a prebuilt LLVM/MLIR 20 on first build.
 cpu-mlir = ["nn", "burn/cpu"]
+
+# Component timings with a small harness of their own; see benches/README.md.
+[[bench]]
+name = "micro"
+harness = false

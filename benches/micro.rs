@@ -1,0 +1,283 @@
+//! Microbenchmarks: each component timed on its own, over pools of distinct positions from
+//! random games so that no single input gets specialised on. Run with `benches/run.sh`, or
+//! `cargo bench --all-features --bench micro [-- FILTER...]` to see the output without
+//! saving it. See `benches/README.md`.
+
+use std::hint::black_box;
+use std::time::{Duration, Instant};
+
+use brut3::agent::{Evaluations, RandomAgent, UtttAgent, heuristic};
+use brut3::game::{BitState, GameState, Move, MoveSet, Symmetry};
+use brut3::mcts::{SearchTree, dirichlet};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
+
+/// Positions per pool.
+const POOL: usize = 4096;
+/// Timed samples per benchmark; the median is reported.
+const SAMPLES: usize = 15;
+/// Wall time of one sample.
+const SAMPLE_TIME: Duration = Duration::from_millis(20);
+/// Simulations per search in the `mcts/search` benchmarks.
+const SIMULATIONS: u32 = 10_000;
+
+struct Harness {
+    filters: Vec<String>,
+}
+
+impl Harness {
+    fn from_args() -> Self {
+        // `cargo bench` passes `--bench` to custom harnesses; flags are not filters.
+        let filters = std::env::args()
+            .skip(1)
+            .filter(|a| !a.starts_with("--"))
+            .collect();
+        Self { filters }
+    }
+
+    /// Times `f` called on `inputs` in turn, one call being `units` units of work, and prints
+    /// the median time per unit with the range over all samples. The checksum is the sum of
+    /// `f` over one pass of `inputs`, so runs at different commits can be checked to compute
+    /// the same thing.
+    fn bench<T>(&self, name: &str, units: u64, inputs: &[T], mut f: impl FnMut(&T) -> u64) {
+        if !self.filters.is_empty() && !self.filters.iter().any(|w| name.contains(w.as_str())) {
+            return;
+        }
+        let checksum = inputs.iter().fold(0u64, |acc, x| acc.wrapping_add(f(x)));
+
+        // Calibrate: double the passes over `inputs` until a run is long enough to time, then
+        // scale. Samples are whole passes, so that every sample sees every input equally often
+        // and inputs of uneven cost do not show up as noise.
+        let mut passes = 1;
+        let elapsed = loop {
+            let t = run(inputs, &mut f, passes);
+            if t >= Duration::from_millis(2) {
+                break t;
+            }
+            passes *= 2;
+        };
+        let passes = ((passes as f64 * SAMPLE_TIME.as_secs_f64() / elapsed.as_secs_f64()).round()
+            as usize)
+            .max(1);
+
+        let per_sample = (passes * inputs.len()) as f64 * units as f64;
+        let mut per_unit: Vec<f64> = (0..SAMPLES)
+            .map(|_| run(inputs, &mut f, passes).as_nanos() as f64 / per_sample)
+            .collect();
+        per_unit.sort_by(f64::total_cmp);
+        println!(
+            "{name:<46} {:>10.2} ns  [{:>9.2} .. {:>9.2}]  checksum {}",
+            per_unit[SAMPLES / 2],
+            per_unit[0],
+            per_unit[SAMPLES - 1],
+            checksum as i64,
+        );
+    }
+}
+
+/// `passes` passes of `f` over `inputs`.
+fn run<T>(inputs: &[T], f: &mut impl FnMut(&T) -> u64, passes: usize) -> Duration {
+    let mut sum = 0u64;
+    let start = Instant::now();
+    for _ in 0..passes {
+        for x in inputs {
+            sum = sum.wrapping_add(f(black_box(x)));
+        }
+    }
+    let elapsed = start.elapsed();
+    black_box(sum);
+    elapsed
+}
+
+/// Non-terminal positions from random games: in the order met, and split by whether the side
+/// to move is sent to one board or may play anywhere.
+struct Pools {
+    all: Vec<BitState>,
+    forced: Vec<BitState>,
+    free: Vec<BitState>,
+}
+
+fn pools() -> Pools {
+    let mut rng = SmallRng::seed_from_u64(1);
+    let (mut all, mut forced, mut free) = (Vec::new(), Vec::new(), Vec::new());
+    while all.len() < POOL || forced.len() < POOL || free.len() < POOL {
+        let mut s = BitState::initial();
+        while s.outcome().is_none() {
+            if all.len() < POOL {
+                all.push(s);
+            }
+            match s.forced_board() {
+                Some(_) if forced.len() < POOL => forced.push(s),
+                None if free.len() < POOL => free.push(s),
+                _ => {}
+            }
+            s.apply(random_move(&s, &mut rng));
+        }
+    }
+    Pools { all, forced, free }
+}
+
+fn random_move(s: &BitState, rng: &mut SmallRng) -> Move {
+    let legal = s.legal_moves();
+    legal.iter().nth(rng.random_range(0..legal.len())).unwrap()
+}
+
+/// A cheap, deterministic, position-dependent leaf value, so that the trees get some shape
+/// without paying for a real evaluator.
+fn fake_value(s: &BitState) -> f32 {
+    let m = s.last_move().map_or(0, |m| m.index() as u32);
+    (m.wrapping_mul(0x9E37_79B9) >> 16) as f32 / 32768.0 - 1.0
+}
+
+/// One full search of `simulations` from `root` with fake leaf values, claiming up to `batch`
+/// leaves per round; `priors` gives every leaf the same non-uniform prior row.
+fn search(
+    root: &BitState,
+    simulations: u32,
+    batch: usize,
+    priors: Option<&[f32; Move::COUNT]>,
+    states: &mut Vec<BitState>,
+    evals: &mut Evaluations,
+) -> u64 {
+    let mut tree = SearchTree::new(*root, simulations, 1.4, 1.0);
+    while !tree.is_done() {
+        states.clear();
+        if tree.claim(batch, states) > 0 {
+            evals.clear();
+            for s in states.iter() {
+                match priors {
+                    Some(row) => evals.push_row(fake_value(s)).copy_from_slice(row),
+                    None => evals.push_value(fake_value(s)),
+                }
+            }
+            tree.resolve(evals, 0);
+        }
+    }
+    tree.result().best_move().map_or(0, |m| m.index() as u64)
+}
+
+fn main() {
+    let h = Harness::from_args();
+    let p = pools();
+    let mut rng = SmallRng::seed_from_u64(2);
+
+    h.bench("baseline/loop overhead", 1, &p.all, |_| 0);
+
+    // --- Rules ---
+    for (pool, name) in [(&p.forced, "forced"), (&p.free, "free")] {
+        h.bench(&format!("game/legal_moves ({name})"), 1, pool, |s| {
+            s.legal_moves().len() as u64
+        });
+    }
+    let with_move: Vec<(BitState, Move)> = p
+        .all
+        .iter()
+        .map(|s| (*s, random_move(s, &mut rng)))
+        .collect();
+    // No "copy + apply" on its own: keeping the new position alive for `black_box` costs
+    // more than the apply, so it measured slower than the version below.
+    h.bench("game/outcome", 1, &p.all, |s| s.outcome().is_some() as u64);
+    h.bench("game/copy + apply + outcome", 1, &with_move, |(s, mv)| {
+        let mut next = *s;
+        next.apply(*mv);
+        next.outcome().is_some() as u64
+    });
+    h.bench("game/outcome_after", 1, &with_move, |(s, mv)| {
+        s.outcome_after(*mv).is_some() as u64
+    });
+    let with_sym: Vec<(BitState, Symmetry)> = p
+        .all
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (*s, Symmetry::ALL[i % 8]))
+        .collect();
+    h.bench("game/transform", 1, &with_sym, |(s, sym)| {
+        black_box(s.transform(*sym));
+        0
+    });
+
+    // --- Picking a random move ---
+    let counts: Vec<usize> = p.all.iter().map(|s| s.legal_moves().len()).collect();
+    // Benchmarks that draw numbers get generators of their own, so that the inputs and
+    // checksums do not depend on which benchmarks the filters select.
+    let mut range_rng = SmallRng::seed_from_u64(6);
+    h.bench("rng/random_range(0..legal)", 1, &counts, |n| {
+        range_rng.random_range(0..*n) as u64
+    });
+    for (pool, name) in [(&p.forced, "forced"), (&p.free, "free")] {
+        let picks: Vec<(<BitState as GameState>::Moves, usize)> = pool
+            .iter()
+            .map(|s| {
+                let legal = s.legal_moves();
+                (legal, rng.random_range(0..legal.len()))
+            })
+            .collect();
+        h.bench(
+            &format!("pick/iter().nth(k) ({name})"),
+            1,
+            &picks,
+            |(legal, k)| legal.iter().nth(*k).unwrap().index() as u64,
+        );
+        let mut agent = RandomAgent::<BitState>::new(3);
+        h.bench(
+            &format!("agent/RandomAgent::choose_move ({name})"),
+            1,
+            pool,
+            |s| agent.choose_move(s).index() as u64,
+        );
+    }
+
+    // --- Leaf evaluators ---
+    let mut agent = RandomAgent::<BitState>::new(4);
+    h.bench("eval/random playout", 1, &p.all, |s| {
+        (agent.evaluate(s).value + 1.0) as u64
+    });
+    h.bench("eval/heuristic::score", 1, &p.all, |s| {
+        heuristic::score(s, s.to_move()) as i64 as u64
+    });
+
+    // --- Search, with fake leaf values: the tree's own cost per simulation ---
+    let roots = &p.all[..16];
+    let mut row = [0.0f32; Move::COUNT];
+    for (i, x) in row.iter_mut().enumerate() {
+        *x = 1.0 + (i * 37 % 11) as f32;
+    }
+    let (mut states, mut evals) = (Vec::new(), Evaluations::default());
+    for (batch, priors, label) in [
+        (1, None, "uniform priors, batch 1"),
+        (1, Some(&row), "prior rows, batch 1"),
+        (16, Some(&row), "prior rows, batch 16"),
+    ] {
+        h.bench(
+            &format!("mcts/search per sim, {label}"),
+            SIMULATIONS as u64,
+            roots,
+            |s| search(s, SIMULATIONS, batch, priors, &mut states, &mut evals),
+        );
+    }
+    let alphas = [0.3f32; 64];
+    let mut noise_rng = SmallRng::seed_from_u64(5);
+    h.bench("mcts/dirichlet(0.3, 81)", 1, &alphas, |a| {
+        (dirichlet(&mut noise_rng, *a, 81)[0] * 1e6) as u64
+    });
+
+    #[cfg(feature = "nn")]
+    network_inputs(&h, &p);
+}
+
+/// Encoding positions into network inputs, which self-play does on the CPU for every leaf.
+#[cfg(feature = "nn")]
+fn network_inputs(h: &Harness, p: &Pools) {
+    use brut3::nn::nnue::{IDS, nnue_ids};
+    use brut3::nn::{FEATURES, encode_into};
+
+    let mut features = [0.0f32; FEATURES];
+    h.bench("nn/encode_into (199 floats)", 1, &p.all, |s| {
+        encode_into(s, &mut features);
+        features[0] as u64
+    });
+    let mut ids = [0i32; IDS];
+    h.bench("nn/nnue_ids", 1, &p.all, |s| {
+        nnue_ids(s, &mut ids);
+        ids[0] as u64
+    });
+}
