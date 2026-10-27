@@ -319,12 +319,16 @@ impl<'a> Gen<'a> {
     }
 
     /// `case scrut of` at indent `d`, the single alternative `con fields ->` on the next line.
-    fn case_open(&mut self, scrut: &str, con: &str, fields: &[String], d: usize) {
-        self.push(format!("{}case {scrut} of", " ".repeat(d)));
-        let mut items = vec![con.to_string()];
-        items.extend(fields[..fields.len() - 1].iter().cloned());
-        items.push(format!("{} ->", fields[fields.len() - 1]));
-        self.wrap(&items, d + 4, Some(d + 2));
+    /// `case (s0, s1, ..) of` at indent `d`, its one alternative matching every scrutinee
+    /// against its pattern, one pattern per line however long (they read best whole); the
+    /// body goes at indent `d + 4` (continuations `d + 6`). GHC never builds the tuple.
+    fn case_match(&mut self, scruts: &[&str], pats: &[String], d: usize) {
+        self.push(format!("{}case ({}) of", " ".repeat(d), scruts.join(", ")));
+        for (i, pat) in pats.iter().enumerate() {
+            let (indent, open) = if i == 0 { (d + 2, "( ") } else { (d + 4, "") };
+            let close = if i + 1 == pats.len() { " ) ->" } else { "," };
+            self.push(format!("{}{open}{pat}{close}", " ".repeat(indent)));
+        }
     }
 
     // ------------------------------------------------------------ vectors
@@ -438,11 +442,17 @@ impl<'a> Gen<'a> {
             "{cb} :: ({elem} -> {elem} -> {elem}) -> {t} -> {t} -> {t}"
         ));
         self.push(format!("{cb} f !u !v ="));
-        self.case_open("u", &t, &a, 2);
-        self.case_open("v", &t, &b, 6);
+        self.case_match(
+            &["u", "v"],
+            &[
+                format!("{t} {}", a.join(" ")),
+                format!("{t} {}", b.join(" ")),
+            ],
+            2,
+        );
         let mut items = vec![t.clone()];
         items.extend(a.iter().zip(&b).map(|(x, y)| format!("(f {x} {y})")));
-        self.wrap(&items, 12, Some(10));
+        self.wrap(&items, 8, Some(6));
         self.push("");
         self.emit_arith(n, elem, &t, &mp, &cb);
         let (sm, dt) = (f("sum"), f("dot"));
@@ -464,14 +474,20 @@ impl<'a> Gen<'a> {
         self.push("   so the additions do not form one dependency chain -}");
         self.push(format!("{dt} :: {t} -> {t} -> {elem}"));
         self.push(format!("{dt} !u !v ="));
-        self.case_open("u", &t, &a, 2);
-        self.case_open("v", &t, &b, 6);
+        self.case_match(
+            &["u", "v"],
+            &[
+                format!("{t} {}", a.join(" ")),
+                format!("{t} {}", b.join(" ")),
+            ],
+            2,
+        );
         let products: Vec<String> = a
             .iter()
             .zip(&b)
             .map(|(x, y)| format!("{x} * {y}"))
             .collect();
-        self.wrap(&split_words(&sum_chain(&products, lanes)), 12, Some(10));
+        self.wrap(&split_words(&sum_chain(&products, lanes)), 8, Some(6));
         self.push(format!("{{-# NOINLINE {dt} #-}}"));
         self.push("");
         if !int_vec && n <= 64 {
@@ -644,30 +660,42 @@ impl<'a> Gen<'a> {
             "{cb} :: ({elem} -> {elem} -> {elem}) -> {t} -> {t} -> {t}"
         ));
         self.push(format!("{cb} f !u !v ="));
-        self.case_open("u", &t, &c, 2);
-        self.case_open("v", &t, &d, 6);
+        self.case_match(
+            &["u", "v"],
+            &[
+                format!("{t} {}", c.join(" ")),
+                format!("{t} {}", d.join(" ")),
+            ],
+            2,
+        );
         let mut items = vec![t.clone()];
         items.extend(
             c.iter()
                 .zip(&d)
                 .map(|(ci, di)| format!("({} f {ci} {di})", g("combine"))),
         );
-        self.wrap(&items, 12, Some(10));
+        self.wrap(&items, 8, Some(6));
         self.push("");
         // Arithmetic as one call per chunk (the chunk functions are NOINLINE).
         for base in ["add", "sub"] {
             let fun = f(base);
             self.push(format!("{fun} :: {t} -> {t} -> {t}"));
             self.push(format!("{fun} !u !v ="));
-            self.case_open("u", &t, &c, 2);
-            self.case_open("v", &t, &d, 6);
+            self.case_match(
+                &["u", "v"],
+                &[
+                    format!("{t} {}", c.join(" ")),
+                    format!("{t} {}", d.join(" ")),
+                ],
+                2,
+            );
             let mut items = vec![t.clone()];
             items.extend(
                 c.iter()
                     .zip(&d)
                     .map(|(ci, di)| format!("({} {ci} {di})", g(base))),
             );
-            self.wrap(&items, 12, Some(10));
+            self.wrap(&items, 8, Some(6));
             self.push("");
         }
         if elem == "Float" {
@@ -698,15 +726,21 @@ impl<'a> Gen<'a> {
         ));
         self.push(format!("{dt} :: {t} -> {t} -> {elem}"));
         self.push(format!("{dt} !u !v ="));
-        self.case_open("u", &t, &c, 2);
-        self.case_open("v", &t, &d, 6);
+        self.case_match(
+            &["u", "v"],
+            &[
+                format!("{t} {}", c.join(" ")),
+                format!("{t} {}", d.join(" ")),
+            ],
+            2,
+        );
         let dots: Vec<String> = c
             .iter()
             .zip(&d)
             .map(|(ci, di)| format!("{} {ci} {di}", g("dot")))
             .collect();
         let lanes = if k >= 4 { 2 } else { 1 };
-        self.wrap(&split_words(&sum_chain(&dots, lanes)), 12, Some(10));
+        self.wrap(&split_words(&sum_chain(&dots, lanes)), 8, Some(6));
         self.push(format!("{{-# NOINLINE {dt} #-}}"));
         self.push("");
     }
@@ -817,19 +851,14 @@ impl<'a> Gen<'a> {
                 "{fun} !rows !bias !{} =",
                 if kind == "residual" { "xin" } else { "x" }
             ));
-            self.case_open("rows", &r_ty, &r, 2);
-            self.push("      case bias of");
-            let mut items = split_words(&self.pat(m, &bb));
-            items.push("->".to_string());
-            self.wrap(&items, 10, Some(8));
-            let mut bd = 10;
+            let mut scruts = vec!["rows", "bias"];
+            let mut pats = vec![format!("{r_ty} {}", r.join(" ")), self.pat(m, &bb)];
             if kind == "residual" {
-                self.push("          case xin of");
-                let mut items = split_words(&self.pat(m, &xx));
-                items.push("->".to_string());
-                self.wrap(&items, 14, Some(12));
-                bd = 14;
+                scruts.push("xin");
+                pats.push(self.pat(m, &xx));
             }
+            self.case_match(&scruts, &pats, 2);
+            let bd = 6;
             let cells: Vec<String> = (0..m)
                 .map(|i| match kind {
                     "linear" => format!("({} + dot{n} {} x)", bb[i], r[i]),
@@ -865,14 +894,14 @@ impl<'a> Gen<'a> {
         let vs: Vec<String> = (0..k)
             .flat_map(|i| (0..n).map(move |j| format!("v{i}_{j}")))
             .collect();
-        for i in 0..k {
-            self.push(format!("{}case u{i} of", " ".repeat(2 + 4 * i)));
-            let mut items = split_words(&self.pat(n, &vs[i * n..(i + 1) * n]));
-            items.push("->".to_string());
-            self.wrap(&items, 6 + 4 * i, Some(4 + 4 * i));
-        }
+        let names: Vec<String> = (0..k).map(|i| format!("u{i}")).collect();
+        let scruts: Vec<&str> = names.iter().map(String::as_str).collect();
+        let pats: Vec<String> = (0..k)
+            .map(|i| self.pat(n, &vs[i * n..(i + 1) * n]))
+            .collect();
+        self.case_match(&scruts, &pats, 2);
         let con = self.con(k * n, &vs);
-        self.wrap(&con, 4 + 4 * k, Some(2 + 4 * k));
+        self.wrap(&con, 8, Some(6));
         self.push("");
     }
 
@@ -887,30 +916,38 @@ impl<'a> Gen<'a> {
         self.push(format!("{fun} :: {}", vec![v.clone(); k + 1].join(" -> ")));
         let args: Vec<String> = (0..k).map(|i| format!("!u{i}")).collect();
         self.push(format!("{fun} {} =", args.join(" ")));
+        let names: Vec<String> = (0..k).map(|i| format!("u{i}")).collect();
+        let scruts: Vec<&str> = names.iter().map(String::as_str).collect();
         match self.chunks(n) {
             Some((kk, m)) => {
-                for i in 0..k {
-                    let fields: Vec<String> = (0..kk).map(|j| format!("c{i}_{j}")).collect();
-                    self.case_open(&format!("u{i}"), &v, &fields, 2 + 4 * i);
-                }
+                let pats: Vec<String> = (0..k)
+                    .map(|i| {
+                        let fields: Vec<String> = (0..kk).map(|j| format!("c{i}_{j}")).collect();
+                        format!("{v} {}", fields.join(" "))
+                    })
+                    .collect();
+                self.case_match(&scruts, &pats, 2);
                 let mut items = vec![v.clone()];
                 for j in 0..kk {
                     let terms: Vec<String> = (0..k).map(|i| format!("c{i}_{j}")).collect();
                     items.push(format!("(sum{k}_{m} {})", terms.join(" ")));
                 }
-                self.wrap(&items, 4 + 4 * k, Some(2 + 4 * k));
+                self.wrap(&items, 8, Some(6));
             }
             None => {
-                for i in 0..k {
-                    let fields: Vec<String> = (0..n).map(|j| format!("v{i}_{j}")).collect();
-                    self.case_open(&format!("u{i}"), &v, &fields, 2 + 4 * i);
-                }
+                let pats: Vec<String> = (0..k)
+                    .map(|i| {
+                        let fields: Vec<String> = (0..n).map(|j| format!("v{i}_{j}")).collect();
+                        format!("{v} {}", fields.join(" "))
+                    })
+                    .collect();
+                self.case_match(&scruts, &pats, 2);
                 let mut items = vec![v.clone()];
                 for j in 0..n {
                     let terms: Vec<String> = (0..k).map(|i| format!("v{i}_{j}")).collect();
                     items.push(format!("({})", terms.join(" + ")));
                 }
-                self.wrap(&items, 4 + 4 * k, Some(2 + 4 * k));
+                self.wrap(&items, 8, Some(6));
             }
         }
         self.push(format!("{{-# NOINLINE {fun} #-}}"));
