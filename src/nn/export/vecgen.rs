@@ -339,7 +339,9 @@ impl Expr {
             Expr::App(head, children) => {
                 let mut out = head.clone();
                 for c in children {
-                    out.push(' ');
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
                     out.push_str(&c.as_child());
                 }
                 out
@@ -372,20 +374,130 @@ impl Expr {
         let split =
             longest > LONG_CHILD || (indent + flat.len() > WIDE_LINE && longest > SHORT_CHILD);
         if !split {
+            if indent + flat.len() >= RECT_LINE {
+                let cells: Vec<String> = children.iter().map(Expr::as_child).collect();
+                return rectangle(head, &cells, indent);
+            }
             return vec![format!("{pad}{flat}")];
         }
         let mut out = vec![format!("{pad}{head}")];
         for c in children {
-            let mut lines = c.layout(indent + 2);
-            if let Expr::App(..) = c {
-                // Parenthesised: open on the first line, close on the last.
-                lines[0].insert(indent + 2, '(');
-                lines.last_mut().expect("a line").push(')');
-            }
-            out.extend(lines);
+            out.extend(c.child_layout(indent + 2));
         }
         out
     }
+
+    /// As a child at `indent`: an application in parentheses, opened on its first line (its
+    /// text one column in, so that its own rows stay aligned) and closed on its last.
+    fn child_layout(&self, indent: usize) -> Vec<String> {
+        match self {
+            Expr::Atom(a) => vec![format!("{}{a}", " ".repeat(indent))],
+            Expr::App(..) => {
+                let mut lines = self.layout(indent + 1);
+                lines[0].replace_range(indent..indent + 1, "(");
+                lines.last_mut().expect("a line").push(')');
+                lines
+            }
+        }
+    }
+}
+
+/// The function head `f (x0:x1:..:tail) =` as an application's items, one cell per element.
+fn cons_head(f: &str, xs: &[String], tail: &str) -> Vec<String> {
+    let mut items = vec![f.to_string()];
+    for (i, x) in xs.iter().enumerate() {
+        let open = if i == 0 { "(" } else { "" };
+        let close = if i + 1 == xs.len() {
+            format!(":{tail}) =")
+        } else {
+            ":".to_string()
+        };
+        items.push(format!("{open}{x}{close}"));
+    }
+    items
+}
+
+/// From this length on, an application of short children goes into rows ([`rectangle`]).
+const RECT_LINE: usize = 250;
+/// The width rows of children keep within (with room for closing parentheses and commas).
+const ROW_LINE: usize = 94;
+
+/// `head` and short `cells` in rows of equal length: under the first cell, or failing that
+/// on lines of their own two deeper, `k` cells per row with `k` a divisor of the cell count
+/// (powers of two first, then the others; the widest that fits in `ROW_LINE`, at least 2);
+/// if no divisor fits, rows filled as far as they go.
+fn rectangle(head: &str, cells: &[String], indent: usize) -> Vec<String> {
+    let n = cells.len();
+    // A bracket opened by the first cell only (`(x0:`, `[a00,`): the later rows start one
+    // column further in, under the first element.
+    let opens = |c: &String| c.starts_with('(') || c.starts_with('[');
+    let shift = usize::from(opens(&cells[0]) && !cells[1..].iter().any(opens));
+    let fits = |start: usize, k: usize| {
+        cells.chunks(k).enumerate().all(|(i, row)| {
+            let lead = if i == 0 { 0 } else { shift };
+            start + lead + row.iter().map(String::len).sum::<usize>() + row.len() <= ROW_LINE
+        })
+    };
+    let divisors: Vec<usize> = (2..=n).rev().filter(|k| n % k == 0).collect();
+    let best = |start: usize| {
+        let powers = divisors.iter().copied().filter(|k| k.is_power_of_two());
+        let others = divisors.iter().copied().filter(|k| !k.is_power_of_two());
+        powers
+            .clone()
+            .find(|&k| fits(start, k))
+            .or_else(|| others.clone().find(|&k| fits(start, k)))
+    };
+    let after_head = if head.is_empty() {
+        indent
+    } else {
+        indent + head.len() + 1
+    };
+    let below = indent + 2;
+    let rows = |start: usize, sizes: &[usize]| -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = cells;
+        for &size in sizes {
+            let (row, tail) = rest.split_at(size);
+            rest = tail;
+            let lead = if out.is_empty() { 0 } else { shift };
+            out.push(format!("{}{}", " ".repeat(start + lead), row.join(" ")));
+        }
+        out
+    };
+    let (start, sizes) = if let Some(k) = best(after_head) {
+        (after_head, vec![k; n / k])
+    } else if let Some(k) = best(below) {
+        (below, vec![k; n / k])
+    } else {
+        // Ragged: fill each row as far as it goes.
+        let start = if after_head <= ROW_LINE / 2 {
+            after_head
+        } else {
+            below
+        };
+        let mut sizes = Vec::new();
+        let (mut count, mut width) = (0, start);
+        for cell in cells {
+            if count > 0 && width + 1 + cell.len() > ROW_LINE {
+                sizes.push(count);
+                (count, width) = (0, start + shift);
+            }
+            width += cell.len() + usize::from(count > 0);
+            count += 1;
+        }
+        sizes.push(count);
+        (start, sizes)
+    };
+    let mut lines = rows(start, &sizes);
+    if head.is_empty() {
+        // Nothing to put first: the rows are the expression.
+    } else if start == after_head {
+        // The first row goes on the head's line.
+        lines[0].replace_range(indent..indent + head.len(), head);
+    } else {
+        lines.insert(0, format!("{}{head}", " ".repeat(indent)));
+    }
+    lines
 }
 
 /// Sums `terms` as a balanced tree, `((t0 + t1) + (t2 + t3)) + ..`: GHC never reassociates
@@ -563,10 +675,12 @@ impl<'a> Gen<'a> {
             "{{- A fixed-width vector of {n} {elem} values, one strict unpacked field per"
         ));
         self.push("   coordinate (coordinate i is field i, counting from 0). -}");
-        self.push(format!(
-            "data {t} = {t} {}",
-            vec![format!("{{-# UNPACK #-}} !{elem}"); n].join(" ")
-        ));
+        self.apply(
+            &std::iter::once(format!("data {t} = {t}"))
+                .chain(std::iter::repeat_n(format!("{{-# UNPACK #-}} !{elem}"), n))
+                .collect::<Vec<_>>(),
+            0,
+        );
         self.push("");
         let (fl, tl, ix) = (f("fromList"), f("toList"), f("index"));
         self.push(format!("{{- {fl} xs"));
@@ -575,7 +689,7 @@ impl<'a> Gen<'a> {
             "   PRE: length xs >= {n}; extra elements are ignored -}}"
         ));
         self.push(format!("{fl} :: [{elem}] -> {t}"));
-        self.line(&[format!("{fl} ({}:_) =", a.join(":"))], 0);
+        self.apply(&cons_head(&fl, &a, "_"), 0);
         let mut items = vec![t.clone()];
         items.extend(a.iter().cloned());
         self.apply(&items, 2);
@@ -586,7 +700,7 @@ impl<'a> Gen<'a> {
             "-- {fr} xs: the {t} of the first {n} elements of xs, and the rest of xs"
         ));
         self.push(format!("{fr} :: [{elem}] -> ({t}, [{elem}])"));
-        self.line(&[format!("{fr} ({}:rest) =", a.join(":"))], 0);
+        self.apply(&cons_head(&fr, &a, "rest"), 0);
         let mut items = vec![format!("({t}")];
         items.extend(a[..last].iter().cloned());
         items.push(format!("{}, rest)", a[last]));
@@ -595,8 +709,11 @@ impl<'a> Gen<'a> {
         self.push("");
         self.push(format!("-- {tl} v: the coordinates of v in order"));
         self.push(format!("{tl} :: {t} -> [{elem}]"));
-        self.line(&self.pattern_head(&format!("{tl} ({t}"), &a, ") ="), 0);
-        let mut items = vec![format!("[{}{}", a[0], if n > 1 { "," } else { "" })];
+        self.apply(&self.pattern_head(&format!("{tl} ({t}"), &a, ") ="), 0);
+        let mut items = vec![
+            String::new(),
+            format!("[{}{}", a[0], if n > 1 { "," } else { "" }),
+        ];
         for x in &a[1..last.max(1)] {
             items.push(format!("{x},"));
         }
@@ -611,7 +728,7 @@ impl<'a> Gen<'a> {
             "-- {ix} i v: coordinate i of v (a jump table).  PRE: 0 <= i < {n}"
         ));
         self.push(format!("{ix} :: Int -> {t} -> {elem}"));
-        self.line(&self.pattern_head(&format!("{ix} i ({t}"), &a, ") ="), 0);
+        self.apply(&self.pattern_head(&format!("{ix} i ({t}"), &a, ") ="), 0);
         self.push("  case i of");
         for (i, x) in a.iter().enumerate() {
             self.push(format!("    {i} -> {x}"));
@@ -632,7 +749,7 @@ impl<'a> Gen<'a> {
         ));
         self.push(format!("{{-# INLINE {mp} #-}}"));
         self.push(format!("{mp} :: ({elem} -> {elem}) -> {t} -> {t}"));
-        self.line(&self.pattern_head(&format!("{mp} f ({t}"), &a, ") ="), 0);
+        self.apply(&self.pattern_head(&format!("{mp} f ({t}"), &a, ") ="), 0);
         let mut items = vec![t.clone()];
         items.extend(a.iter().map(|x| format!("(f {x})")));
         self.apply(&items, 2);
@@ -661,7 +778,7 @@ impl<'a> Gen<'a> {
         let (sm, dt) = (f("sum"), f("dot"));
         self.push(format!("-- {sm} v: the sum of the coordinates of v"));
         self.push(format!("{sm} :: {t} -> {elem}"));
-        self.line(&self.pattern_head(&format!("{sm} ({t}"), &a, ") ="), 0);
+        self.apply(&self.pattern_head(&format!("{sm} ({t}"), &a, ") ="), 0);
         self.out.extend(sum_tree(&a).layout(2));
         if n >= 32 {
             self.push(format!("{{-# NOINLINE {sm} #-}}"));
@@ -694,7 +811,7 @@ impl<'a> Gen<'a> {
                 "   RETURNS: the maximum of acc and the coordinates v_i for which bit i of mask is clear -}",
             );
             self.push(format!("maskedMax{n} :: Int -> {t} -> Float -> Float"));
-            self.line(
+            self.apply(
                 &self.pattern_head(
                     &format!("maskedMax{n} m ({t}"),
                     &a,
@@ -717,7 +834,7 @@ impl<'a> Gen<'a> {
                 "   RETURNS: the vector with coordinate i = exp (v_i - c) where bit i of mask is clear, 0 where set -}",
             );
             self.push(format!("maskedExp{n} :: Int -> Float -> {t} -> {t}"));
-            self.line(
+            self.apply(
                 &self.pattern_head(&format!("maskedExp{n} m c ({t}"), &a, ") ="),
                 0,
             );
@@ -778,10 +895,12 @@ impl<'a> Gen<'a> {
         self.push(format!(
             "   code for {m}-wide straight-line functions than for {n}-wide ones. -}}"
         ));
-        self.push(format!(
-            "data {t} = {t} {}",
-            vec![format!("!{c_ty}"); k].join(" ")
-        ));
+        self.apply(
+            &std::iter::once(format!("data {t} = {t}"))
+                .chain(std::iter::repeat_n(format!("!{c_ty}"), k))
+                .collect::<Vec<_>>(),
+            0,
+        );
         self.push("");
         let (fl, tl, ix) = (f("fromList"), f("toList"), f("index"));
         let fr = f("fromListRest");
@@ -971,16 +1090,18 @@ impl<'a> Gen<'a> {
         self.push(format!(
             "{{- {m} rows of width {n}: a matrix stored one row per output, row i = field i. -}}"
         ));
-        self.push(format!(
-            "data {r_ty} = {r_ty} {}",
-            vec![format!("!{v_ty}"); m].join(" ")
-        ));
+        self.apply(
+            &std::iter::once(format!("data {r_ty} = {r_ty}"))
+                .chain(std::iter::repeat_n(format!("!{v_ty}"), m))
+                .collect::<Vec<_>>(),
+            0,
+        );
         self.push("");
         self.push(format!(
             "-- sel{m}_{n} i rows: row i (a jump table).  PRE: 0 <= i < {m}"
         ));
         self.push(format!("sel{m}_{n} :: Int -> {r_ty} -> {v_ty}"));
-        self.line(
+        self.apply(
             &self.pattern_head(&format!("sel{m}_{n} i ({r_ty}"), &r, ") ="),
             0,
         );
@@ -994,7 +1115,7 @@ impl<'a> Gen<'a> {
             "-- fromListRows{m}_{n} rs: the matrix whose row i is rs !! i.  PRE: length rs >= {m}"
         ));
         self.push(format!("fromListRows{m}_{n} :: [{v_ty}] -> {r_ty}"));
-        self.line(&[format!("fromListRows{m}_{n} ({}:_) =", r.join(":"))], 0);
+        self.apply(&cons_head(&format!("fromListRows{m}_{n}"), &r, "_"), 0);
         let mut items = vec![r_ty.clone()];
         items.extend(r.iter().cloned());
         self.apply(&items, 2);
@@ -1224,10 +1345,12 @@ impl<'a> Gen<'a> {
         self.push(format!(
             "{{- {g} columns of width {m}: a layer's columns (one per input) for {g} inputs. -}}"
         ));
-        self.push(format!(
-            "data {ty} = {ty} {}",
-            vec![format!("!Vec{m}"); g].join(" ")
-        ));
+        self.apply(
+            &std::iter::once(format!("data {ty} = {ty}"))
+                .chain(std::iter::repeat_n(format!("!Vec{m}"), g))
+                .collect::<Vec<_>>(),
+            0,
+        );
         self.push("");
     }
 
@@ -1239,10 +1362,12 @@ impl<'a> Gen<'a> {
             self.push(format!(
                 "{{- The columns of a layer with {m} outputs and {n} inputs, {k} groups of {g}. -}}"
             ));
-            self.push(format!(
-                "data {ty} = {ty} {}",
-                vec![format!("!Cols{g}_{m}"); k].join(" ")
-            ));
+            self.apply(
+                &std::iter::once(format!("data {ty} = {ty}"))
+                    .chain(std::iter::repeat_n(format!("!Cols{g}_{m}"), k))
+                    .collect::<Vec<_>>(),
+                0,
+            );
             self.push("");
         }
         let fun = format!("columns{m}_{n}");
@@ -1264,7 +1389,7 @@ impl<'a> Gen<'a> {
             Some(k) => {
                 let mut group = vec![format!("group g = Cols{g}_{m}")];
                 group.extend((0..g).map(|j| format!("(col ({g} * g + {j}))")));
-                self.line(&group, 6);
+                self.apply(&group, 6);
                 items.extend((0..k).map(|i| format!("(group {i})")));
             }
             None => items.extend((0..n).map(|j| format!("(col {j})"))),

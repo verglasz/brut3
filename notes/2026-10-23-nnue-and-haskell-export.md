@@ -248,7 +248,10 @@ runs and prune passes and adds one per run.
   module without a model, and `Net.hs` names them in its header. Generated code keeps every
   pattern on one line, and a construction too unless its children are long (over 30
   characters, or over 16 on a line over 300): then each child gets its own line, laid out
-  the same way. Indices are padded per role (`a00 .. a63`) so that bindings line up.
+  the same way. Short children on a line of 250 or more go into rows of equal length
+  aligned under the first child (a divisor of their count, powers of two first, the widest
+  under 100 columns; ragged if none fits). Sums split along their tree. Indices are padded
+  per role (`a00 .. a63`) so that bindings line up.
 - Speed (the Haskell project's `2026-10-27-exporter-changes.md`): reductions (`dotN`,
   `sumN`) are balanced trees, since GHC keeps `Float` associations as written;
   `accumulateRows` is one `sum22_A` in the old fold's order (bit-identical); and the hidden
