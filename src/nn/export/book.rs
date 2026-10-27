@@ -196,7 +196,7 @@ pub fn book_modules(
     bundle_imports(
         &mut s,
         &[
-            "import Data.Bits (shiftL, (.|.))",
+            "import Data.Bits ((.<<.), (.|.))",
             "import Data.Word (Word32, Word8)",
         ],
     );
@@ -222,7 +222,7 @@ bookKeyOfBoards codes forcedBoard = case map fromIntegral codes of
     BookKey (pair c0 c1) (pair c2 c3) (pair c4 c5) (pair c6 c7) (pair c8 (fromIntegral forcedBoard))
   _ -> error "bookKeyOfBoards: not nine boards"
   where
-    pair hi lo = hi `shiftL` 16 .|. lo
+    pair hi lo = hi .<<. 16 .|. lo
 
 -- | Image of square i under each of the eight symmetries (identity first). A symmetry maps
 -- the cell at (board b, square q) to (p !! b, p !! q) and the forced board b to p !! b.
