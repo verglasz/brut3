@@ -220,8 +220,32 @@ impl VecSpec {
 
 // ---------------------------------------------------------------- formatting helpers
 
+/// Index `i` among `count` names of one role, displayed zero-padded to the width of the
+/// largest index, so that lists of bindings line up (`a00 .. a63`).
+pub(super) fn pad_index(i: usize, count: usize) -> PaddedIndex {
+    let largest = count.saturating_sub(1);
+    PaddedIndex {
+        i,
+        width: largest.checked_ilog10().map_or(1, |d| d as usize + 1),
+    }
+}
+
+/// See [`pad_index`].
+pub(super) struct PaddedIndex {
+    i: usize,
+    width: usize,
+}
+
+impl std::fmt::Display for PaddedIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:0width$}", self.i, width = self.width)
+    }
+}
+
 fn names(prefix: &str, n: usize) -> Vec<String> {
-    (0..n).map(|i| format!("{prefix}{i}")).collect()
+    (0..n)
+        .map(|i| format!("{prefix}{}", pad_index(i, n)))
+        .collect()
 }
 
 /// Lays `items` out on lines of at most `LINE` characters.
@@ -497,23 +521,23 @@ impl<'a> Gen<'a> {
             );
             self.push(format!("maskedMax{n} :: Int -> {t} -> Float -> Float"));
             self.wrap(
-                &self.pattern_head(&format!("maskedMax{n} m ({t}"), &a, ") acc0 ="),
+                &self.pattern_head(
+                    &format!("maskedMax{n} m ({t}"),
+                    &a,
+                    &format!(") acc{} =", pad_index(0, n + 1)),
+                ),
                 2,
                 Some(0),
             );
             self.push("  let");
             for (i, x) in a.iter().enumerate() {
-                let prev = if i == 0 {
-                    "acc0".to_string()
-                } else {
-                    format!("acc{i}")
-                };
+                let prev = format!("acc{}", pad_index(i, n + 1));
                 self.push(format!(
                     "    acc{} = if testBit m {i} then {prev} else max {prev} {x}",
-                    i + 1
+                    pad_index(i + 1, n + 1)
                 ));
             }
-            self.push(format!("  in acc{n}"));
+            self.push(format!("  in acc{}", pad_index(n, n + 1)));
             self.push("");
             self.push(format!("{{- maskedExp{n} mask c v"));
             self.push(
@@ -889,12 +913,12 @@ impl<'a> Gen<'a> {
             self.push("");
             return;
         }
-        let args: Vec<String> = (0..k).map(|i| format!("!u{i}")).collect();
+        let args: Vec<String> = (0..k).map(|i| format!("!u{}", pad_index(i, k))).collect();
         self.push(format!("{fun} {} =", args.join(" ")));
         let vs: Vec<String> = (0..k)
-            .flat_map(|i| (0..n).map(move |j| format!("v{i}_{j}")))
+            .flat_map(|i| (0..n).map(move |j| format!("v{}_{}", pad_index(i, k), pad_index(j, n))))
             .collect();
-        let names: Vec<String> = (0..k).map(|i| format!("u{i}")).collect();
+        let names: Vec<String> = (0..k).map(|i| format!("u{}", pad_index(i, k))).collect();
         let scruts: Vec<&str> = names.iter().map(String::as_str).collect();
         let pats: Vec<String> = (0..k)
             .map(|i| self.pat(n, &vs[i * n..(i + 1) * n]))
@@ -914,22 +938,26 @@ impl<'a> Gen<'a> {
             k - 1
         ));
         self.push(format!("{fun} :: {}", vec![v.clone(); k + 1].join(" -> ")));
-        let args: Vec<String> = (0..k).map(|i| format!("!u{i}")).collect();
+        let args: Vec<String> = (0..k).map(|i| format!("!u{}", pad_index(i, k))).collect();
         self.push(format!("{fun} {} =", args.join(" ")));
-        let names: Vec<String> = (0..k).map(|i| format!("u{i}")).collect();
+        let names: Vec<String> = (0..k).map(|i| format!("u{}", pad_index(i, k))).collect();
         let scruts: Vec<&str> = names.iter().map(String::as_str).collect();
         match self.chunks(n) {
             Some((kk, m)) => {
                 let pats: Vec<String> = (0..k)
                     .map(|i| {
-                        let fields: Vec<String> = (0..kk).map(|j| format!("c{i}_{j}")).collect();
+                        let fields: Vec<String> = (0..kk)
+                            .map(|j| format!("c{}_{}", pad_index(i, k), pad_index(j, kk)))
+                            .collect();
                         format!("{v} {}", fields.join(" "))
                     })
                     .collect();
                 self.case_match(&scruts, &pats, 2);
                 let mut items = vec![v.clone()];
                 for j in 0..kk {
-                    let terms: Vec<String> = (0..k).map(|i| format!("c{i}_{j}")).collect();
+                    let terms: Vec<String> = (0..k)
+                        .map(|i| format!("c{}_{}", pad_index(i, k), pad_index(j, kk)))
+                        .collect();
                     items.push(format!("(sum{k}_{m} {})", terms.join(" ")));
                 }
                 self.wrap(&items, 8, Some(6));
@@ -937,14 +965,18 @@ impl<'a> Gen<'a> {
             None => {
                 let pats: Vec<String> = (0..k)
                     .map(|i| {
-                        let fields: Vec<String> = (0..n).map(|j| format!("v{i}_{j}")).collect();
+                        let fields: Vec<String> = (0..n)
+                            .map(|j| format!("v{}_{}", pad_index(i, k), pad_index(j, n)))
+                            .collect();
                         format!("{v} {}", fields.join(" "))
                     })
                     .collect();
                 self.case_match(&scruts, &pats, 2);
                 let mut items = vec![v.clone()];
                 for j in 0..n {
-                    let terms: Vec<String> = (0..k).map(|i| format!("v{i}_{j}")).collect();
+                    let terms: Vec<String> = (0..k)
+                        .map(|i| format!("v{}_{}", pad_index(i, k), pad_index(j, n)))
+                        .collect();
                     items.push(format!("({})", terms.join(" + ")));
                 }
                 self.wrap(&items, 8, Some(6));

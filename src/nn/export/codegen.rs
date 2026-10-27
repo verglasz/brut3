@@ -127,7 +127,9 @@ fn header(out: &mut String, module: &str, exports: &str, opts: &str) {
 }
 
 fn vars(prefix: &str, n: usize) -> Vec<String> {
-    (0..n).map(|i| format!("{prefix}{i}")).collect()
+    (0..n)
+        .map(|i| format!("{prefix}{}", super::vecgen::pad_index(i, n)))
+        .collect()
 }
 
 /// `Net.hs`: the decoded network and its forward pass.
