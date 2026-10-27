@@ -160,9 +160,9 @@ move in that frame; lookup maps back through the inverse symmetry (the quarter t
 other's inverses, the rest are self-inverse). Ties between symmetries are harmless (symmetric
 positions, equivalent moves). File lines: `CELLS MOVE VALUE move:visits,...`, where `CELLS`
 is one position the key stands for (81 cell digits and the forced digit), the one searched;
-loading canonicalises every line, and of lines that share a key keeps the one with the most
-visits (files from before these keys load as they are; the 107,798-entry book had no such
-pair). Agents use a book by ending their spec with
+loading canonicalises every line and pools the searches of lines that share a key (same
+moves: visits add up, the value is the visit-weighted mean, the best move the most visited;
+files from before these keys load as they are; the 107,798-entry book had no such pair). Agents use a book by ending their spec with
 `book <file>` (`mcts`, `nn`, `mcts-nn`), e.g. `benchmark "mcts-nn models/m cuda 1000 16 book
 models/book.txt" "mcts-nn models/m cuda 1000 16"`: book moves are played instantly, in
 lockstep matches too, and the search starts at the first position outside the book.

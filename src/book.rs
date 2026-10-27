@@ -20,9 +20,9 @@
 //! board's index (9 for a free choice), `MOVE` the chosen move's index, `VALUE` the root value
 //! for the side to move, and `VISITS` a comma-separated list of `move:count` over the moves,
 //! then `dropped` for an entry pruned from the shipped book. Moves are in the frame of
-//! `CELLS`. Lines starting with `#` are comments. Loading canonicalises every line, so a file
-//! with several lines for one key (from before keys ignored decided boards' cells) keeps the
-//! one with the most visits.
+//! `CELLS`. Lines starting with `#` are comments. Loading canonicalises every line and pools
+//! the searches of lines that share a key (from before keys ignored decided boards' cells):
+//! the positions have the same moves, so their visits add up.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
@@ -67,6 +67,46 @@ impl Entry {
 
     fn total_visits(&self) -> u32 {
         self.visits.iter().map(|(_, n)| n).sum()
+    }
+
+    /// Two searches of positions with one key pooled, moves in the same frame: the visits add
+    /// up, the value is the visit-weighted mean, the best move is the most visited one (the
+    /// deeper search's on ties), and the entry is live if either was.
+    fn pooled(self, other: Entry) -> Entry {
+        let (deep, shallow) = if other.total_visits() > self.total_visits() {
+            (other, self)
+        } else {
+            (self, other)
+        };
+        let (wd, ws) = (deep.total_visits() as f32, shallow.total_visits() as f32);
+        let value = if wd + ws > 0.0 {
+            (deep.value * wd + shallow.value * ws) / (wd + ws)
+        } else {
+            deep.value
+        };
+        let mut visits = deep.visits;
+        for (mv, n) in shallow.visits {
+            match visits.iter_mut().find(|(m, _)| *m == mv) {
+                Some(entry) => entry.1 += n,
+                None => visits.push((mv, n)),
+            }
+        }
+        let count = |mv: Move| visits.iter().find(|(m, _)| *m == mv).map_or(0, |e| e.1);
+        let top = visits.iter().map(|(_, n)| *n).max().unwrap_or(0);
+        let best = if count(deep.best) == top {
+            deep.best
+        } else {
+            visits
+                .iter()
+                .find(|(_, n)| *n == top)
+                .map_or(deep.best, |e| e.0)
+        };
+        Entry {
+            best,
+            value,
+            visits,
+            dropped: deep.dropped && shallow.dropped,
+        }
     }
 }
 
@@ -437,19 +477,23 @@ impl Book {
             }
             let (cells, entry) = parse_entry(line).map_err(|e| format!("line {}: {e}", i + 1))?;
             let state = state_of_cells(&cells).map_err(|e| format!("line {}: {e}", i + 1))?;
-            // Of several lines for one key, the deepest search stays (a live one on ties).
-            let rank = |e: &Entry| (e.total_visits(), !e.dropped);
-            match book.entries.get(&canonical(&state).2) {
+            // Lines for one key pool their searches; the deeper one's position stays.
+            let (sym, image, key) = canonical(&state);
+            let entry = entry.mapped(sym);
+            let entry = match book.entries.remove(&key) {
                 Some(old) => {
                     book.coalesced += 1;
-                    if rank(&entry) > rank(old) {
-                        book.insert(&state, entry);
+                    if entry.total_visits() > old.total_visits() {
+                        book.positions.insert(key.clone(), image);
                     }
+                    old.pooled(entry)
                 }
                 None => {
-                    book.insert(&state, entry);
+                    book.positions.insert(key.clone(), image);
+                    entry
                 }
-            }
+            };
+            book.entries.insert(key, entry);
         }
         Ok(book)
     }
@@ -738,16 +782,34 @@ mod tests {
         assert_eq!(key_of(&a), key_of(&b));
         assert_eq!(canonical(&a).2, canonical(&b).2);
 
-        // A file holding both keeps the deeper search, under one entry.
+        // A file holding both pools their searches under one entry.
         let text = format!(
-            "{} 40 0.1 40:5\n{} 41 0.2 41:9\n",
+            "{} 40 0.1 40:5,41:3\n{} 41 0.2 41:4,42:2 dropped\n",
             cells_of(&a),
             cells_of(&b)
         );
         let book = Book::parse(&text).unwrap();
         assert_eq!((book.len(), book.coalesced()), (1, 1));
-        assert_eq!(book.best_move(&a), Some(Move::from_index(41)));
-        assert_eq!(book.best_move(&b), Some(Move::from_index(41)));
+        let entry = book.lookup(&b).unwrap();
+        let count = |i: usize| {
+            entry
+                .visits
+                .iter()
+                .find(|(m, _)| m.index() == i)
+                .map(|e| e.1)
+        };
+        assert_eq!(
+            (count(40), count(41), count(42)),
+            (Some(5), Some(7), Some(2))
+        );
+        assert_eq!(entry.best, Move::from_index(41), "most visits once pooled");
+        assert!((entry.value - (0.1 * 8.0 + 0.2 * 6.0) / 14.0).abs() < 1e-6);
+        assert_eq!(book.live_len(), 1, "live if either line was");
+        assert_eq!(
+            book.positions()[0].1,
+            canonical(&a).1,
+            "the deeper search's position"
+        );
     }
 
     #[test]
