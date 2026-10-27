@@ -30,10 +30,16 @@ pub use agent::NetAgent;
 pub use any_model::{AnyModel, ModelSpec};
 pub use backend::BackendKind;
 pub use board_transformer::{
-    BoardTransformer, BoardTransformerConfig, BoardTransformerV2, BoardTransformerV2Config,
+    BoardTransformer,
+    BoardTransformerConfig,
+    BoardTransformerV2,
+    BoardTransformerV2Config,
 };
 pub use cell_transformer::{
-    CellTransformer, CellTransformerConfig, CellTransformerV2, CellTransformerV2Config,
+    CellTransformer,
+    CellTransformerConfig,
+    CellTransformerV2,
+    CellTransformerV2Config,
 };
 pub use encode::{FEATURES, encode_batch, encode_into};
 pub use linear::{LinearNet, LinearNetConfig};
@@ -41,7 +47,14 @@ pub use model::{HostPrediction, MOVES, Model, Prediction, Verdict, expected_valu
 pub use nnue::{Nnue, NnueConfig};
 pub use pipeline::{GenerationReport, LoopConfig, ReplayBuffer, run_loop, train_model};
 pub use train::{
-    Augment, Dataset, Sample, TrainOptions, TrainReport, generate, generate_parallel, train,
+    Augment,
+    Dataset,
+    Sample,
+    TrainOptions,
+    TrainReport,
+    generate,
+    generate_parallel,
+    train,
 };
 
 /// Tests that touch a device take this lock: initialising or driving several CubeCL backends

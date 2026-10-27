@@ -152,13 +152,14 @@ fn softmax3(z: [f32; 3]) -> [f32; 3] {
 
 #[cfg(test)]
 mod tests {
+    use rand::rngs::SmallRng;
+    use rand::{Rng, SeedableRng};
+
     use super::*;
     use crate::game::test_positions::{o_must_block, x_wins_in_one};
     use crate::nn::BackendKind;
     use crate::nn::model::predict_host;
     use crate::nn::nnue::NnueConfig;
-    use rand::rngs::SmallRng;
-    use rand::{Rng, SeedableRng};
 
     /// Positions along random games, one every few plies.
     fn random_positions(seed: u64, n: usize) -> Vec<BitState> {

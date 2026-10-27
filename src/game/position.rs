@@ -6,8 +6,17 @@
 use std::fmt;
 
 use super::{
-    BoardStatus, GameState, Move, MoveList, MoveSet, Outcome, Player, Square, Symmetry,
-    board_status_of, line_winner,
+    BoardStatus,
+    GameState,
+    Move,
+    MoveList,
+    MoveSet,
+    Outcome,
+    Player,
+    Square,
+    Symmetry,
+    board_status_of,
+    line_winner,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]

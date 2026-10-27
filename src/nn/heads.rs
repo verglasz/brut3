@@ -2,11 +2,21 @@
 
 use burn::module::Param;
 use burn::nn::transformer::{
-    TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput,
+    TransformerEncoder,
+    TransformerEncoderConfig,
+    TransformerEncoderInput,
 };
 use burn::nn::{
-    Dropout, DropoutConfig, Embedding, EmbeddingConfig, Gelu, Initializer, LayerNorm,
-    LayerNormConfig, Linear, LinearConfig,
+    Dropout,
+    DropoutConfig,
+    Embedding,
+    EmbeddingConfig,
+    Gelu,
+    Initializer,
+    LayerNorm,
+    LayerNormConfig,
+    Linear,
+    LinearConfig,
 };
 use burn::prelude::*;
 

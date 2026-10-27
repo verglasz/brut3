@@ -8,7 +8,12 @@ use burn::prelude::Tensor;
 use super::any_model::AnyModel;
 use super::backend::BackendKind;
 use super::model::{
-    HostPrediction, LOGITS, expected_value, host_policy_into, host_wdl, logits_to_host,
+    HostPrediction,
+    LOGITS,
+    expected_value,
+    host_policy_into,
+    host_wdl,
+    logits_to_host,
 };
 use crate::agent::{Evaluation, Evaluations, UtttAgent};
 use crate::game::{BitState, GameState, Move};

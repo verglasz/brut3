@@ -1645,7 +1645,11 @@ impl<'a> Gen<'a> {
             );
             self.push(BODY_BEGIN);
         }
-        self.push("-- BEGIN GENERATED VEC  (ultimate-ttt-burn export; do not edit by hand)");
+        self.push(concat!(
+            "-- BEGIN GENERATED VEC  (",
+            env!("CARGO_PKG_NAME"),
+            " export; do not edit by hand)"
+        ));
         self.push("{- FOURMOLU_DISABLE -}");
         self.push("");
         if !spec.aliases.is_empty() {

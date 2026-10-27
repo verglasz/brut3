@@ -16,7 +16,12 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
 use super::haskell::{
-    banner, bundle_body_begin, bundle_body_end, bundle_imports, data_warning, hs_list,
+    banner,
+    bundle_body_begin,
+    bundle_body_end,
+    bundle_imports,
+    data_warning,
+    hs_list,
 };
 use super::quant::base64;
 use crate::book::{Book, KEY_LEN, Key, key_of};

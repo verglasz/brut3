@@ -1,7 +1,8 @@
 [package]
-name = "ultimate-ttt-burn"
+name = "brut3"
 version = "0.1.0"
 edition = "2024"
+description = "An Ultimate Tic-Tac-Toe agent (in Burn + Rust)"
 
 [dependencies]
 burn = { version = "0.22.1", optional = true, default-features = false }

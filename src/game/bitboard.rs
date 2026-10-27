@@ -5,7 +5,16 @@
 //! private: the public surface is the [`GameState`] trait with its explicit [`Move`]s.
 
 use super::{
-    BoardStatus, GameState, LINES, Move, MoveSet, Outcome, Player, Position, Square, Symmetry,
+    BoardStatus,
+    GameState,
+    LINES,
+    Move,
+    MoveSet,
+    Outcome,
+    Player,
+    Position,
+    Square,
+    Symmetry,
 };
 
 /// All nine squares set.

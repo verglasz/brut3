@@ -8,12 +8,12 @@ pub mod bitboard;
 pub mod position;
 pub mod symmetry;
 
+use std::fmt;
+use std::str::FromStr;
+
 pub use bitboard::{BitMoveSet, BitState};
 pub use position::Position;
 pub use symmetry::Symmetry;
-
-use std::fmt;
-use std::str::FromStr;
 
 /// One of the two players. `X` moves first.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]

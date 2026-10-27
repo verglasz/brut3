@@ -5,14 +5,22 @@
 //! lookup tables (contents, features, local and send policy) are rows per id already and are
 //! kept as they are.
 
+use std::ops::Range;
+
 use burn::prelude::*;
 
 use crate::nn::model::MOVES;
 use crate::nn::nnue::{
-    BOARDS, CELLS, CONTENT_ROWS, CONTENTS, FEATURE_ROWS, IDS_PER_BOARD, Nnue, NnueConfig,
+    BOARDS,
+    CELLS,
+    CONTENT_ROWS,
+    CONTENTS,
+    FEATURE_ROWS,
+    IDS_PER_BOARD,
+    Nnue,
+    NnueConfig,
     OPEN_CONTENTS,
 };
-use std::ops::Range;
 
 /// A row-major matrix of `f32`.
 #[derive(Clone, Debug, PartialEq)]

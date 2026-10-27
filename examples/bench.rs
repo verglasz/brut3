@@ -3,11 +3,11 @@
 
 use std::time::Instant;
 
+use brut3::agent::{GreedyAgent, MinimaxAgent, RandomAgent, UtttAgent};
+use brut3::game::{BitState, GameState, MoveSet};
+use brut3::mcts::{Mcts, MctsConfig};
+use brut3::selfplay::{SelfPlayConfig, self_play};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
-use ultimate_ttt_burn::agent::{GreedyAgent, MinimaxAgent, RandomAgent, UtttAgent};
-use ultimate_ttt_burn::game::{BitState, GameState, MoveSet};
-use ultimate_ttt_burn::mcts::{Mcts, MctsConfig};
-use ultimate_ttt_burn::selfplay::{SelfPlayConfig, self_play};
 
 fn time<R>(label: &str, f: impl FnOnce() -> (R, u64, &'static str)) -> R {
     let start = Instant::now();
@@ -120,8 +120,8 @@ fn main() {
 
 #[cfg(feature = "nn")]
 fn network_benchmarks() {
-    use ultimate_ttt_burn::agent::{Evaluations, UtttAgent};
-    use ultimate_ttt_burn::nn::{BackendKind, ModelSpec, NetAgent};
+    use brut3::agent::{Evaluations, UtttAgent};
+    use brut3::nn::{BackendKind, ModelSpec, NetAgent};
 
     let kind = BackendKind::preferred();
     let mut rng = SmallRng::seed_from_u64(1);

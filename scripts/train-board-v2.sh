@@ -38,7 +38,7 @@ EVAL_GAMES=${EVAL_GAMES:-60}
 BACKEND=${BACKEND:-cuda}
 
 cargo build --release --features "$BACKEND"
-exec target/release/ultimate-ttt-burn loop \
+exec target/release/brut3 loop \
     --backend "$BACKEND" \
     --model "$MODEL" \
     --dir "$DIR" \

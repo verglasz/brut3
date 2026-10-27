@@ -14,7 +14,12 @@ use burn::nn::transformer::TransformerEncoder;
 use burn::prelude::*;
 
 use super::heads::{
-    BodyConfig, ClsReadout, ClsReadoutConfig, Perceptron, PerceptronConfig, embedding,
+    BodyConfig,
+    ClsReadout,
+    ClsReadoutConfig,
+    Perceptron,
+    PerceptronConfig,
+    embedding,
     encode_all_to_all,
 };
 use super::model::{MOVES, Model, Prediction, Verdict};

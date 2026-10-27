@@ -13,11 +13,19 @@ use burn::tensor::activation::{log_softmax, softmax};
 use burn::train::logger::{EvaluationProgressLogger, TrainingProgressLogger};
 use burn::train::metric::{AccuracyMetric, LossMetric, MetricDefinition};
 use burn::train::renderer::{
-    EvaluationName, MetricState, MetricsRenderer, MetricsRendererEvaluation,
+    EvaluationName,
+    MetricState,
+    MetricsRenderer,
+    MetricsRendererEvaluation,
     MetricsRendererTraining,
 };
 use burn::train::{
-    ClassificationOutput, ExecutionStrategy, InferenceStep, Learner, SupervisedTraining, TrainStep,
+    ClassificationOutput,
+    ExecutionStrategy,
+    InferenceStep,
+    Learner,
+    SupervisedTraining,
+    TrainStep,
 };
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng, rngs::SmallRng};

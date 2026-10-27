@@ -10,10 +10,16 @@ use burn::prelude::Device;
 use serde::{Deserialize, Serialize};
 
 use super::board_transformer::{
-    BoardTransformer, BoardTransformerConfig, BoardTransformerV2, BoardTransformerV2Config,
+    BoardTransformer,
+    BoardTransformerConfig,
+    BoardTransformerV2,
+    BoardTransformerV2Config,
 };
 use super::cell_transformer::{
-    CellTransformer, CellTransformerConfig, CellTransformerV2, CellTransformerV2Config,
+    CellTransformer,
+    CellTransformerConfig,
+    CellTransformerV2,
+    CellTransformerV2Config,
 };
 use super::heads::BodyConfig;
 use super::linear::{LinearNet, LinearNetConfig};

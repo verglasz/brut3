@@ -1,13 +1,13 @@
 use std::io;
 use std::process::ExitCode;
 
+use brut3::agent::AgentSpec;
+use brut3::repl;
 use clap::{Parser, Subcommand};
-use ultimate_ttt_burn::agent::AgentSpec;
-use ultimate_ttt_burn::repl;
 
 /// Ultimate Tic Tac Toe agents: play, train, benchmark.
 #[derive(Parser)]
-#[command(name = "ultimate-ttt-burn", version)]
+#[command(name = "brut3", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -515,7 +515,7 @@ fn main() -> ExitCode {
         ),
         #[cfg(feature = "nn")]
         Command::Backends => {
-            use ultimate_ttt_burn::nn::BackendKind;
+            use brut3::nn::BackendKind;
             for kind in BackendKind::ALL {
                 let state = if kind.is_compiled() {
                     "compiled"
@@ -545,10 +545,11 @@ fn prune_book(args: &PruneArgs) -> Result<(), String> {
     use std::collections::{BTreeMap, HashSet};
     use std::io::Write;
     use std::time::Instant;
-    use ultimate_ttt_burn::agent::UtttAgent;
-    use ultimate_ttt_burn::book::{Book, agent_agrees};
-    use ultimate_ttt_burn::game::{BitState, Move};
-    use ultimate_ttt_burn::selfplay::search_positions;
+
+    use brut3::agent::UtttAgent;
+    use brut3::book::{Book, agent_agrees};
+    use brut3::game::{BitState, Move};
+    use brut3::selfplay::search_positions;
 
     if args.agent.is_none() && args.drop_rare.is_none() {
         return Err("nothing to drop: give --agent and/or --drop-rare".into());
@@ -736,7 +737,8 @@ fn book(
 ) -> Result<(), String> {
     use std::io::Write;
     use std::time::Instant;
-    use ultimate_ttt_burn::book::{Book, BookConfig};
+
+    use brut3::book::{Book, BookConfig};
 
     let words: Vec<&str> = search.split_whitespace().collect();
     let spec = AgentSpec::parse(&words)?;
@@ -831,8 +833,8 @@ fn benchmark(
     dirichlet_alpha: f32,
     specs: &[String],
 ) -> Result<(), String> {
-    use ultimate_ttt_burn::benchmark::round_robin_with;
-    use ultimate_ttt_burn::selfplay::MatchExploration;
+    use brut3::benchmark::round_robin_with;
+    use brut3::selfplay::MatchExploration;
     let exploration = MatchExploration {
         temperature_moves,
         root_noise: (dirichlet_alpha > 0.0).then_some((dirichlet_alpha, 0.25)),
@@ -858,7 +860,7 @@ fn serve(addr: &str, specs: &[String]) -> Result<(), String> {
             AgentSpec::parse(&words)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    ultimate_ttt_burn::serve::run(&specs, addr).map_err(|e| e.to_string())
+    brut3::serve::run(&specs, addr).map_err(|e| e.to_string())
 }
 
 fn play(spec: &[String]) -> Result<(), String> {
@@ -874,8 +876,8 @@ fn play(spec: &[String]) -> Result<(), String> {
 
 #[cfg(feature = "nn")]
 fn run_loop(args: &LoopArgs) -> Result<(), String> {
-    use ultimate_ttt_burn::nn::{BackendKind, LoopConfig, ModelSpec, TrainOptions, run_loop};
-    use ultimate_ttt_burn::selfplay::{MatchExploration, SelfPlayConfig};
+    use brut3::nn::{BackendKind, LoopConfig, ModelSpec, TrainOptions, run_loop};
+    use brut3::selfplay::{MatchExploration, SelfPlayConfig};
 
     let backend = match &args.backend {
         Some(name) => name.parse::<BackendKind>()?,
@@ -961,8 +963,9 @@ fn run_loop(args: &LoopArgs) -> Result<(), String> {
 fn selfplay(args: &SelfplayArgs) -> Result<(), String> {
     use std::io::Write;
     use std::time::Instant;
-    use ultimate_ttt_burn::nn::{games, generate_parallel};
-    use ultimate_ttt_burn::selfplay::SelfPlayConfig;
+
+    use brut3::nn::{games, generate_parallel};
+    use brut3::selfplay::SelfPlayConfig;
 
     let words: Vec<&str> = args.evaluator.split_whitespace().collect();
     let evaluator = AgentSpec::parse(&words)?;
@@ -1017,19 +1020,16 @@ fn selfplay(args: &SelfplayArgs) -> Result<(), String> {
             .map(|h| h.join().expect("self-play thread panicked"))
             .collect()
     });
-    let mut data = ultimate_ttt_burn::nn::Dataset::default();
-    let mut stats = ultimate_ttt_burn::selfplay::SelfPlayStats::default();
+    let mut data = brut3::nn::Dataset::default();
+    let mut stats = brut3::selfplay::SelfPlayStats::default();
     for run in runs {
         let (part, part_stats) = run?;
         let offset = data.games();
-        data.samples.extend(
-            part.samples
-                .into_iter()
-                .map(|s| ultimate_ttt_burn::nn::Sample {
-                    game: s.game + offset,
-                    ..s
-                }),
-        );
+        data.samples
+            .extend(part.samples.into_iter().map(|s| brut3::nn::Sample {
+                game: s.game + offset,
+                ..s
+            }));
         stats.games += part_stats.games;
         stats.positions += part_stats.positions;
         stats.simulations += part_stats.simulations;
@@ -1052,7 +1052,8 @@ fn selfplay(args: &SelfplayArgs) -> Result<(), String> {
 #[cfg(feature = "nn")]
 fn import_utttai(paths: &[std::path::PathBuf], out: &std::path::Path) -> Result<(), String> {
     use std::time::Instant;
-    use ultimate_ttt_burn::nn::{games, utttai};
+
+    use brut3::nn::{games, utttai};
 
     let start = Instant::now();
     let data = utttai::import(paths)?;
@@ -1081,9 +1082,9 @@ fn export(
     vec_flags: Vec<String>,
     fixed_vec: bool,
 ) -> Result<(), String> {
-    use ultimate_ttt_burn::book::Book;
-    use ultimate_ttt_burn::nn::export::{ExportOptions, VecSpec, Weights, write_all};
-    use ultimate_ttt_burn::nn::{AnyModel, BackendKind};
+    use brut3::book::Book;
+    use brut3::nn::export::{ExportOptions, VecSpec, Weights, write_all};
+    use brut3::nn::{AnyModel, BackendKind};
 
     // Messages go to stderr: with `--out -`, stdout holds the files.
     let to_stdout = out == std::path::Path::new("-");
@@ -1181,7 +1182,8 @@ fn export(
 fn train(args: &TrainArgs) -> Result<(), String> {
     use std::io::Write;
     use std::time::Instant;
-    use ultimate_ttt_burn::nn::{BackendKind, ModelSpec, TrainOptions, generate};
+
+    use brut3::nn::{BackendKind, ModelSpec, TrainOptions, generate};
 
     let backend = match &args.backend {
         Some(name) => name.parse::<BackendKind>()?,
@@ -1201,7 +1203,7 @@ fn train(args: &TrainArgs) -> Result<(), String> {
     };
     let data = match &args.selfplay_evaluator {
         _ if !args.data.is_empty() => {
-            let data = ultimate_ttt_burn::nn::games::load_many(&args.data)?;
+            let data = brut3::nn::games::load_many(&args.data)?;
             println!(
                 "loaded {} games from {} file(s)",
                 data.games(),
@@ -1210,8 +1212,8 @@ fn train(args: &TrainArgs) -> Result<(), String> {
             data
         }
         Some(evaluator) => {
-            use ultimate_ttt_burn::nn::generate_parallel;
-            use ultimate_ttt_burn::selfplay::SelfPlayConfig;
+            use brut3::nn::generate_parallel;
+            use brut3::selfplay::SelfPlayConfig;
             let words: Vec<&str> = evaluator.split_whitespace().collect();
             let evaluator_spec = AgentSpec::parse(&words)?;
             let cfg = SelfPlayConfig {
@@ -1248,7 +1250,7 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         start.elapsed().as_secs_f32(),
     );
     if let Some(out) = &args.data_out {
-        ultimate_ttt_burn::nn::games::save(out, &data)?;
+        brut3::nn::games::save(out, &data)?;
         println!("  saved to {}", out.display());
     }
     let device = backend.device();
@@ -1272,13 +1274,8 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         outcome_weight: args.outcome_weight,
         search_value_weight: args.search_value_weight,
     };
-    let (model, report) = ultimate_ttt_burn::nn::train_model(
-        &model_spec,
-        args.init.as_deref(),
-        &device,
-        data,
-        &opts,
-    )?;
+    let (model, report) =
+        brut3::nn::train_model(&model_spec, args.init.as_deref(), &device, data, &opts)?;
     println!(
         "  {} train / {} validation positions; kept epoch {} of {} (lowest validation loss)",
         report.train_positions, report.validation_positions, report.best_epoch, report.epochs

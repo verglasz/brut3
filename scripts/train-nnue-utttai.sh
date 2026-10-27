@@ -24,7 +24,7 @@ STAGE2=${STAGE2:-datasets/stage2.games}
 WORKERS=${WORKERS:-0}
 
 # cargo build --release --features "$BACKEND"
-BIN=target/release/ultimate-ttt-burn
+BIN=target/release/brut3
 
 # The burn dashboard assumes a dark background. When it is going to be shown (a terminal,
 # and no --no-tui among the extra arguments), give the terminal a dark background and a light

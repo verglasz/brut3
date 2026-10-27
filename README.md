@@ -1,4 +1,14 @@
-# ultimate-ttt-burn
+# brut3
+
+```text
+ _                _     ____  X | O | X
+| |__  _ __ _   _| |_  |__ / ---+---+---
+| '_ \| '__| | | | __|  |_ \  O | X |
+| |_) | |  | |_| | |_  |___/ ---+---+---
+|_.__/|_|   \__,_|\__|          | O | X
+```
+
+**b**est **r**esponse, **U**ltimate **T**ic-**T**ac-**T**oe: an Ultimate Tic-Tac-Toe agent (in Burn + Rust).
 
 A Monte Carlo Tree Search agent for [Ultimate Tic Tac Toe](https://en.wikipedia.org/wiki/Ultimate_tic-tac-toe),
 written in Rust with [burn](https://burn.dev) for the neural-network side.
