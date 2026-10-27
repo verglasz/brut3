@@ -158,11 +158,14 @@ Positions that differ only inside decided boards play the same, so they share a 
 entry (the marks no longer tell whose turn it is, hence the last digit). Entries store the
 move in that frame; lookup maps back through the inverse symmetry (the quarter turns are each
 other's inverses, the rest are self-inverse). Ties between symmetries are harmless (symmetric
-positions, equivalent moves). File lines: `CELLS MOVE VALUE move:visits,...`, where `CELLS`
-is one position the key stands for (81 cell digits and the forced digit), the one searched;
-loading canonicalises every line and pools the searches of lines that share a key (same
-moves: visits add up, the value is the visit-weighted mean, the best move the most visited;
-files from before these keys load as they are; the 107,798-entry book had no such pair). Agents use a book by ending their spec with
+positions, equivalent moves). File lines: `KEY MOVE VALUE move:visits,...`, moves in the
+key's frame. A key stands for one position (`state_of_key`): a won board as the winner's top
+row, a full one as `XOX OXX OXO`, and as last move (only its square counts: it sets the
+forced board) a fitting mark of the side that just moved, else any cell on the right square.
+Files from before these keys, with 82-digit positions in place of keys, still load: every
+line is canonicalised, and lines that share a key pool their searches (same moves: visits
+add up, the value is the visit-weighted mean, the best move the most visited; the
+107,798-entry book had no such pair). A position's ply is its depth in the book's walk. Agents use a book by ending their spec with
 `book <file>` (`mcts`, `nn`, `mcts-nn`), e.g. `benchmark "mcts-nn models/m cuda 1000 16 book
 models/book.txt" "mcts-nn models/m cuda 1000 16"`: book moves are played instantly, in
 lockstep matches too, and the search starts at the first position outside the book.
@@ -181,8 +184,7 @@ settings from different plies, and the header gets a line per pass. A pass drops
   are left alone; only an agent pass can drop them;
 - with `--agent "<spec>"`, the entries whose move the agent (the engine's search at its
   play-time budget) plays anyway, counting moves equal up to the position's symmetries.
-  Positions are each entry's stored position, rebuilt with a last move that sends play to
-  the stored forced board. `--min-advantage a` keeps entries where the book move leads the agent's
+  Positions are rebuilt from their keys (`state_of_key`). `--min-advantage a` keeps entries where the book move leads the agent's
   second-best by less than `a` of its visits or policy (each with its symmetric
   equivalents); `--keep-replies k` keeps the lines of replies of at least `k` each
   unsearched (at 0.05: 7,874 entries).

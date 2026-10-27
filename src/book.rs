@@ -15,14 +15,13 @@
 //! move, so that deepening the book later can extend the frontier from the file alone and
 //! re-choose moves from their children's values.
 //!
-//! File format: lines of `CELLS MOVE VALUE VISITS`, where `CELLS` is one position the entry
-//! stands for, as 81 cell digits by [`Move::index`] (0 empty, 1 X, 2 O) followed by the forced
-//! board's index (9 for a free choice), `MOVE` the chosen move's index, `VALUE` the root value
-//! for the side to move, and `VISITS` a comma-separated list of `move:count` over the moves,
-//! then `dropped` for an entry pruned from the shipped book. Moves are in the frame of
-//! `CELLS`. Lines starting with `#` are comments. Loading canonicalises every line and pools
-//! the searches of lines that share a key (from before keys ignored decided boards' cells):
-//! the positions have the same moves, so their visits add up.
+//! File format: lines of `KEY MOVE VALUE VISITS`, where `KEY` is the canonical [`Key`],
+//! `MOVE` the chosen move's index, `VALUE` the root value for the side to move, and `VISITS` a
+//! comma-separated list of `move:count` over the moves, then `dropped` for an entry pruned
+//! from the shipped book. Lines starting with `#` are comments. Files from before keys left
+//! out decided boards' cells have 82-digit positions (81 cells and the forced board) in place
+//! of keys; loading canonicalises every line and pools the searches of lines that share a
+//! key: the positions have the same moves, so their visits add up.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
@@ -128,9 +127,6 @@ impl Entry {
 #[derive(Clone, Debug, Default)]
 pub struct Book {
     entries: HashMap<Key, Entry>,
-    /// For every entry, the position it was searched from (or read as), in the key's
-    /// canonical frame: one of the positions the key stands for, which the file stores.
-    positions: HashMap<Key, BitState>,
     /// Lines of the loaded file that shared a key with another line.
     coalesced: usize,
 }
@@ -205,6 +201,98 @@ pub fn canonical(state: &BitState) -> (Symmetry, BitState, Key) {
         }
     }
     best.expect("eight symmetries")
+}
+
+/// The cells a key's decided board stands for: the winner's top row for a won board,
+/// `XOX OXX OXO` (no line) for a full one.
+fn decided_cells(status: BoardStatus) -> [Option<Player>; 9] {
+    use Player::{O, X};
+    match status {
+        BoardStatus::Won(winner) => {
+            let mut cells = [None; 9];
+            cells[..3].fill(Some(winner));
+            cells
+        }
+        BoardStatus::Full => [X, O, X, O, X, X, O, X, O].map(Some),
+        BoardStatus::Open => unreachable!("a decided board"),
+    }
+}
+
+/// The position a key stands for, in the key's frame: the open boards as the key gives them,
+/// each decided board as [`decided_cells`], and as the last move (whose square is all the
+/// rules read of it: it sets the forced board) the first mark of the side that just moved
+/// that sends play to the key's forced board, or to a decided board when the choice is free,
+/// else the first cell that does.
+pub fn state_of_key(key: &str) -> Result<BitState, String> {
+    let digits = key.as_bytes();
+    if digits.len() != KEY_LEN || !digits.iter().all(u8::is_ascii_digit) {
+        return Err(format!("bad key {key:?}"));
+    }
+    let to_move = match digits[KEY_LEN - 1] {
+        b'0' => Player::X,
+        b'1' => Player::O,
+        _ => return Err(format!("{key:?}: bad side to move")),
+    };
+    let mut position = Position::initial();
+    let mut status = [BoardStatus::Open; 9];
+    for (board, s) in status.iter_mut().enumerate() {
+        let cells = &digits[board * 9..board * 9 + 9];
+        let cells: [Option<Player>; 9] = match cells[0] {
+            b'3' | b'4' | b'5' if cells.iter().all(|&c| c == cells[0]) => {
+                *s = match cells[0] {
+                    b'3' => BoardStatus::Won(Player::X),
+                    b'4' => BoardStatus::Won(Player::O),
+                    _ => BoardStatus::Full,
+                };
+                decided_cells(*s)
+            }
+            _ => {
+                let mut open = [None; 9];
+                for (cell, &d) in open.iter_mut().zip(cells) {
+                    *cell = match d {
+                        b'0' => None,
+                        b'1' => Some(Player::X),
+                        b'2' => Some(Player::O),
+                        _ => return Err(format!("{key:?}: bad board {board}")),
+                    };
+                }
+                open
+            }
+        };
+        for (square, cell) in cells.into_iter().enumerate() {
+            position.set_cell(Move::from_index(board * 9 + square), cell);
+        }
+    }
+    position.set_to_move(to_move);
+    let forced = usize::from(digits[Move::COUNT] - b'0');
+    let leads_there = |mv: &Move| {
+        let square = mv.square.index();
+        if forced == 9 {
+            status[square].is_decided()
+        } else {
+            square == forced
+        }
+    };
+    let cells = (0..Move::COUNT).map(Move::from_index);
+    let mover = to_move.other();
+    let last = cells
+        .clone()
+        .filter(leads_there)
+        .find(|&mv| position.cell(mv) == Some(mover))
+        .or_else(|| cells.clone().find(leads_there));
+    let started = cells.clone().any(|mv| position.cell(mv).is_some());
+    if started {
+        position.set_last_move(Some(
+            last.ok_or_else(|| format!("{key:?}: a free choice with no decided board"))?,
+        ));
+    } else if forced != 9 {
+        return Err(format!("{key:?}: forced board {forced} on an empty board"));
+    }
+    let state = BitState::from_position(&position);
+    if key_of(&state) != key {
+        return Err(format!("{key:?} is not a position"));
+    }
+    Ok(state)
 }
 
 /// The state that cells and a forced board (as [`cells_of`] writes them) describe. They hold
@@ -350,17 +438,52 @@ impl Book {
         self.entries.iter()
     }
 
-    /// Every entry's position (in the canonical frame: the one searched, or the one the file
-    /// gave, of the positions its key stands for) with its key, sorted by key, dropped entries
-    /// included.
+    /// Every entry's position (a position its key stands for, in the canonical frame: see
+    /// [`state_of_key`]) with its key, sorted by key, dropped entries included.
     pub fn positions(&self) -> Vec<(Key, BitState)> {
-        let mut positions: Vec<(Key, BitState)> = self
-            .positions
-            .iter()
-            .map(|(key, state)| (key.clone(), *state))
-            .collect();
-        positions.sort_by(|a, b| a.0.cmp(&b.0));
-        positions
+        let mut keys: Vec<&Key> = self.entries.keys().collect();
+        keys.sort();
+        keys.into_iter()
+            .map(|key| {
+                (
+                    key.clone(),
+                    state_of_key(key).expect("book keys are positions"),
+                )
+            })
+            .collect()
+    }
+
+    /// Every entry's ply: the fewest moves from the start that reach it through the book's
+    /// moves (every move with visits, dropped entries included), or for an entry no such path
+    /// reaches, the marks of its position.
+    pub fn plies(&self) -> HashMap<Key, usize> {
+        let mut plies = HashMap::new();
+        let mut queue = VecDeque::from([(BitState::initial(), 0)]);
+        while let Some((state, ply)) = queue.pop_front() {
+            if state.is_terminal() {
+                continue;
+            }
+            let (sym, _, key) = canonical(&state);
+            let Some(entry) = self.entries.get(&key) else {
+                continue;
+            };
+            if plies.contains_key(&key) {
+                continue;
+            }
+            plies.insert(key, ply);
+            let back = sym.inverse();
+            for (mv, _) in entry.visits.iter().filter(|(_, n)| *n > 0) {
+                let mut child = state;
+                child.apply(back.apply_move(*mv));
+                queue.push_back((child, ply + 1));
+            }
+        }
+        for (key, _) in self.positions() {
+            plies
+                .entry(key)
+                .or_insert_with_key(|key| marks(&state_of_key(key).expect("a position")));
+        }
+        plies
     }
 
     /// Lines of the loaded file that were merged into another line's entry, their positions
@@ -372,8 +495,7 @@ impl Book {
     /// Stores `entry`, searched from `state` with its moves in `state`'s frame, under
     /// `state`'s canonical key; returns the entry it replaces.
     pub fn insert(&mut self, state: &BitState, entry: Entry) -> Option<Entry> {
-        let (sym, image, key) = canonical(state);
-        self.positions.insert(key.clone(), image);
+        let (sym, _, key) = canonical(state);
         self.entries.insert(key, entry.mapped(sym))
     }
 
@@ -475,23 +597,23 @@ impl Book {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let (cells, entry) = parse_entry(line).map_err(|e| format!("line {}: {e}", i + 1))?;
-            let state = state_of_cells(&cells).map_err(|e| format!("line {}: {e}", i + 1))?;
-            // Lines for one key pool their searches; the deeper one's position stays.
-            let (sym, image, key) = canonical(&state);
+            let (position, entry) =
+                parse_entry(line).map_err(|e| format!("line {}: {e}", i + 1))?;
+            let state = if position.len() == KEY_LEN {
+                state_of_key(&position)
+            } else {
+                state_of_cells(&position)
+            }
+            .map_err(|e| format!("line {}: {e}", i + 1))?;
+            // Lines for one key pool their searches.
+            let (sym, _, key) = canonical(&state);
             let entry = entry.mapped(sym);
             let entry = match book.entries.remove(&key) {
                 Some(old) => {
                     book.coalesced += 1;
-                    if entry.total_visits() > old.total_visits() {
-                        book.positions.insert(key.clone(), image);
-                    }
                     old.pooled(entry)
                 }
-                None => {
-                    book.positions.insert(key.clone(), image);
-                    entry
-                }
+                None => entry,
             };
             book.entries.insert(key, entry);
         }
@@ -508,8 +630,7 @@ impl Book {
         }
         for key in keys {
             let e = &self.entries[key];
-            let cells = cells_of(&self.positions[key]);
-            let _ = write!(out, "{cells} {} {:.4}", e.best.index(), e.value);
+            let _ = write!(out, "{key} {} {:.4}", e.best.index(), e.value);
             for (i, (mv, n)) in e.visits.iter().enumerate() {
                 out.push(if i == 0 { ' ' } else { ',' });
                 let _ = write!(out, "{}:{n}", mv.index());
@@ -663,12 +784,13 @@ pub struct Extension {
     pub researched: usize,
 }
 
-/// A line's cells (as [`cells_of`] writes them) and entry.
+/// A line's key (or, in old files, cells as [`cells_of`] writes them) and entry.
 fn parse_entry(line: &str) -> Result<(String, Entry), String> {
     let mut fields = line.split_whitespace();
     let key = fields.next().ok_or("empty line")?;
-    if key.len() != Move::COUNT + 1 || !key.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!("bad cells {key:?}"));
+    if ![KEY_LEN, Move::COUNT + 1].contains(&key.len()) || !key.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(format!("bad key {key:?}"));
     }
     let move_index = |s: &str| -> Result<Move, String> {
         let i: usize = s.parse().map_err(|_| format!("bad move {s:?}"))?;
@@ -805,11 +927,22 @@ mod tests {
         assert_eq!(entry.best, Move::from_index(41), "most visits once pooled");
         assert!((entry.value - (0.1 * 8.0 + 0.2 * 6.0) / 14.0).abs() < 1e-6);
         assert_eq!(book.live_len(), 1, "live if either line was");
-        assert_eq!(
-            book.positions()[0].1,
-            canonical(&a).1,
-            "the deeper search's position"
-        );
+        // The position the key stands for: X's top row on the won board, which the canonical
+        // frame puts last.
+        let (key, state) = &book.positions()[0];
+        assert_eq!(cells_of(state), format!("{rest}1110000009"));
+        assert_eq!(*key, key_of(state));
+        // Saved, the line holds the key.
+        let path = std::env::temp_dir().join(format!("uttt-pool-{}.txt", std::process::id()));
+        book.save(&path, &[]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let best = book.get(key).unwrap().best.index();
+        assert!(text.starts_with(&format!("{key} {best} ")), "{text}");
+        let back = Book::parse(&text).unwrap();
+        let (saved, read) = (book.get(key).unwrap(), back.get(key).unwrap());
+        assert_eq!((&read.best, &read.visits), (&saved.best, &saved.visits));
+        assert!((read.value - saved.value).abs() < 1e-4, "four decimals");
     }
 
     #[test]
@@ -822,6 +955,11 @@ mod tests {
                     let back = state_of_cells(&cells_of(&state)).expect("reachable");
                     assert_eq!(cells_of(&back), cells_of(&state));
                     assert_eq!(key_of(&back), key_of(&state));
+                    // From the key alone: the same key, side to move and moves.
+                    let made = state_of_key(&key_of(&state)).expect("a key's position");
+                    assert_eq!(key_of(&made), key_of(&state));
+                    assert_eq!(made.to_move(), state.to_move());
+                    assert_eq!(made.legal_moves_vec(), state.legal_moves_vec());
                     assert_eq!(back.to_move(), state.to_move());
                     assert_eq!(back.legal_moves_vec(), state.legal_moves_vec());
                 }
@@ -832,6 +970,16 @@ mod tests {
         assert!(state_of_cells(&format!("{}4", "0".repeat(81))).is_err());
         assert!(state_of_cells(&format!("1{}9", "1".repeat(80))).is_err());
         assert!(state_of_cells("01").is_err());
+        assert_eq!(
+            state_of_key(&format!("{}90", "0".repeat(81))),
+            Ok(BitState::initial())
+        );
+        assert!(state_of_key(&format!("{}40", "0".repeat(81))).is_err());
+        assert!(
+            state_of_key(&format!("1{}91", "0".repeat(80))).is_err(),
+            "free, nothing decided"
+        );
+        assert!(state_of_key(&format!("{}{}91", "3".repeat(8), "0".repeat(73))).is_err());
     }
 
     #[test]
@@ -958,7 +1106,6 @@ mod tests {
         let back = Book::load(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.entries, book.entries);
-        assert_eq!(back.positions, book.positions);
         assert!(Book::parse("bad line").is_err());
         assert!(Book::parse(&format!("{key} 81 0.0")).is_err());
         assert!(Book::parse(&format!("{key} 40 0.0 40:1 dropped extra")).is_err());
@@ -1120,9 +1267,9 @@ mod tests {
 
         // Dropped entries are frontier again, and come back from their stored search.
         let ply_one: Vec<Key> = book
-            .positions()
+            .plies()
             .into_iter()
-            .filter(|(_, s)| marks(s) == 1)
+            .filter(|(_, ply)| *ply == 1)
             .map(|(k, _)| k)
             .collect();
         for key in &ply_one {

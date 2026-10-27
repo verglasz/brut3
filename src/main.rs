@@ -507,11 +507,11 @@ fn main() -> ExitCode {
 }
 
 fn prune_book(args: &PruneArgs) -> Result<(), String> {
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, HashSet};
     use std::io::Write;
     use std::time::Instant;
     use ultimate_ttt_burn::agent::UtttAgent;
-    use ultimate_ttt_burn::book::{self, Book, agent_agrees};
+    use ultimate_ttt_burn::book::{Book, agent_agrees};
     use ultimate_ttt_burn::game::{BitState, Move};
     use ultimate_ttt_burn::selfplay::search_positions;
 
@@ -547,11 +547,7 @@ fn prune_book(args: &PruneArgs) -> Result<(), String> {
             book.coalesced()
         );
     }
-    let plies: HashMap<String, usize> = book
-        .positions()
-        .into_iter()
-        .map(|(key, state)| (key, book::marks(&state)))
-        .collect();
+    let plies = book.plies();
     let ply_of = |key: &str| plies[key];
     let deep = |key: &str| ply_of(key) >= args.from_ply;
 
