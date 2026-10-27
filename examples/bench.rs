@@ -136,19 +136,36 @@ fn network_benchmarks() {
             s.apply(legal.nth(k).unwrap());
         }
     }
-    for (name, words) in [
-        ("linear", vec!["linear"]),
+    let nnue = vec!["nnue", "64", "512", "128", "4"];
+    // (name, spec, backend, folded): NNUE models are folded for inference unless asked not to.
+    let mut runs = vec![
+        ("linear", vec!["linear"], kind, true),
         (
             "board-transformer 64 2 4",
             vec!["board-transformer", "64", "2", "4"],
+            kind,
+            true,
         ),
         (
             "cell-transformer 64 2 4",
             vec!["cell-transformer", "64", "2", "4"],
+            kind,
+            true,
         ),
-    ] {
+    ];
+    // On the preferred backend, and on the pure-Rust CPU one when that is another.
+    let mut backends = vec![kind];
+    if kind != BackendKind::Flex && BackendKind::Flex.is_compiled() {
+        backends.push(BackendKind::Flex);
+    }
+    for backend in backends {
+        runs.push(("nnue 64 512 128 4, folded", nnue.clone(), backend, true));
+        runs.push(("nnue 64 512 128 4, unfolded", nnue.clone(), backend, false));
+    }
+    for (name, words, kind, folded) in runs {
         let spec = ModelSpec::parse(&words).unwrap();
-        let mut agent = NetAgent::new(spec.init(&kind.device()), kind);
+        let agent = NetAgent::new(spec.init(&kind.device()), kind);
+        let mut agent = if folded { agent } else { agent.unfolded() };
         let mut out = Evaluations::default();
         for batch in [16usize, 256, 2048] {
             // Warm up this shape first: kernel compilation and autotune happen on first use.

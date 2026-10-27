@@ -112,6 +112,29 @@ pub trait Model: Module {
     fn predict(&self, input: Self::Input) -> Prediction;
 }
 
+/// Anything that turns positions into a [`Prediction`]: every [`Model`], and inference-only
+/// forms of one such as [`super::nnue::FoldedNnue`], which are not trained or saved and so
+/// need not be modules. The prediction helpers below take any of them.
+pub trait Predictor {
+    type Input;
+
+    fn encode(states: &[BitState], device: &Device) -> Self::Input;
+
+    fn predict(&self, input: Self::Input) -> Prediction;
+}
+
+impl<M: Model> Predictor for M {
+    type Input = M::Input;
+
+    fn encode(states: &[BitState], device: &Device) -> M::Input {
+        <M as Model>::encode(states, device)
+    }
+
+    fn predict(&self, input: M::Input) -> Prediction {
+        <M as Model>::predict(self, input)
+    }
+}
+
 /// `[batch, MOVES]` mask of legal moves.
 pub fn legal_mask(states: &[BitState], device: &Device) -> Tensor<2, Bool> {
     let mut mask = vec![false; states.len() * MOVES];
@@ -156,7 +179,7 @@ impl HostPrediction {
 /// rows of [`LOGITS`] floats, each the three verdict logits followed by the move logits
 /// indexed by `Move::index`. Masking and softmax are left to the host, where they are a few
 /// dozen flops per position: see [`host_wdl`] and [`host_policy_into`].
-pub fn predict_logits<M: Model>(model: &M, states: &[BitState], device: &Device) -> Vec<f32> {
+pub fn predict_logits<M: Predictor>(model: &M, states: &[BitState], device: &Device) -> Vec<f32> {
     if states.is_empty() {
         return Vec::new();
     }
@@ -181,7 +204,7 @@ fn padded_len(n: usize) -> usize {
 /// The `[n, LOGITS]` tensor behind [`predict_logits`], still on the device: queue it with
 /// this, do other work, then read it with [`logits_to_host`]. `states` must not be empty.
 /// The batch is padded to [`padded_len`] positions on the way and the padding sliced off.
-pub fn predict_logits_tensor<M: Model>(
+pub fn predict_logits_tensor<M: Predictor>(
     model: &M,
     states: &[BitState],
     device: &Device,
@@ -246,7 +269,11 @@ pub fn host_policy_into(row: &[f32], legal: &impl MoveSet, out: &mut [f32; MOVES
 }
 
 /// Runs `model` on `states` and reads the probabilities back.
-pub fn predict_host<M: Model>(model: &M, states: &[BitState], device: &Device) -> HostPrediction {
+pub fn predict_host<M: Predictor>(
+    model: &M,
+    states: &[BitState],
+    device: &Device,
+) -> HostPrediction {
     let logits = predict_logits(model, states, device);
     let mut dense = [0.0f32; MOVES];
     let mut prediction = HostPrediction::default();

@@ -14,12 +14,19 @@ use super::model::{
     host_policy_into,
     host_wdl,
     logits_to_host,
+    predict_host,
+    predict_logits,
+    predict_logits_tensor,
 };
+use super::nnue::FoldedNnue;
 use crate::agent::{Evaluation, Evaluations, UtttAgent};
 use crate::game::{BitState, GameState, Move};
 
 pub struct NetAgent {
     model: AnyModel,
+    /// An NNUE model's folded form, which every evaluation goes through when present (see
+    /// [`NetAgent::unfolded`]).
+    folded: Option<FoldedNnue>,
     device: Device,
     backend: BackendKind,
     /// A forward pass queued by `begin_batch` and not yet read back: the logits tensor and how
@@ -28,9 +35,16 @@ pub struct NetAgent {
 }
 
 impl NetAgent {
+    /// An agent on `backend`'s default device, where `model` must live. An NNUE model is
+    /// folded for inference here.
     pub fn new(model: AnyModel, backend: BackendKind) -> Self {
+        let folded = match &model {
+            AnyModel::Nnue(net) => Some(net.fold()),
+            _ => None,
+        };
         Self {
             model,
+            folded,
             device: backend.device(),
             backend,
             in_flight: None,
@@ -39,14 +53,15 @@ impl NetAgent {
 
     /// Loads a model saved by [`AnyModel::save`] onto `backend`'s default device.
     pub fn load(path: &Path, backend: BackendKind) -> Result<Self, String> {
-        let device = backend.device();
-        let model = AnyModel::load(path, &device)?;
-        Ok(Self {
-            model,
-            device,
-            backend,
-            in_flight: None,
-        })
+        let model = AnyModel::load(path, &backend.device())?;
+        Ok(Self::new(model, backend))
+    }
+
+    /// The same agent evaluating with the model as trained, without the folded table: for
+    /// comparisons, and to save the table's device memory.
+    pub fn unfolded(mut self) -> Self {
+        self.folded = None;
+        self
     }
 
     pub fn backend(&self) -> BackendKind {
@@ -59,7 +74,10 @@ impl NetAgent {
 
     /// Network outputs for `states`, one forward pass.
     pub fn predict(&self, states: &[BitState]) -> HostPrediction {
-        self.model.predict_host(states, &self.device)
+        match &self.folded {
+            Some(folded) => predict_host(folded, states, &self.device),
+            None => self.model.predict_host(states, &self.device),
+        }
     }
 
     /// Appends the evaluations of `states` from their rows of `logits`: exact values for
@@ -119,7 +137,10 @@ impl UtttAgent for NetAgent {
 
     /// One forward pass and one readback for the whole batch.
     fn evaluate_batch(&mut self, states: &[BitState], out: &mut Evaluations) {
-        let logits = self.model.predict_logits(states, &self.device);
+        let logits = match &self.folded {
+            Some(folded) => predict_logits(folded, states, &self.device),
+            None => self.model.predict_logits(states, &self.device),
+        };
         Self::fill(states, &logits, out);
     }
 
@@ -127,7 +148,10 @@ impl UtttAgent for NetAgent {
     fn begin_batch(&mut self, states: &[BitState]) {
         assert!(self.in_flight.is_none(), "finish the previous batch first");
         if !states.is_empty() {
-            let logits = self.model.predict_logits_tensor(states, &self.device);
+            let logits = match &self.folded {
+                Some(folded) => predict_logits_tensor(folded, states, &self.device),
+                None => self.model.predict_logits_tensor(states, &self.device),
+            };
             self.in_flight = Some((logits, states.len()));
         }
     }
