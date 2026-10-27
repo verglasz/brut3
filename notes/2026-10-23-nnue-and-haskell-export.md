@@ -245,7 +245,18 @@ runs and prune passes and adds one per run.
   `--rows`, `--dense`, `--concat`, `--sum`, `--alias`); `--no-fixed-vec` keeps a
   hand-written module instead. Without `--model`, `export --out <dir> -- <flags>` writes
   FixedVec.hs for those shapes alone. The export prints the flags that make the same
-  module without a model, and `Net.hs` names them in its header.
+  module without a model, and `Net.hs` names them in its header. Generated code keeps every
+  pattern and construction on one line (an application whose elements are long
+  computations puts one element per line), with indices padded per role (`a00 .. a63`) so
+  that bindings line up.
+- Speed (the Haskell project's `2026-10-27-exporter-changes.md`): reductions (`dotN`,
+  `sumN`) are balanced trees, since GHC keeps `Float` associations as written;
+  `accumulateRows` is one `sum22_A` in the old fold's order (bit-identical); and the hidden
+  layers also come by columns over the nonzero inputs (`--sparse`, derived from the model):
+  `Net.hs` has `HiddenColumns`, `hiddenColumns` (transposed once at load) and
+  `sparseHiddenOf`, equal to `hiddenOf` up to rounding (SelfTest checks it, `bench` times
+  both). Medium net: 48-54 us per evaluation dense, 30-34 us sparse; the 32-wide hidden
+  layers of the small net gain nothing.
 - `Net.hs`: the `Net` record decoded from the arrays on first use (`net`), `foldRow`,
   `accumulateRows`, `hiddenOf`, `wdlOf`, `policyLogits`. Imports `Gen.FixedVec` and aliases
   `VecE`/`VecA`/`VecH`. Layout per the project's vector codegen notes
