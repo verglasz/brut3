@@ -507,11 +507,11 @@ fn main() -> ExitCode {
 }
 
 fn prune_book(args: &PruneArgs) -> Result<(), String> {
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::io::Write;
     use std::time::Instant;
     use ultimate_ttt_burn::agent::UtttAgent;
-    use ultimate_ttt_burn::book::{Book, agent_agrees};
+    use ultimate_ttt_burn::book::{self, Book, agent_agrees};
     use ultimate_ttt_burn::game::{BitState, Move};
     use ultimate_ttt_burn::selfplay::search_positions;
 
@@ -541,7 +541,18 @@ fn prune_book(args: &PruneArgs) -> Result<(), String> {
         .collect();
     let mut book = Book::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     let live_before = book.live_len();
-    let ply_of = |key: &str| key.bytes().take(Move::COUNT).filter(|&b| b != b'0').count();
+    if book.coalesced() > 0 {
+        println!(
+            "{} lines merged into others' entries (positions differing only inside decided boards)",
+            book.coalesced()
+        );
+    }
+    let plies: HashMap<String, usize> = book
+        .positions()
+        .into_iter()
+        .map(|(key, state)| (key, book::marks(&state)))
+        .collect();
+    let ply_of = |key: &str| plies[key];
     let deep = |key: &str| ply_of(key) >= args.from_ply;
 
     // Per ply: entries, live before, common, dropped as rare, dropped by the agent.
@@ -580,7 +591,7 @@ fn prune_book(args: &PruneArgs) -> Result<(), String> {
     if let Some(spec) = &spec {
         // Only the live entries off the common lines from --from-ply on are searched.
         let positions: Vec<_> = book
-            .positions()?
+            .positions()
             .into_iter()
             .filter(|(key, _)| {
                 deep(key) && !common.contains(key) && book.get(key).is_some_and(|e| !e.dropped)
@@ -707,6 +718,12 @@ fn book(
             .map_err(|e| format!("cannot read {}: {e}", out.display()))?;
         let book = Book::parse(&text).map_err(|e| format!("{}: {e}", out.display()))?;
         println!("extending {} ({} entries)", out.display(), book.len());
+        if book.coalesced() > 0 {
+            println!(
+                "  {} lines merged into others' entries (positions differing only inside decided boards)",
+                book.coalesced()
+            );
+        }
         let history: Vec<String> = text
             .lines()
             .map_while(|l| l.strip_prefix('#'))

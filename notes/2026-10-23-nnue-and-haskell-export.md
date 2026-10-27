@@ -151,11 +151,18 @@ re-runnable to deepen (`--plies 10`). Depth 8 ≈ 74k raw entries before symmetr
 
 **Canonical form**: of the 8 images of a position (the same square mapping applied to board
 and square coordinates and to the forced board; mappings in `game/symmetry.rs`), the one with
-the lexicographically smallest key, key = 81 cell digits by `board*9+square` (0 empty, 1 X,
-2 O) + forced board digit (9 = free). Entries store the move in that frame; lookup maps back
-through the inverse symmetry (the quarter turns are each other's inverses, the rest are
-self-inverse). Ties between symmetries are harmless (symmetric positions, equivalent moves).
-File lines: `KEY MOVE VALUE move:visits,...`. Agents use a book by ending their spec with
+the lexicographically smallest key. Key = per board nine characters by `board*9+square`: an
+open board's cell digits (0 empty, 1 X, 2 O), or nine times `3`/`4`/`5` for a board won by X,
+won by O or full; then the forced board digit (9 = free) and the side to move (0 X, 1 O).
+Positions that differ only inside decided boards play the same, so they share a key and an
+entry (the marks no longer tell whose turn it is, hence the last digit). Entries store the
+move in that frame; lookup maps back through the inverse symmetry (the quarter turns are each
+other's inverses, the rest are self-inverse). Ties between symmetries are harmless (symmetric
+positions, equivalent moves). File lines: `CELLS MOVE VALUE move:visits,...`, where `CELLS`
+is one position the key stands for (81 cell digits and the forced digit), the one searched;
+loading canonicalises every line, and of lines that share a key keeps the one with the most
+visits (files from before these keys load as they are; the 107,798-entry book had no such
+pair). Agents use a book by ending their spec with
 `book <file>` (`mcts`, `nn`, `mcts-nn`), e.g. `benchmark "mcts-nn models/m cuda 1000 16 book
 models/book.txt" "mcts-nn models/m cuda 1000 16"`: book moves are played instantly, in
 lockstep matches too, and the search starts at the first position outside the book.
@@ -174,8 +181,8 @@ settings from different plies, and the header gets a line per pass. A pass drops
   are left alone; only an agent pass can drop them;
 - with `--agent "<spec>"`, the entries whose move the agent (the engine's search at its
   play-time budget) plays anyway, counting moves equal up to the position's symmetries.
-  Positions are rebuilt from their keys, with a last move that sends play to the stored
-  forced board. `--min-advantage a` keeps entries where the book move leads the agent's
+  Positions are each entry's stored position, rebuilt with a last move that sends play to
+  the stored forced board. `--min-advantage a` keeps entries where the book move leads the agent's
   second-best by less than `a` of its visits or policy (each with its symmetric
   equivalents); `--keep-replies k` keeps the lines of replies of at least `k` each
   unsearched (at 0.05: 7,874 entries).
@@ -254,24 +261,27 @@ runs and prune passes and adds one per run.
   replays the references from their ids through `Net` and checks the deviations, and
   `bench n`, which times accumulator + MLP + value head + nine policy logits.
 - `Book.hs` (with `--book models/book.txt`, with or without a model): `bookEntries`, the
-  decoded canonical entries (25 bytes each: three little-endian `Word64` key words, then
-  the move index), `bookKey` and the eight `squarePermutations`. The engine should build
-  a balanced tree from `bookEntries` and compute keys from its own bitboards. Bytes go
-  through `Word8`, so `Decode.decodeBytes` may return `Int8` or `Word8`.
+  decoded canonical entries, `boardCode`, `bookKey cells forced toMove`,
+  `bookKeyOfBoards codes forced toMove` and the eight `squarePermutations`. An entry is 20
+  bytes: nine little-endian `Word16` board codes (an open board's digits as a base-3
+  number, square 0 most significant, 0..19682; 19683 won by X, 19684 won by O, 19685
+  full), `2 * forced + toMove`, the move index. A `BookKey` is three `Word64`s packing
+  three codes each in base 19686, the last times 20 plus `2 * forced + toMove`. The engine
+  should build a balanced tree from `bookEntries` and compute keys from its own bitboards.
+  Bytes go through `Word8`, so `Decode.decodeBytes` may return `Int8` or `Word8`.
 - `BookContent.hs`: only the data, `bookText`, the sorted byte stream in base64 literals.
 - Every exported item carries a one-line Haddock comment (`FixedVec.hs` excepted: it
   follows `gen/vecgen.py`). `Weights.hs` and `BookContent.hs` open their bodies with a
   DATA BLOB WARNING giving a rough size (from the data's shape), so readers skip them.
 - `BookTest.hs` (verification only): a reference `canonicalKey`/`lookupBook` by linear
   search, and `bookRefs`/`bookTest`: book positions under random symmetries plus a few
-  off-book ones, with the move Rust's `Book::lookup` gives. Key words: the 81 cell
-  digits as three base-3 numbers of 27 digits, most significant first, the last times ten
-  plus the forced digit, so word order is key-string order and "smallest image, first
-  symmetry on ties" means the same on both sides. The 14k-entry book is 354 KB of bytes
+  book positions with a decided board and a few off-book ones, with the move Rust's
+  `Book::lookup` gives. Word order is key-string order, so "smallest image, first symmetry
+  on ties" means the same on both sides. The 14k-entry book is 354 KB of bytes
   (8 literals), compiles in 3 s and passes its 44 lookups.
 
-Every module carries `{-# LANGUAGE Safe #-}`. The five that ship (`Weights`, `FixedVec`,
-`Net`, `Spec`, `Book`) mark the sections the Haskell project's bundler concatenates into the
+Every module carries `{-# LANGUAGE Safe #-}`. The six that ship (`Weights`, `FixedVec`,
+`Net`, `Spec`, `Book`, `BookContent`) mark the sections the Haskell project's bundler concatenates into the
 single contest file (its `notes/2026-10-26-exporter-changes.md`): `{- BUNDLE IMPORTS BEGIN -}`
 / `END` around the imports from base, `{- BUNDLE BODY BEGIN -}` / `END` around the top-level
 declarations, each body preceded by a comment listing the names it defines. Outside the

@@ -7,29 +7,40 @@
 //! every reply whose share of the search's visits is at least a threshold, once with us as X
 //! and once as O. Positions are stored under their canonical form over the eight board
 //! symmetries, with the moves in that frame; a lookup canonicalises the live position and
-//! maps the move back.
+//! maps the move back. A key does not hold a decided board's cells, only who won it (or that
+//! it is full): positions that differ only inside decided boards play the same, so they share
+//! an entry.
 //!
 //! Each entry keeps the search's root value and visit counts over the moves, not just the
 //! move, so that deepening the book later can extend the frontier from the file alone and
 //! re-choose moves from their children's values.
 //!
-//! File format: lines of `KEY MOVE VALUE VISITS`, where `KEY` is 81 cell digits by
-//! [`Move::index`] (0 empty, 1 X, 2 O) followed by the forced board's index (9 for a free
-//! choice), `MOVE` the chosen move's index, `VALUE` the root value for the side to move, and
-//! `VISITS` a comma-separated list of `move:count` over the moves, then `dropped` for an entry
-//! pruned from the shipped book. Lines starting with `#` are comments.
+//! File format: lines of `CELLS MOVE VALUE VISITS`, where `CELLS` is one position the entry
+//! stands for, as 81 cell digits by [`Move::index`] (0 empty, 1 X, 2 O) followed by the forced
+//! board's index (9 for a free choice), `MOVE` the chosen move's index, `VALUE` the root value
+//! for the side to move, and `VISITS` a comma-separated list of `move:count` over the moves,
+//! then `dropped` for an entry pruned from the shipped book. Moves are in the frame of
+//! `CELLS`. Lines starting with `#` are comments. Loading canonicalises every line, so a file
+//! with several lines for one key (from before keys ignored decided boards' cells) keeps the
+//! one with the most visits.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::agent::UtttAgent;
-use crate::game::{BitState, GameState, Move, Player, Position, Symmetry};
+use crate::game::{BitState, BoardStatus, GameState, Move, Player, Position, Square, Symmetry};
 use crate::mcts::{MctsConfig, SearchResult};
 use crate::selfplay::search_positions;
 
-/// A book position's key: 81 cell digits then the forced board digit.
+/// A book position's key: per board, nine characters in [`Move::index`] order, the cell
+/// digits of an open board (0 empty, 1 X, 2 O) or nine times `3` (won by X), `4` (won by O) or
+/// `5` (full) for a decided one; then the forced board digit (9 for a free choice) and the
+/// side to move (0 X, 1 O), which the marks no longer tell.
 pub type Key = String;
+
+/// Characters in a [`Key`].
+pub const KEY_LEN: usize = Move::COUNT + 2;
 
 /// What the search found from a position, in the position's canonical frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -59,26 +70,87 @@ impl Entry {
     }
 }
 
+impl Entry {
+    /// The entry with its moves mapped through `sym`.
+    fn mapped(self, sym: Symmetry) -> Self {
+        Entry {
+            best: sym.apply_move(self.best),
+            visits: self
+                .visits
+                .into_iter()
+                .map(|(mv, n)| (sym.apply_move(mv), n))
+                .collect(),
+            ..self
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Book {
     entries: HashMap<Key, Entry>,
+    /// For every entry, the position it was searched from (or read as), in the key's
+    /// canonical frame: one of the positions the key stands for, which the file stores.
+    positions: HashMap<Key, BitState>,
+    /// Lines of the loaded file that shared a key with another line.
+    coalesced: usize,
+}
+
+fn forced_digit(state: &BitState) -> char {
+    match state.forced_board() {
+        Some(b) => char::from(b'0' + b.index() as u8),
+        None => '9',
+    }
+}
+
+fn cell_digit(cell: Option<Player>) -> char {
+    match cell {
+        None => '0',
+        Some(Player::X) => '1',
+        Some(Player::O) => '2',
+    }
 }
 
 /// The key of `state` as it stands (no canonicalisation).
 pub fn key_of(state: &BitState) -> Key {
-    let mut key = String::with_capacity(82);
-    for i in 0..Move::COUNT {
-        key.push(match state.cell(Move::from_index(i)) {
-            None => '0',
-            Some(Player::X) => '1',
-            Some(Player::O) => '2',
-        });
+    let mut key = String::with_capacity(KEY_LEN);
+    for board in 0..9 {
+        let decided = match state.board_status(Square::from_index(board)) {
+            BoardStatus::Open => None,
+            BoardStatus::Won(Player::X) => Some('3'),
+            BoardStatus::Won(Player::O) => Some('4'),
+            BoardStatus::Full => Some('5'),
+        };
+        for square in 0..9 {
+            key.push(
+                decided.unwrap_or_else(|| {
+                    cell_digit(state.cell(Move::from_index(board * 9 + square)))
+                }),
+            );
+        }
     }
-    key.push(match state.forced_board() {
-        Some(b) => char::from(b'0' + b.index() as u8),
-        None => '9',
+    key.push(forced_digit(state));
+    key.push(match state.to_move() {
+        Player::X => '0',
+        Player::O => '1',
     });
     key
+}
+
+/// The position's cells and forced board as the file stores them: 81 cell digits by
+/// [`Move::index`] and the forced board digit.
+pub fn cells_of(state: &BitState) -> String {
+    let mut cells: String = (0..Move::COUNT)
+        .map(|i| cell_digit(state.cell(Move::from_index(i))))
+        .collect();
+    cells.push(forced_digit(state));
+    cells
+}
+
+/// Marks on the board: the position's ply.
+pub fn marks(state: &BitState) -> usize {
+    (0..Move::COUNT)
+        .filter(|&i| state.cell(Move::from_index(i)).is_some())
+        .count()
 }
 
 /// The canonical image of `state`: the symmetry (first in `Symmetry::ALL` on ties) whose
@@ -95,11 +167,11 @@ pub fn canonical(state: &BitState) -> (Symmetry, BitState, Key) {
     best.expect("eight symmetries")
 }
 
-/// The state a key describes, in the key's frame. A key holds no move history, so the last
-/// move is set to some mark of the side that just moved whose square sends play to the key's
-/// forced board (or to a decided board when the choice is free); the rules read nothing else
-/// of it.
-pub fn state_of_key(key: &str) -> Result<BitState, String> {
+/// The state that cells and a forced board (as [`cells_of`] writes them) describe. They hold
+/// no move history, so the last move is set to some mark of the side that just moved whose
+/// square sends play to the forced board (or to a decided board when the choice is free); the
+/// rules read nothing else of it.
+pub fn state_of_cells(key: &str) -> Result<BitState, String> {
     let digits = key.as_bytes();
     if digits.len() != Move::COUNT + 1 || !digits.iter().all(u8::is_ascii_digit) {
         return Err(format!("bad key {key:?}"));
@@ -143,7 +215,7 @@ pub fn state_of_key(key: &str) -> Result<BitState, String> {
         })?));
     }
     let state = BitState::from_position(&position);
-    if key_of(&state) != key {
+    if cells_of(&state) != key {
         return Err(format!("{key:?} is not a reachable position"));
     }
     Ok(state)
@@ -238,14 +310,31 @@ impl Book {
         self.entries.iter()
     }
 
-    /// Every entry's position (in the canonical frame) with its key, sorted by key, dropped
-    /// entries included.
-    pub fn positions(&self) -> Result<Vec<(Key, BitState)>, String> {
-        let mut keys: Vec<&Key> = self.entries.keys().collect();
-        keys.sort();
-        keys.into_iter()
-            .map(|key| Ok((key.clone(), state_of_key(key)?)))
-            .collect()
+    /// Every entry's position (in the canonical frame: the one searched, or the one the file
+    /// gave, of the positions its key stands for) with its key, sorted by key, dropped entries
+    /// included.
+    pub fn positions(&self) -> Vec<(Key, BitState)> {
+        let mut positions: Vec<(Key, BitState)> = self
+            .positions
+            .iter()
+            .map(|(key, state)| (key.clone(), *state))
+            .collect();
+        positions.sort_by(|a, b| a.0.cmp(&b.0));
+        positions
+    }
+
+    /// Lines of the loaded file that were merged into another line's entry, their positions
+    /// differing only inside decided boards.
+    pub fn coalesced(&self) -> usize {
+        self.coalesced
+    }
+
+    /// Stores `entry`, searched from `state` with its moves in `state`'s frame, under
+    /// `state`'s canonical key; returns the entry it replaces.
+    pub fn insert(&mut self, state: &BitState, entry: Entry) -> Option<Entry> {
+        let (sym, image, key) = canonical(state);
+        self.positions.insert(key.clone(), image);
+        self.entries.insert(key, entry.mapped(sym))
     }
 
     /// The entry stored under the canonical `key`.
@@ -346,8 +435,21 @@ impl Book {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let (key, entry) = parse_entry(line).map_err(|e| format!("line {}: {e}", i + 1))?;
-            book.entries.insert(key, entry);
+            let (cells, entry) = parse_entry(line).map_err(|e| format!("line {}: {e}", i + 1))?;
+            let state = state_of_cells(&cells).map_err(|e| format!("line {}: {e}", i + 1))?;
+            // Of several lines for one key, the deepest search stays (a live one on ties).
+            let rank = |e: &Entry| (e.total_visits(), !e.dropped);
+            match book.entries.get(&canonical(&state).2) {
+                Some(old) => {
+                    book.coalesced += 1;
+                    if rank(&entry) > rank(old) {
+                        book.insert(&state, entry);
+                    }
+                }
+                None => {
+                    book.insert(&state, entry);
+                }
+            }
         }
         Ok(book)
     }
@@ -362,7 +464,8 @@ impl Book {
         }
         for key in keys {
             let e = &self.entries[key];
-            let _ = write!(out, "{key} {} {:.4}", e.best.index(), e.value);
+            let cells = cells_of(&self.positions[key]);
+            let _ = write!(out, "{cells} {} {:.4}", e.best.index(), e.value);
             for (i, (mv, n)) in e.visits.iter().enumerate() {
                 out.push(if i == 0 { ' ' } else { ',' });
                 let _ = write!(out, "{}:{n}", mv.index());
@@ -455,13 +558,7 @@ impl Book {
             }
             let plies = frontier
                 .iter()
-                .map(|s| {
-                    key_of(s)
-                        .bytes()
-                        .take(Move::COUNT)
-                        .filter(|&b| b != b'0')
-                        .count()
-                })
+                .map(marks)
                 .fold((usize::MAX, 0), |(lo, hi), p| (lo.min(p), hi.max(p)));
             let before = frontier.len();
             // A dropped entry comes back from its stored search when that had at least the
@@ -498,7 +595,7 @@ impl Book {
                 });
                 for (state, result) in frontier.iter().zip(&results) {
                     if let Some(entry) = Entry::from_result(result) {
-                        match self.entries.insert(key_of(state), entry) {
+                        match self.insert(state, entry) {
                             Some(_) => done.researched += 1,
                             None => done.added += 1,
                         }
@@ -522,11 +619,12 @@ pub struct Extension {
     pub researched: usize,
 }
 
-fn parse_entry(line: &str) -> Result<(Key, Entry), String> {
+/// A line's cells (as [`cells_of`] writes them) and entry.
+fn parse_entry(line: &str) -> Result<(String, Entry), String> {
     let mut fields = line.split_whitespace();
     let key = fields.next().ok_or("empty line")?;
     if key.len() != Move::COUNT + 1 || !key.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!("bad key {key:?}"));
+        return Err(format!("bad cells {key:?}"));
     }
     let move_index = |s: &str| -> Result<Move, String> {
         let i: usize = s.parse().map_err(|_| format!("bad move {s:?}"))?;
@@ -604,7 +702,7 @@ mod tests {
     #[test]
     fn keys_and_canonical_forms() {
         let initial = BitState::initial();
-        assert_eq!(key_of(&initial), format!("{}9", "0".repeat(81)));
+        assert_eq!(key_of(&initial), format!("{}90", "0".repeat(81)));
         let (sym, image, key) = canonical(&initial);
         assert_eq!(sym, Symmetry::Identity);
         assert_eq!(image, initial);
@@ -622,9 +720,34 @@ mod tests {
             assert_eq!(img, image);
         }
         // The forced board is board 0's image under the canonical symmetry.
-        let forced: usize = key[81..].parse().unwrap();
+        let forced: usize = key[81..82].parse().unwrap();
         assert!(forced < 9);
         assert_eq!(image.forced_board(), Some(Square::from_index(forced)));
+        assert_eq!(&key[82..], "0", "X to move");
+    }
+
+    #[test]
+    fn keys_ignore_the_cells_of_decided_boards() {
+        // X won board 0 along its top row; O's two marks there sit on different squares. The
+        // last move, X's square 0, sends play to the won board: a free choice.
+        let rest = "0".repeat(72);
+        let a = state_of_cells(&format!("111220000{rest}9")).unwrap();
+        let b = state_of_cells(&format!("111200200{rest}9")).unwrap();
+        assert_ne!(cells_of(&a), cells_of(&b));
+        assert_eq!(key_of(&a), format!("{}{rest}91", "3".repeat(9)));
+        assert_eq!(key_of(&a), key_of(&b));
+        assert_eq!(canonical(&a).2, canonical(&b).2);
+
+        // A file holding both keeps the deeper search, under one entry.
+        let text = format!(
+            "{} 40 0.1 40:5\n{} 41 0.2 41:9\n",
+            cells_of(&a),
+            cells_of(&b)
+        );
+        let book = Book::parse(&text).unwrap();
+        assert_eq!((book.len(), book.coalesced()), (1, 1));
+        assert_eq!(book.best_move(&a), Some(Move::from_index(41)));
+        assert_eq!(book.best_move(&b), Some(Move::from_index(41)));
     }
 
     #[test]
@@ -634,7 +757,8 @@ mod tests {
             let mut s = BitState::initial();
             while !s.is_terminal() {
                 for state in [s, canonical(&s).1] {
-                    let back = state_of_key(&key_of(&state)).expect("reachable");
+                    let back = state_of_cells(&cells_of(&state)).expect("reachable");
+                    assert_eq!(cells_of(&back), cells_of(&state));
                     assert_eq!(key_of(&back), key_of(&state));
                     assert_eq!(back.to_move(), state.to_move());
                     assert_eq!(back.legal_moves_vec(), state.legal_moves_vec());
@@ -642,10 +766,10 @@ mod tests {
                 s.apply(agent.choose_move(&s));
             }
         }
-        assert!(state_of_key(&format!("{}9", "0".repeat(81))).is_ok());
-        assert!(state_of_key(&format!("{}4", "0".repeat(81))).is_err());
-        assert!(state_of_key(&format!("1{}9", "1".repeat(80))).is_err());
-        assert!(state_of_key("01").is_err());
+        assert!(state_of_cells(&format!("{}9", "0".repeat(81))).is_ok());
+        assert!(state_of_cells(&format!("{}4", "0".repeat(81))).is_err());
+        assert!(state_of_cells(&format!("1{}9", "1".repeat(80))).is_err());
+        assert!(state_of_cells("01").is_err());
     }
 
     #[test]
@@ -679,17 +803,12 @@ mod tests {
         // e (10%) or f (90%).
         let mut book = Book::default();
         let insert = |book: &mut Book, state: &BitState, best: Move, visits: &[(Move, u32)]| {
-            let (sym, _, key) = canonical(state);
-            let visits = visits
-                .iter()
-                .map(|&(m, n)| (sym.apply_move(m), n))
-                .collect();
-            book.entries.insert(
-                key,
+            book.insert(
+                state,
                 Entry {
-                    best: sym.apply_move(best),
+                    best,
                     value: 0.0,
-                    visits,
+                    visits: visits.to_vec(),
                     dropped: false,
                 },
             );
@@ -736,22 +855,16 @@ mod tests {
         let mut book = Book::default();
         let mut s = BitState::initial();
         s.apply(Move::new(sq(0, 1), sq(2, 0))); // X top-middle board, bottom-left square
-        let (sym, image, key) = canonical(&s);
         let reply = Move::new(sq(2, 0), sq(1, 1)); // O in the forced board's centre
-        let reply_c = sym.apply_move(reply);
-        book.entries.insert(
-            key,
+        book.insert(
+            &s,
             Entry {
-                best: reply_c,
+                best: reply,
                 value: -0.1,
-                visits: vec![
-                    (reply_c, 90),
-                    (sym.apply_move(Move::new(sq(2, 0), sq(0, 0))), 10),
-                ],
+                visits: vec![(reply, 90), (Move::new(sq(2, 0), sq(0, 0)), 10)],
                 dropped: false,
             },
         );
-        let _ = image;
         let found = book.lookup(&s).unwrap();
         assert_eq!(found.best, reply);
         assert_eq!(found.visits[0], (reply, 90));
@@ -766,9 +879,9 @@ mod tests {
     #[test]
     fn file_round_trip() {
         let mut book = Book::default();
-        let key = key_of(&BitState::initial());
-        book.entries.insert(
-            key.clone(),
+        let key = cells_of(&BitState::initial());
+        book.insert(
+            &BitState::initial(),
             Entry {
                 best: Move::from_index(40),
                 value: 0.0625,
@@ -783,6 +896,7 @@ mod tests {
         let back = Book::load(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(back.entries, book.entries);
+        assert_eq!(back.positions, book.positions);
         assert!(Book::parse("bad line").is_err());
         assert!(Book::parse(&format!("{key} 81 0.0")).is_err());
         assert!(Book::parse(&format!("{key} 40 0.0 40:1 dropped extra")).is_err());
@@ -797,13 +911,12 @@ mod tests {
         after.apply(centre);
         let mut book = Book::default();
         for (state, best) in [(root, centre), (after, reply)] {
-            let (sym, _, key) = canonical(&state);
-            book.entries.insert(
-                key,
+            book.insert(
+                &state,
                 Entry {
-                    best: sym.apply_move(best),
+                    best,
                     value: 0.0,
-                    visits: vec![(sym.apply_move(best), 10)],
+                    visits: vec![(best, 10)],
                     dropped: false,
                 },
             );
@@ -843,8 +956,8 @@ mod tests {
         let centre = Move::new(sq(1, 1), sq(1, 1));
         let corner = Move::new(sq(0, 0), sq(0, 0));
         let edge = Move::new(sq(0, 1), sq(0, 1));
-        book.entries.insert(
-            key_of(&BitState::initial()),
+        book.insert(
+            &BitState::initial(),
             Entry {
                 best: centre,
                 value: 0.1,
@@ -877,13 +990,12 @@ mod tests {
         );
         // An existing reply branch is still walked, and grows along its own main line.
         let reply = Move::new(sq(0, 0), sq(1, 1));
-        let (sym, _, key) = canonical(&after_corner);
-        book.entries.insert(
-            key,
+        book.insert(
+            &after_corner,
             Entry {
-                best: sym.apply_move(reply),
+                best: reply,
                 value: 0.0,
-                visits: vec![(sym.apply_move(reply), 9), (sym.apply_move(edge), 1)],
+                visits: vec![(reply, 9), (edge, 1)],
                 dropped: false,
             },
         );
@@ -946,9 +1058,10 @@ mod tests {
 
         // Dropped entries are frontier again, and come back from their stored search.
         let ply_one: Vec<Key> = book
-            .all_entries()
-            .filter(|(k, _)| k.bytes().take(Move::COUNT).filter(|&b| b != b'0').count() == 1)
-            .map(|(k, _)| k.clone())
+            .positions()
+            .into_iter()
+            .filter(|(_, s)| marks(s) == 1)
+            .map(|(k, _)| k)
             .collect();
         for key in &ply_one {
             book.drop_entry(key);
