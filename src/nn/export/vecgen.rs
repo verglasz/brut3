@@ -249,7 +249,7 @@ fn names(prefix: &str, n: usize) -> Vec<String> {
 }
 
 /// Lays `items` out on lines of at most `LINE` characters.
-fn wrap(items: &[String], indent: usize, first_indent: Option<usize>) -> Vec<String> {
+pub(super) fn wrap(items: &[String], indent: usize, first_indent: Option<usize>) -> Vec<String> {
     let mut lines = Vec::new();
     let mut cur = " ".repeat(first_indent.unwrap_or(indent));
     let body_indent = " ".repeat(indent);
@@ -736,11 +736,7 @@ impl<'a> Gen<'a> {
         let (sm, dt) = (f("sum"), f("dot"));
         self.push(format!("{sm} :: {t} -> {elem}"));
         let sums: Vec<String> = c.iter().map(|ci| format!("{} {ci}", g("sum"))).collect();
-        self.push(format!(
-            "{sm} ({t} {}) = {}",
-            c.join(" "),
-            sum_tree(&sums)
-        ));
+        self.push(format!("{sm} ({t} {}) = {}", c.join(" "), sum_tree(&sums)));
         self.push("");
         self.push(format!(
             "-- {dt} u v: the dot product, as the sum of the chunk dot products"

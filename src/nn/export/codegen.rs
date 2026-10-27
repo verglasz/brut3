@@ -18,10 +18,14 @@ use super::vecgen::VecSpec;
 use crate::game::LINES;
 use crate::nn::model::MOVES;
 use crate::nn::nnue::{
-    BOARDS, CELL_BASE, CELL_PAD, CELLS, CONTENT_ROWS, CONTENTS, DECIDED_BASE, FEATURE_ROWS,
-    FORCED_BASE, FULL, IDS_PER_BOARD, LINE_BASE, LINE_STATES, NO_FORCED, NnueConfig, OPEN_CONTENTS,
-    OPEN_MARKS_BASE, WON_BY_ME, WON_BY_THEM,
+    BOARDS, CELL_BASE, CELL_PAD, CELLS, CONTENT_ROWS, CONTENTS, DECIDED_BASE, FEATURE_IDS,
+    FEATURE_ROWS, FORCED_BASE, FULL, IDS_PER_BOARD, LINE_BASE, LINE_STATES, NO_FORCED, NnueConfig,
+    OPEN_CONTENTS, OPEN_MARKS_BASE, TOKENS, WON_BY_ME, WON_BY_THEM,
 };
+
+/// Inputs the accumulator sums: the bias, the folded rows of the board tokens and the feature
+/// rows.
+const ACC_INPUTS: usize = 1 + TOKENS + FEATURE_IDS;
 
 /// Width of a chunk of a wide vector, and of the fold's row pieces.
 pub const CHUNK: usize = 64;
@@ -104,6 +108,7 @@ pub fn vec_spec(names: &Names, prefix: &str) -> VecSpec {
     }
     spec.rows = names.selected();
     spec.dense = names.dense();
+    spec.sums = vec![(ACC_INPUTS, names.a)];
     spec.concats = vec![(names.pieces(), CHUNK)];
     spec
 }
@@ -542,11 +547,46 @@ data OpenClosed a = OpenClosed
         s,
         "accumulateRows :: Net -> [VecA] -> Int -> [Int] -> Int -> Int -> VecA"
     );
+    // One ACC_INPUTS-way sum, in the order of `foldl add` over bias, rows, features (so the
+    // result is the same to the bit as that fold's).
+    let rows = vars("r", TOKENS);
+    let lines = vars("l", LINES.len());
+    let mut terms = vec!["(netMixBias n)".to_string()];
+    terms.extend(rows.iter().cloned());
+    terms.push(format!(
+        "(sel{FORCED_FEATURES}_{a} forcedBoard (netForcedFeature n))"
+    ));
+    terms.extend(
+        lines
+            .iter()
+            .enumerate()
+            .map(|(l, code)| format!("(sel{LINE_STATES}_{a} {code} (netLineFeature{l} n))")),
+    );
+    terms.push(format!(
+        "(sel{DECIDED_FEATURES}_{a} decided (netDecidedFeature n))"
+    ));
+    terms.push(format!(
+        "(sel{MARKS_FEATURES}_{a} marks (netMarksFeature n))"
+    ));
+    assert_eq!(terms.len(), ACC_INPUTS, "accumulator inputs");
     let _ = writeln!(
         s,
-        "accumulateRows n rows forcedBoard lineCodes decided marks =\n\
-         \x20 let features = sel{FORCED_FEATURES}_{a} forcedBoard (netForcedFeature n) : zipWith (\\l code -> sel{LINE_STATES}_{a} code (lineFeature n l)) [0 ..] lineCodes ++ [sel{DECIDED_FEATURES}_{a} decided (netDecidedFeature n), sel{MARKS_FEATURES}_{a} marks (netMarksFeature n)]\n\
-         \x20  in relu{a} (foldl add{a} (netMixBias n) (rows ++ features))\n"
+        "accumulateRows n rows forcedBoard lineCodes decided marks = case (rows, lineCodes) of\n\
+         \x20 ([{}], [{}]) ->",
+        rows.join(", "),
+        lines.join(", ")
+    );
+    let mut items = vec![format!("relu{a}"), format!("(sum{ACC_INPUTS}_{a}")];
+    items.extend(terms);
+    let last = items.pop().expect("terms");
+    items.push(format!("{last})"));
+    for line in super::vecgen::wrap(&items, 6, Some(4)) {
+        let _ = writeln!(s, "{line}");
+    }
+    let _ = writeln!(
+        s,
+        "  _ -> error \"accumulateRows: not {TOKENS} rows and {} line codes\"\n",
+        LINES.len()
     );
     let _ = writeln!(s, "-- | The last hidden layer.");
     let _ = writeln!(s, "hiddenOf :: Net -> VecA -> VecH");
