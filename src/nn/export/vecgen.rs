@@ -385,23 +385,75 @@ impl Expr {
 /// `Float` additions, so the expression's shape is the dependency graph, and a tree of depth
 /// log2 n leaves the most additions independent (measured: 25% less time per multiply-add in
 /// a 64-wide dot than four strided partial sums).
-fn sum_tree(terms: &[String]) -> String {
-    let mut level: Vec<String> = terms.to_vec();
+fn sum_tree(terms: &[String]) -> Sum {
+    let mut level: Vec<Sum> = terms.iter().cloned().map(Sum::Term).collect();
     while level.len() > 1 {
-        level = level
-            .chunks(2)
-            .map(|pair| match pair {
-                [a, b] => format!("({a} + {b})"),
-                [a] => a.clone(),
-                _ => unreachable!("chunks of two"),
-            })
-            .collect();
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        let mut items = level.into_iter();
+        while let Some(a) = items.next() {
+            next.push(match items.next() {
+                Some(b) => Sum::Add(Box::new(a), Box::new(b)),
+                None => a,
+            });
+        }
+        level = next;
     }
-    level.pop().unwrap_or_else(|| "0".to_string())
+    level.pop().unwrap_or_else(|| Sum::Term("0".to_string()))
 }
 
-fn split_words(text: &str) -> Vec<String> {
-    text.split(' ').map(str::to_string).collect()
+/// Columns a sum's line may take before its tree splits.
+const SUM_LINE: usize = 100;
+
+/// A tree of additions, laid out along its own boundaries.
+enum Sum {
+    Term(String),
+    Add(Box<Sum>, Box<Sum>),
+}
+
+impl Sum {
+    fn inline(&self) -> String {
+        match self {
+            Sum::Term(t) => t.clone(),
+            Sum::Add(l, r) => format!("{} + {}", l.as_child(), r.as_child()),
+        }
+    }
+
+    fn as_child(&self) -> String {
+        match self {
+            Sum::Term(t) => t.clone(),
+            Sum::Add(..) => format!("({})", self.inline()),
+        }
+    }
+
+    /// The sum at `indent`: on one line if it fits in `SUM_LINE` columns, else its two
+    /// operands each on their own lines (the right one led by `+`), laid out the same way:
+    /// the two children of a node are both inline or both split, never half and half.
+    fn layout(&self, indent: usize) -> Vec<String> {
+        let flat = self.inline();
+        match self {
+            Sum::Add(l, r) if indent + flat.len() > SUM_LINE => {
+                let mut out = l.child_layout(indent);
+                let mut right = r.child_layout(indent + 2);
+                right[0].replace_range(indent..indent + 2, "+ ");
+                out.extend(right);
+                out
+            }
+            _ => vec![format!("{}{flat}", " ".repeat(indent))],
+        }
+    }
+
+    /// As an operand: a sum in parentheses, opened on its first line and closed on its last.
+    fn child_layout(&self, indent: usize) -> Vec<String> {
+        match self {
+            Sum::Term(t) => vec![format!("{}{t}", " ".repeat(indent))],
+            Sum::Add(..) => {
+                let mut lines = self.layout(indent + 1);
+                lines[0].replace_range(indent..indent + 1, "(");
+                lines.last_mut().expect("a line").push(')');
+                lines
+            }
+        }
+    }
 }
 
 fn ty_prefix(elem: &str) -> (&'static str, &'static str) {
@@ -592,7 +644,7 @@ impl<'a> Gen<'a> {
         self.push(format!("-- {sm} v: the sum of the coordinates of v"));
         self.push(format!("{sm} :: {t} -> {elem}"));
         self.line(&self.pattern_head(&format!("{sm} ({t}"), &a, ") ="), 0);
-        self.line(&split_words(&sum_tree(&a)), 2);
+        self.out.extend(sum_tree(&a).layout(2));
         if n >= 32 {
             self.push(format!("{{-# NOINLINE {sm} #-}}"));
         }
@@ -615,7 +667,7 @@ impl<'a> Gen<'a> {
             .zip(&b)
             .map(|(x, y)| format!("{x} * {y}"))
             .collect();
-        self.line(&split_words(&sum_tree(&products)), 6);
+        self.out.extend(sum_tree(&products).layout(6));
         self.push(format!("{{-# NOINLINE {dt} #-}}"));
         self.push("");
         if !int_vec && n <= 64 {
@@ -841,7 +893,8 @@ impl<'a> Gen<'a> {
         let (sm, dt) = (f("sum"), f("dot"));
         self.push(format!("{sm} :: {t} -> {elem}"));
         let sums: Vec<String> = c.iter().map(|ci| format!("{} {ci}", g("sum"))).collect();
-        self.push(format!("{sm} ({t} {}) = {}", c.join(" "), sum_tree(&sums)));
+        self.push(format!("{sm} ({t} {}) =", c.join(" ")));
+        self.out.extend(sum_tree(&sums).layout(2));
         self.push("");
         self.push(format!(
             "-- {dt} u v: the dot product, as the sum of the chunk dot products"
@@ -861,7 +914,7 @@ impl<'a> Gen<'a> {
             .zip(&d)
             .map(|(ci, di)| format!("{} {ci} {di}", g("dot")))
             .collect();
-        self.line(&split_words(&sum_tree(&dots)), 6);
+        self.out.extend(sum_tree(&dots).layout(6));
         self.push(format!("{{-# NOINLINE {dt} #-}}"));
         self.push("");
     }
