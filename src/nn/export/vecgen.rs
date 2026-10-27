@@ -1205,7 +1205,8 @@ impl<'a> Gen<'a> {
     }
 
     /// `gatherG_M x cols rest`: the `(x_j, column j)` pairs of the nonzero `x_j`, in order,
-    /// consed onto `rest`, each step strict so that only the list cells and pairs allocate.
+    /// consed onto `rest`, all strict (`rest` too, so a chain of gathers allocates no thunks):
+    /// only the list cells and pairs allocate.
     fn emit_gather(&mut self, g: usize, m: usize) {
         let fun = format!("gather{g}_{m}");
         let (a, k, r) = (names("a", g), names("k", g), names("r", g));
@@ -1215,7 +1216,7 @@ impl<'a> Gen<'a> {
         self.push(format!(
             "{fun} :: Vec{g} -> Cols{g}_{m} -> [(Float, Vec{m})] -> [(Float, Vec{m})]"
         ));
-        self.push(format!("{fun} !x !cols rest ="));
+        self.push(format!("{fun} !x !cols !rest ="));
         self.case_match(
             &["x", "cols"],
             &[
