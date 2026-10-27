@@ -317,6 +317,13 @@ const SHORT_CHILD: usize = 16;
 const WIDE_LINE: usize = 300;
 
 impl Expr {
+    /// A flat pattern or application given as words, `head c0 c1 ..` (no parentheses).
+    pub(super) fn words(text: &str) -> Self {
+        let mut words = text.split(' ').map(str::to_string);
+        let head = words.next().unwrap_or_default();
+        Expr::App(head, words.map(Expr::Atom).collect())
+    }
+
     /// `head c0 c1 ..` with atom children.
     pub(super) fn app(head: impl Into<String>, children: &[String]) -> Self {
         Expr::App(
@@ -519,11 +526,22 @@ impl<'a> Gen<'a> {
     /// against its pattern, one pattern per line however long (they read best whole); the
     /// body goes at indent `d + 4` (continuations `d + 6`). GHC never builds the tuple.
     fn case_match(&mut self, scruts: &[&str], pats: &[String], d: usize) {
+        let pats: Vec<Expr> = pats.iter().map(|p| Expr::words(p)).collect();
+        self.case_match_exprs(scruts, &pats, d);
+    }
+
+    /// [`Gen::case_match`] with the patterns as expressions: each laid out like a
+    /// construction (a nested pattern with long parts puts each part on its own line).
+    fn case_match_exprs(&mut self, scruts: &[&str], pats: &[Expr], d: usize) {
         self.push(format!("{}case ({}) of", " ".repeat(d), scruts.join(", ")));
         for (i, pat) in pats.iter().enumerate() {
-            let (indent, open) = if i == 0 { (d + 2, "( ") } else { (d + 4, "") };
+            let mut lines = pat.layout(d + 4);
+            if i == 0 {
+                lines[0].replace_range(d + 2..d + 4, "( ");
+            }
             let close = if i + 1 == pats.len() { " ) ->" } else { "," };
-            self.push(format!("{}{open}{pat}{close}", " ".repeat(indent)));
+            lines.last_mut().expect("a line").push_str(close);
+            self.out.extend(lines);
         }
     }
 
@@ -922,15 +940,15 @@ impl<'a> Gen<'a> {
     // ------------------------------------------------------------ matrices and layers
 
     /// Pattern binding the `n` coordinates of a Float `Vec{n}` to `vs` (nested aware).
-    fn pat(&self, n: usize, vs: &[String]) -> String {
+    fn pat(&self, n: usize, vs: &[String]) -> Expr {
         match self.chunks(n) {
-            None => format!("Vec{n} {}", vs.join(" ")),
-            Some((k, m)) => {
-                let parts: Vec<String> = (0..k)
-                    .map(|i| format!("({})", self.pat(m, &vs[i * m..(i + 1) * m])))
-                    .collect();
-                format!("Vec{n} {}", parts.join(" "))
-            }
+            None => Expr::app(format!("Vec{n}"), vs),
+            Some((k, m)) => Expr::App(
+                format!("Vec{n}"),
+                (0..k)
+                    .map(|i| self.pat(m, &vs[i * m..(i + 1) * m]))
+                    .collect(),
+            ),
         }
     }
 
@@ -1013,12 +1031,12 @@ impl<'a> Gen<'a> {
                 if kind == "residual" { "xin" } else { "x" }
             ));
             let mut scruts = vec!["rows", "bias"];
-            let mut pats = vec![format!("{r_ty} {}", r.join(" ")), self.pat(m, &bb)];
+            let mut pats = vec![Expr::app(r_ty.clone(), &r), self.pat(m, &bb)];
             if kind == "residual" {
                 scruts.push("xin");
                 pats.push(self.pat(m, &xx));
             }
-            self.case_match(&scruts, &pats, 2);
+            self.case_match_exprs(&scruts, &pats, 2);
             let bd = 6;
             let cells: Vec<String> = (0..m)
                 .map(|i| match kind {
@@ -1057,10 +1075,10 @@ impl<'a> Gen<'a> {
             .collect();
         let names: Vec<String> = (0..k).map(|i| format!("u{}", pad_index(i, k))).collect();
         let scruts: Vec<&str> = names.iter().map(String::as_str).collect();
-        let pats: Vec<String> = (0..k)
+        let pats: Vec<Expr> = (0..k)
             .map(|i| self.pat(n, &vs[i * n..(i + 1) * n]))
             .collect();
-        self.case_match(&scruts, &pats, 2);
+        self.case_match_exprs(&scruts, &pats, 2);
         let con = self.con(k * n, &vs);
         self.layout(&con, 6);
         self.push("");
