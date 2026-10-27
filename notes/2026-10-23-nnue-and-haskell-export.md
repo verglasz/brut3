@@ -275,7 +275,9 @@ runs and prune passes and adds one per run.
   derived order is the key-string order; 32 bytes on the heap with GHC 9.10 (as are three
   `Word64`s, or nine `Word16`s and a `Word8`: small strict fields are packed). The engine should
   build a balanced tree from `bookEntries` and compute board codes from its own bitboards.
-  Bytes go through `Word8`, so `Decode.decodeBytes` may return `Int8` or `Word8`.
+  `bookEntries` reads the stream with `Decode.decodeU16lePiecesWith` as ten `Word16` per
+  entry (the forced board and the move share the last one, low byte and high byte);
+  `bookKeyOfBoards :: [Word16] -> Word8 -> BookKey`.
 - `BookContent.hs`: only the data, `bookText`, the sorted byte stream in base64 literals.
 - Every exported item carries a one-line Haddock comment (`FixedVec.hs` excepted: it
   follows `gen/vecgen.py`). `Weights.hs` and `BookContent.hs` open their bodies with a

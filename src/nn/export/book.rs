@@ -191,13 +191,13 @@ pub fn book_modules(
         &format!("{prefix}.Book"),
         "(BookKey (..), bookKeyOfBoards, bookEntries, squarePermutations)",
     );
-    let _ = writeln!(s, "import Decode (decodeBytes)");
+    let _ = writeln!(s, "import Decode (decodeU16lePiecesWith)");
     let _ = writeln!(s, "import {prefix}.BookContent (bookText)");
     bundle_imports(
         &mut s,
         &[
-            "import Data.Bits ((.<<.), (.|.))",
-            "import Data.Word (Word32, Word8)",
+            "import Data.Bits ((.&.), (.<<.), (.>>.), (.|.))",
+            "import Data.Word (Word16, Word32, Word8)",
         ],
     );
     bundle_body_begin(
@@ -216,7 +216,7 @@ data BookKey = BookKey !Word32 !Word32 !Word32 !Word32 !Word32
   deriving (Eq, Ord, Show)
 
 -- | The key of nine board codes (by board) and the forced board.
-bookKeyOfBoards :: [Int] -> Int -> BookKey
+bookKeyOfBoards :: [Word16] -> Word8 -> BookKey
 bookKeyOfBoards codes forcedBoard = case map fromIntegral codes of
   [c0, c1, c2, c3, c4, c5, c6, c7, c8] ->
     BookKey (pair c0 c1) (pair c2 c3) (pair c4 c5) (pair c6 c7) (pair c8 (fromIntegral forcedBoard))
@@ -237,18 +237,17 @@ squarePermutations :: [[Int]]
     );
     s.push_str(
         r#"-- | Every entry (canonical key, best move index in the canonical frame), ascending by key.
+-- The stream is ten little-endian Word16 per entry: the nine board codes, then the forced
+-- board in the low byte and the move in the high byte.
 bookEntries :: [(BookKey, Int)]
-bookEntries = go (map (\b -> fromIntegral (fromIntegral b :: Word8)) (decodeBytes (concat bookText)))
+bookEntries = go (decodeU16lePiecesWith id bookText)
   where
-    -- the bytes as 0..255, whether decodeBytes gives Int8 or Word8
-    go :: [Int] -> [(BookKey, Int)]
     go [] = []
-    go bytes =
-      let (entry, rest) = splitAt 20 bytes
-          code i = entry !! (2 * i) + 256 * entry !! (2 * i + 1)
-       in if length entry == 20
-            then (bookKeyOfBoards (map code [0 .. 8]) (entry !! 18), entry !! 19) : go rest
-            else error "bookEntries: ragged book stream"
+    go ws = case splitAt 9 ws of
+      (codes, forcedAndMove : rest)
+        | length codes == 9 ->
+            (bookKeyOfBoards codes (fromIntegral (forcedAndMove .&. 0xFF)), fromIntegral (forcedAndMove .>>. 8)) : go rest
+      _ -> error "bookEntries: ragged book stream"
 "#,
     );
     bundle_body_end(&mut s);
@@ -314,7 +313,8 @@ boardCode cells
 -- | The key of 81 cells (by board * 9 + square, from the side to move's view) and the
 -- forced board.
 keyOfCells :: [Int] -> Int -> BookKey
-keyOfCells cells = bookKeyOfBoards [boardCode (take 9 (drop (9 * b) cells)) | b <- [0 .. 8]]
+keyOfCells cells forced =
+  bookKeyOfBoards [fromIntegral (boardCode (take 9 (drop (9 * b) cells))) | b <- [0 .. 8]] (fromIntegral forced)
 
 -- | The smallest key among the position's eight images, with the permutation that produced
 -- it (the first one on ties, as the book was built).
