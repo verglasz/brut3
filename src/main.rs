@@ -1121,6 +1121,10 @@ fn export(
     }
     if !report.vecgen.is_empty() {
         println!("FixedVec: {}", report.vecgen);
+        println!(
+            "  the same module without a model: export --vec-extra \"{}\"",
+            report.vec_flags
+        );
     }
     if let Some(stats) = &report.book {
         println!(

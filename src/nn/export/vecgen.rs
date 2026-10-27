@@ -155,6 +155,18 @@ impl VecSpec {
 
     /// The equivalent `gen/vecgen.py` command line.
     pub fn command(&self) -> String {
+        let flags = self.flags();
+        let flags = if flags.is_empty() {
+            String::new()
+        } else {
+            format!(" {flags}")
+        };
+        format!("python3 gen/vecgen.py{flags} --module {}", self.module)
+    }
+
+    /// The shape flags of [`VecSpec::command`], without the module: what `--vec-extra` takes
+    /// to make the same module on its own.
+    pub fn flags(&self) -> String {
         let nums = |s: &BTreeSet<usize>| {
             s.iter()
                 .map(|n| n.to_string())
@@ -167,7 +179,7 @@ impl VecSpec {
                 .collect::<Vec<_>>()
                 .join(",")
         };
-        let mut out = vec!["python3 gen/vecgen.py".to_string()];
+        let mut out = Vec::new();
         if !self.floats.is_empty() {
             out.push(format!("--float {}", nums(&self.floats)));
         }
@@ -203,7 +215,6 @@ impl VecSpec {
                 .collect();
             out.push(format!("--alias {}", aliases.join(",")));
         }
-        out.push(format!("--module {}", self.module));
         out.join(" ")
     }
 

@@ -243,7 +243,7 @@ runs and prune passes and adds one per run.
   them in vecgen flag syntax: `--vec-extra "--int32 512 --rows 9:128"`; `--no-fixed-vec`
   keeps a hand-generated module instead. Without `--model`, `export --vec-extra "..." --out
   <dir>` writes FixedVec.hs for the extra shapes alone. The export prints the equivalent
-  vecgen command.
+  vecgen command and the `--vec-extra` flags that make the same module without a model.
 - `Net.hs`: the `Net` record decoded from the arrays on first use (`net`), `foldRow`,
   `accumulateRows`, `hiddenOf`, `wdlOf`, `policyLogits`. Imports `Gen.FixedVec` and aliases
   `VecE`/`VecA`/`VecH`. Layout per the project's vector codegen notes

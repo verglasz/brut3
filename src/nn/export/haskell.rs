@@ -65,6 +65,8 @@ pub struct Report {
     pub chunks: usize,
     /// The `gen/vecgen.py` command that makes the `FixedVec` module the code needs.
     pub vecgen: String,
+    /// Its shape flags: the `--vec-extra` that makes the same module without a model.
+    pub vec_flags: String,
     /// Largest deviations of the dequantised weights from the exact ones over the reference
     /// positions: win/draw/loss probability, `p_win - p_loss`, legal-move probability.
     pub wdl_error: f32,
@@ -144,6 +146,7 @@ pub fn write_all(
     };
     if let Some(spec) = vec_spec {
         report.vecgen = spec.command();
+        report.vec_flags = spec.flags();
         if opts.fixed_vec {
             emit("FixedVec", spec.generate_bundled())?;
         }
