@@ -326,6 +326,30 @@ impl GameState for BitState {
         }
     }
 
+    /// Only a move that decides its own board can end the game, so every other move is
+    /// answered from that board's masks alone.
+    #[inline]
+    fn outcome_after(&self, mv: Move) -> Option<Outcome> {
+        debug_assert!(self.is_legal(mv), "illegal move {mv}");
+        let p = self.to_move.index();
+        let b = mv.board.index();
+        let bit = 1 << mv.square.index();
+        let big = if WIN[(self.marks[p][b] | bit) as usize] {
+            self.big[p] | 1 << b
+        } else if self.occupied(b) | bit == FULL {
+            self.big[p]
+        } else {
+            return None;
+        };
+        if WIN[big as usize] {
+            Some(Outcome::Win(self.to_move))
+        } else if self.done | 1 << b == FULL {
+            Some(Outcome::Draw)
+        } else {
+            None
+        }
+    }
+
     fn transform(&self, symmetry: Symmetry) -> Self {
         let mut out = Self {
             marks: [[0; 9]; 2],
@@ -441,6 +465,9 @@ mod tests {
                 }
                 for mv in &ref_moves {
                     assert!(bit_moves.contains(*mv) && bit.is_legal(*mv));
+                    let mut next = pos.clone();
+                    next.apply(*mv);
+                    assert_eq!(bit.outcome_after(*mv), next.outcome(), "{mv}\n{pos}");
                 }
                 let mv = ref_moves[rng.random_range(0..ref_moves.len())];
                 pos.apply(mv);

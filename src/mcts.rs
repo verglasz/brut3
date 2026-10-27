@@ -480,13 +480,11 @@ impl<S: GameState> SearchTree<S> {
                 Some(p) if !uniform => p[mv.index()].max(0.0) / total,
                 _ => 1.0 / n as f32,
             };
-            let mut child_state = state.clone();
-            child_state.apply(mv);
             self.edges.push(Edge {
                 mv,
                 prior,
                 child: NO_NODE,
-                terminal: child_state.outcome(),
+                terminal: state.outcome_after(mv),
             });
         }
 

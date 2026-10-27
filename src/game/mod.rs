@@ -354,6 +354,14 @@ pub trait GameState: Clone {
     /// `None` while the game is ongoing.
     fn outcome(&self) -> Option<Outcome>;
 
+    /// [`GameState::outcome`] after playing `mv`, without keeping the new position. `mv` must
+    /// be legal, so the game is not over yet.
+    fn outcome_after(&self, mv: Move) -> Option<Outcome> {
+        let mut next = self.clone();
+        next.apply(mv);
+        next.outcome()
+    }
+
     /// The same position seen through a symmetry of the board: every mark, the forced board
     /// and the move history move with it, the side to move and the outcome do not.
     fn transform(&self, symmetry: Symmetry) -> Self;
