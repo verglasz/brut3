@@ -246,9 +246,9 @@ runs and prune passes and adds one per run.
   hand-written module instead. Without `--model`, `export --out <dir> -- <flags>` writes
   FixedVec.hs for those shapes alone. The export prints the flags that make the same
   module without a model, and `Net.hs` names them in its header. Generated code keeps every
-  pattern and construction on one line (an application whose elements are long
-  computations puts one element per line), with indices padded per role (`a00 .. a63`) so
-  that bindings line up.
+  pattern on one line, and a construction too unless its children are long (over 30
+  characters, or over 16 on a line over 300): then each child gets its own line, laid out
+  the same way. Indices are padded per role (`a00 .. a63`) so that bindings line up.
 - Speed (the Haskell project's `2026-10-27-exporter-changes.md`): reductions (`dotN`,
   `sumN`) are balanced trees, since GHC keeps `Float` associations as written;
   `accumulateRows` is one `sum22_A` in the old fold's order (bit-identical); and the hidden

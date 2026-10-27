@@ -303,24 +303,82 @@ pub(super) fn line(items: &[String], indent: usize) -> String {
     format!("{}{}", " ".repeat(indent), items.join(" "))
 }
 
-/// Elements longer than this put an application's elements one per line.
-const LONG_ELEMENT: usize = 30;
+/// A generated expression, for layout: an atom, written as given, or an application whose
+/// children may go on lines of their own.
+pub(super) enum Expr {
+    Atom(String),
+    App(String, Vec<Expr>),
+}
 
-/// An application `head e1 e2 ..` (`items = [head, e1, ..]`) at `indent`: on one line, or,
-/// when an element is a long computation of its own, the head on its line and each element
-/// on its own line two deeper. An element is never broken across lines.
-pub(super) fn apply(items: &[String], indent: usize) -> Vec<String> {
-    let (head, elements) = items.split_first().expect("a head");
-    if elements.iter().all(|e| e.len() <= LONG_ELEMENT) {
-        return vec![line(items, indent)];
+/// A child longer than this always puts an application's children one per line.
+const LONG_CHILD: usize = 30;
+/// On a line longer than `WIDE_LINE`, a child longer than `SHORT_CHILD` already does.
+const SHORT_CHILD: usize = 16;
+const WIDE_LINE: usize = 300;
+
+impl Expr {
+    /// `head c0 c1 ..` with atom children.
+    pub(super) fn app(head: impl Into<String>, children: &[String]) -> Self {
+        Expr::App(
+            head.into(),
+            children.iter().cloned().map(Expr::Atom).collect(),
+        )
     }
-    let mut out = vec![format!("{}{head}", " ".repeat(indent))];
-    out.extend(
-        elements
+
+    /// The expression on one line.
+    fn inline(&self) -> String {
+        match self {
+            Expr::Atom(a) => a.clone(),
+            Expr::App(head, children) => {
+                let mut out = head.clone();
+                for c in children {
+                    out.push(' ');
+                    out.push_str(&c.as_child());
+                }
+                out
+            }
+        }
+    }
+
+    /// As a child: an application in parentheses.
+    fn as_child(&self) -> String {
+        match self {
+            Expr::Atom(a) => a.clone(),
+            Expr::App(..) => format!("({})", self.inline()),
+        }
+    }
+
+    /// The expression at `indent`: on one line unless its children are long (see
+    /// `LONG_CHILD`), then the head on its line and every child on its own two deeper, laid
+    /// out the same way. Nothing is ever broken inside an atom.
+    pub(super) fn layout(&self, indent: usize) -> Vec<String> {
+        let pad = " ".repeat(indent);
+        let flat = self.inline();
+        let Expr::App(head, children) = self else {
+            return vec![format!("{pad}{flat}")];
+        };
+        let longest = children
             .iter()
-            .map(|e| format!("{}{e}", " ".repeat(indent + 2))),
-    );
-    out
+            .map(|c| c.as_child().len())
+            .max()
+            .unwrap_or(0);
+        let split =
+            longest > LONG_CHILD || (indent + flat.len() > WIDE_LINE && longest > SHORT_CHILD);
+        if !split {
+            return vec![format!("{pad}{flat}")];
+        }
+        let mut out = vec![format!("{pad}{head}")];
+        for c in children {
+            let mut lines = c.layout(indent + 2);
+            if let Expr::App(..) = c {
+                // Parenthesised: open on the first line, close on the last.
+                lines[0].insert(indent + 2, '(');
+                lines.last_mut().expect("a line").push(')');
+            }
+            out.extend(lines);
+        }
+        out
+    }
 }
 
 /// Sums `terms` as a balanced tree, `((t0 + t1) + (t2 + t3)) + ..`: GHC never reassociates
@@ -392,8 +450,13 @@ impl<'a> Gen<'a> {
         self.out.push(line(items, indent));
     }
 
+    /// An application `items[0] items[1] ..` laid out by [`Expr::layout`].
     fn apply(&mut self, items: &[String], indent: usize) {
-        self.out.extend(apply(items, indent));
+        self.layout(&Expr::app(items[0].clone(), &items[1..]), indent);
+    }
+
+    fn layout(&mut self, e: &Expr, indent: usize) {
+        self.out.extend(e.layout(indent));
     }
 
     fn chunks(&self, n: usize) -> Option<(usize, usize)> {
@@ -819,21 +882,15 @@ impl<'a> Gen<'a> {
     }
 
     /// Construction of a Float `Vec{n}` from `n` coordinate expressions (nested aware).
-    fn con(&self, n: usize, es: &[String]) -> Vec<String> {
+    fn con(&self, n: usize, es: &[String]) -> Expr {
         match self.chunks(n) {
-            None => {
-                let mut toks = vec![format!("Vec{n}")];
-                toks.extend(es.iter().cloned());
-                toks
-            }
-            Some((k, m)) => {
-                let mut toks = vec![format!("Vec{n}")];
-                for i in 0..k {
-                    let inner = self.con(m, &es[i * m..(i + 1) * m]);
-                    toks.push(format!("({})", inner.join(" ")));
-                }
-                toks
-            }
+            None => Expr::app(format!("Vec{n}"), es),
+            Some((k, m)) => Expr::App(
+                format!("Vec{n}"),
+                (0..k)
+                    .map(|i| self.con(m, &es[i * m..(i + 1) * m]))
+                    .collect(),
+            ),
         }
     }
 
@@ -918,7 +975,7 @@ impl<'a> Gen<'a> {
                 })
                 .collect();
             let con = self.con(m, &cells);
-            self.apply(&con, bd);
+            self.layout(&con, bd);
             self.push(format!("{{-# NOINLINE {fun} #-}}"));
             self.push("");
         }
@@ -952,7 +1009,7 @@ impl<'a> Gen<'a> {
             .collect();
         self.case_match(&scruts, &pats, 2);
         let con = self.con(k * n, &vs);
-        self.apply(&con, 6);
+        self.layout(&con, 6);
         self.push("");
     }
 
@@ -1217,25 +1274,22 @@ impl<'a> Gen<'a> {
     /// columns over the nonzero inputs only.
     fn emit_sparse(&mut self, m: usize, n: usize, k: usize) {
         let (g, groups) = self.input_groups(n);
-        let gathers = |groups: Option<usize>| -> String {
-            match groups {
-                Some(c) => {
-                    let mut expr = "[]".to_string();
-                    for i in (0..c).rev() {
-                        let (xi, gi) = (
-                            format!("x{}", pad_index(i, c)),
-                            format!("g{}", pad_index(i, c)),
-                        );
-                        expr = if expr == "[]" {
-                            format!("gather{g}_{m} {xi} {gi} []")
-                        } else {
-                            format!("gather{g}_{m} {xi} {gi} ({expr})")
-                        };
+        // The gathered pairs of every input chunk, one gather per line.
+        let gathers: Vec<String> = match groups {
+            Some(c) => (0..c)
+                .map(|i| {
+                    let (xi, gi) = (
+                        format!("x{}", pad_index(i, c)),
+                        format!("g{}", pad_index(i, c)),
+                    );
+                    if i + 1 == c {
+                        format!("gather{g}_{m} {xi} {gi} []")
+                    } else {
+                        format!("gather{g}_{m} {xi} {gi} $")
                     }
-                    expr
-                }
-                None => format!("gather{n}_{m} x cols []"),
-            }
+                })
+                .collect(),
+            None => vec![format!("gather{n}_{m} x cols []")],
         };
         let mut kinds = vec![(
             format!("sparseDense{m}_{n}"),
@@ -1258,8 +1312,7 @@ impl<'a> Gen<'a> {
                 "{fun} :: Cols{n}_{m} -> Vec{m} -> Vec{n} -> Vec{m}"
             ));
             self.push(format!("{fun} !cols !bias !x ="));
-            let body = format!("relu{m} (addColumns{k}_{m} {start} ({}))", gathers(groups));
-            match groups {
+            let d = match groups {
                 Some(c) => {
                     self.case_match(
                         &["cols", "x"],
@@ -1269,10 +1322,18 @@ impl<'a> Gen<'a> {
                         ],
                         2,
                     );
-                    self.line(&split_words(&body), 6);
+                    6
                 }
-                None => self.line(&split_words(&body), 2),
+                None => 2,
+            };
+            let pad = " ".repeat(d);
+            self.push(format!("{pad}let pairs ="));
+            for gather in &gathers {
+                self.push(format!("{pad}      {gather}"));
             }
+            self.push(format!(
+                "{pad} in relu{m} (addColumns{k}_{m} {start} pairs)"
+            ));
             self.push("");
         }
     }

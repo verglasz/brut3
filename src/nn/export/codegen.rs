@@ -583,11 +583,9 @@ data OpenClosed a = OpenClosed
         rows.join(", "),
         lines.join(", ")
     );
-    let mut items = vec![format!("relu{a} (sum{ACC_INPUTS}_{a}")];
-    items.extend(terms);
-    let last = items.pop().expect("terms");
-    items.push(format!("{last})"));
-    for line in super::vecgen::apply(&items, 4) {
+    let sum = super::vecgen::Expr::app(format!("sum{ACC_INPUTS}_{a}"), &terms);
+    let acc = super::vecgen::Expr::App(format!("relu{a}"), vec![sum]);
+    for line in acc.layout(4) {
         let _ = writeln!(s, "{line}");
     }
     let _ = writeln!(
