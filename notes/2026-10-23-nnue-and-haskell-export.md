@@ -266,7 +266,7 @@ runs and prune passes and adds one per run.
   replays the references from their ids through `Net` and checks the deviations, and
   `bench n`, which times accumulator + MLP + value head + nine policy logits.
 - `Book.hs` (with `--book models/book.txt`, with or without a model): `bookEntries`, the
-  decoded canonical entries, `bookKeyOfBoards codes forced` and the eight
+  decoded canonical entries, `bookKeyOfBoards codes forced`, `type Symmetry = [Int]` and the eight
   `squarePermutations`. An entry is 20 bytes: nine little-endian `Word16` board codes (an
   open board's digits from the side to move's view as a base-3 number, square 0 most
   significant, 0..19682; 19683 won by the side to move, 19684 won by the opponent, 19685

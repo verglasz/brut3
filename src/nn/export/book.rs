@@ -189,7 +189,7 @@ pub fn book_modules(
     banner(
         &mut s,
         &format!("{prefix}.Book"),
-        "(BookKey (..), bookKeyOfBoards, bookEntries, squarePermutations)",
+        "(BookKey (..), Symmetry, bookKeyOfBoards, bookEntries, squarePermutations)",
     );
     let _ = writeln!(s, "import Decode (decodeU16lePiecesWith)");
     let _ = writeln!(s, "import {prefix}.BookContent (bookText)");
@@ -202,7 +202,7 @@ pub fn book_modules(
     );
     bundle_body_begin(
         &mut s,
-        "BookKey (constructor BookKey), bookKeyOfBoards, squarePermutations, bookEntries",
+        "BookKey (constructor BookKey), Symmetry, bookKeyOfBoards, squarePermutations, bookEntries",
     );
     s.push_str(
         r#"-- | A position's key, from the side to move's view: the nine boards' codes and the forced
@@ -226,9 +226,12 @@ bookKeyOfBoards codes forcedBoard = case map fromIntegral codes of
   where
     pair hi lo = hi .<<. 16 .|. lo
 
--- | Image of square i under each of the eight symmetries (identity first). A symmetry maps
--- the cell at (board b, square q) to (p !! b, p !! q) and the forced board b to p !! b.
-squarePermutations :: [[Int]]
+-- | One of the eight board symmetries, as the image of each square: p !! i for square i. It
+-- maps the cell at (board b, square q) to (p !! b, p !! q) and the forced board b to p !! b.
+type Symmetry = [Int]
+
+-- | The eight symmetries, identity first, in the order the book breaks ties between images in.
+squarePermutations :: [Symmetry]
 "#,
     );
     let perms = square_permutations();
@@ -297,7 +300,7 @@ bookEntries = go (decodeU16lePiecesWith id bookText)
     t.push_str(
         r#"-- | The cells of a position's image under a permutation: the image's cell at
 -- (p b, p q) is the position's cell at (b, q).
-permuteCells :: [Int] -> [Int] -> [Int]
+permuteCells :: Symmetry -> [Int] -> [Int]
 permuteCells p cells =
   let inv = [length (takeWhile (/= i) p) | i <- [0 .. 8]]
    in [cells !! ((inv !! b) * 9 + inv !! q) | b <- [0 .. 8], q <- [0 .. 8]]
@@ -320,7 +323,7 @@ keyOfCells cells forced =
 
 -- | The smallest key among the position's eight images, with the permutation that produced
 -- it (the first one on ties, as the book was built).
-canonicalKey :: [Int] -> Int -> (BookKey, [Int])
+canonicalKey :: [Int] -> Int -> (BookKey, Symmetry)
 canonicalKey cells forced =
   minimumBy (comparing fst)
     [ (keyOfCells (permuteCells p cells) (if forced == 9 then 9 else p !! forced), p)
