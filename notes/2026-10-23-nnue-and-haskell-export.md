@@ -213,7 +213,10 @@ runs and prune passes and adds one per run.
 - `Weights.hs`: `arrays :: [Array]`, one `Array name rows cols scale text` per weight array,
   int16-quantised with one scale per array, little-endian, base64 in string literals of
   64 KB (lines of 1024 characters joined by string gaps). Matrices are one row per output
-  (burn's `[d_in, d_out]` transposed), `W_mix` split into `mix0..mix8`.
+  (burn's `[d_in, d_out]` transposed), `W_mix` split into `mix0..mix8`. The per-content
+  tables are shipped in the parts the `Net` record holds them in: `content_open` (11093
+  rows), `content_decided` (3), `no_forced`, `cells` (27), `cell_pad`, and `local_open` /
+  `local_decided`, `send_open` / `send_decided`. Each part has its own scale.
 - The literal decoder is not generated: the Haskell project's hand-written `Decode` module
   (`lib/Decode.hs`, streaming one pass over the pieces) provides `decodeRowsWith`,
   `decodeFloats`, `decodeBytes`, `chunksOf`; `Net.hs` builds rows with `decodeRowsWith` and
@@ -238,8 +241,8 @@ runs and prune passes and adds one per run.
   The per-content tables (`netContent`, `netLocal`, `netSend`) are `OpenClosed` values: the
   open contents in raw-code order (`ocOpen`) and one entry each for full, won by the side to
   move and won by the opponent; the content array's other rows are `netNoForced`,
-  `netCells` (27, at `3 * cell + v`) and `netPad`. `splitOpenClosed` cuts the decoded
-  arrays with the counts of `Gen.Spec` and fails naming the array on any other length.
+  `netCells` (27, at `3 * cell + v`) and `netPad`. Each field decodes from its own array,
+  so the usual shape check of every array is the only length check.
 - `Reference.hs`: positions with cells, side to move, last move, forced board, raw codes,
   the input ids, accumulator, hidden layer, W/D/L logits and probabilities, and every legal
   move's logit and probability, as computed by the **int16-rounded** weights (so the port
@@ -279,8 +282,8 @@ Measured (GHC 9.10.3, `-O2 -XSafe`, one core), including `FixedVec`, on 2026-10-
 
 | model | params | int16 stream | quantisation error (wdl / policy) | compile | self-test | µs per eval after the fold |
 |---|---|---|---|---|---|---|
-| `nnue 64 128 32 2` | 0.99M | 2.0 MB, 59 literals | 1.8e-4 / 3.6e-4 | 6–7 s | max dev 6e-6 | 6 |
-| `nnue 64 512 128 4` | 1.59M | 3.2 MB, 84 literals | 2.8e-4 / 1.5e-3 | 13–17 s | max dev 1e-5 | 61–71 (noisy) |
+| `nnue 64 128 32 2` | 0.99M | 2.0 MB, 65 literals | 1.3e-4 / 2.7e-4 | 6–7 s | max dev 6e-6 | 6 |
+| `nnue 64 512 128 4` | 1.59M | 3.2 MB, 90 literals | 3.1e-4 / 1.5e-3 | 13–17 s | max dev 1e-5 | 61–71 (noisy) |
 
 The chunked layout (8 x `Vec64` for A 512) is what makes the medium net cheap to compile
 and fast to run: flat 512-wide functions were 60 s / 2.3 GB to compile and ~100 µs per

@@ -51,11 +51,24 @@ impl Weights {
             assert_eq!(a.name, expect, "array order");
             (a.rows, a.cols, f(&a))
         };
-        let mut matrix = |name: &str| {
-            let (rows, cols, data) = next(name);
-            Matrix::new(rows, cols, data)
+        // A table shipped in parts: the parts' rows stacked back together.
+        let mut stacked = |names: &[&str]| {
+            let parts: Vec<_> = names.iter().map(|&name| next(name)).collect();
+            let rows = parts.iter().map(|&(rows, _, _)| rows).sum();
+            Matrix::new(
+                rows,
+                parts[0].1,
+                parts.into_iter().flat_map(|p| p.2).collect(),
+            )
         };
-        let content = matrix("content");
+        let content = stacked(&[
+            "content_open",
+            "content_decided",
+            "no_forced",
+            "cells",
+            "cell_pad",
+        ]);
+        let mut matrix = |name: &str| stacked(&[name]);
         let mix: Vec<Matrix> = (0..self.mix.len())
             .map(|k| matrix(&format!("mix{k}")))
             .collect();
@@ -77,8 +90,8 @@ impl Weights {
             weight: matrix("policy"),
             bias: matrix("policy_bias").data,
         };
-        let local = matrix("local");
-        let send = matrix("send").data;
+        let local = stacked(&["local_open", "local_decided"]);
+        let send = stacked(&["send_open", "send_decided"]).data;
         assert!(arrays.next().is_none(), "every array mapped");
         Self {
             config: self.config.clone(),
@@ -189,9 +202,9 @@ mod tests {
             assert_eq!(a.bytes.len(), 2 * a.rows * a.cols, "{}", a.name);
             assert_eq!(decode(&base64(&a.bytes)), a.bytes, "{}", a.name);
         }
-        // The first array is the content table; its first row decodes to the weights.
+        // The first array is the open part of the content table; its first row decodes to the weights.
         let first = &arrays[0];
-        assert_eq!(first.name, "content");
+        assert_eq!(first.name, "content_open");
         for (i, w) in weights.content.row(0).iter().enumerate() {
             let q = i16::from_le_bytes([first.bytes[2 * i], first.bytes[2 * i + 1]]);
             assert!((q as f32 * first.scale - w).abs() <= first.scale / 2.0 + 1e-9);

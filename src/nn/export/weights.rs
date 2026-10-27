@@ -9,8 +9,10 @@ use burn::prelude::*;
 
 use crate::nn::model::MOVES;
 use crate::nn::nnue::{
-    BOARDS, CELLS, CONTENT_ROWS, CONTENTS, FEATURE_ROWS, IDS_PER_BOARD, Nnue, NnueConfig,
+    BOARDS, CELL_BASE, CELL_PAD, CELLS, CONTENT_ROWS, CONTENTS, FEATURE_ROWS, IDS_PER_BOARD,
+    NO_FORCED, Nnue, NnueConfig, OPEN_CONTENTS,
 };
+use std::ops::Range;
 
 /// A row-major matrix of `f32`.
 #[derive(Clone, Debug, PartialEq)]
@@ -173,6 +175,8 @@ impl Weights {
     }
 
     /// Every array in a fixed order: the matrices one row per output, the biases as one row.
+    /// The per-content tables are cut where the Haskell record cuts them: the open contents,
+    /// the three decided kinds, and for the content table also no-forced, cells and pad.
     pub fn arrays(&self) -> Vec<Array<'_>> {
         fn m<'a>(name: &str, m: &'a Matrix) -> Array<'a> {
             Array {
@@ -190,7 +194,22 @@ impl Weights {
                 data: v,
             }
         }
-        let mut out = vec![m("content", &self.content)];
+        fn part<'a>(name: &str, m: &'a Matrix, rows: Range<usize>) -> Array<'a> {
+            Array {
+                name: name.to_string(),
+                rows: rows.len(),
+                cols: m.cols,
+                data: &m.data[rows.start * m.cols..rows.end * m.cols],
+            }
+        }
+        let (open, decided) = (0..OPEN_CONTENTS, OPEN_CONTENTS..CONTENTS);
+        let mut out = vec![
+            part("content_open", &self.content, open.clone()),
+            part("content_decided", &self.content, decided.clone()),
+            part("no_forced", &self.content, NO_FORCED..NO_FORCED + 1),
+            part("cells", &self.content, CELL_BASE..CELL_PAD),
+            part("cell_pad", &self.content, CELL_PAD..CONTENT_ROWS),
+        ];
         for (k, w) in self.mix.iter().enumerate() {
             out.push(m(&format!("mix{k}"), w));
         }
@@ -206,13 +225,20 @@ impl Weights {
         out.push(m("skip", &self.skip));
         out.push(m("policy", &self.policy.weight));
         out.push(v("policy_bias", &self.policy.bias));
-        out.push(m("local", &self.local));
+        out.push(part("local_open", &self.local, open.clone()));
+        out.push(part("local_decided", &self.local, decided.clone()));
         // One value per content: a column, not a row.
         out.push(Array {
-            name: "send".into(),
-            rows: self.send.len(),
+            name: "send_open".into(),
+            rows: open.len(),
             cols: 1,
-            data: &self.send,
+            data: &self.send[open],
+        });
+        out.push(Array {
+            name: "send_decided".into(),
+            rows: decided.len(),
+            cols: 1,
+            data: &self.send[decided],
         });
         out
     }

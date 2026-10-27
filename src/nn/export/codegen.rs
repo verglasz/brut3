@@ -18,9 +18,9 @@ use super::vecgen::VecSpec;
 use crate::game::LINES;
 use crate::nn::model::MOVES;
 use crate::nn::nnue::{
-    BOARDS, CELL_BASE, CELL_PAD, CELLS, CONTENT_ROWS, CONTENTS, DECIDED_BASE, FEATURE_ROWS,
-    FORCED_BASE, FULL, IDS_PER_BOARD, LINE_BASE, LINE_STATES, NO_FORCED, NnueConfig, OPEN_CONTENTS,
-    OPEN_MARKS_BASE, WON_BY_ME, WON_BY_THEM,
+    BOARDS, CELL_BASE, CELL_PAD, CELLS, CONTENTS, DECIDED_BASE, FEATURE_ROWS, FORCED_BASE, FULL,
+    IDS_PER_BOARD, LINE_BASE, LINE_STATES, NO_FORCED, NnueConfig, OPEN_CONTENTS, OPEN_MARKS_BASE,
+    WON_BY_ME, WON_BY_THEM,
 };
 
 /// Width of a chunk of a wide vector, and of the fold's row pieces.
@@ -143,13 +143,12 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
     );
     let _ = writeln!(s, "import Decode (chunksOf, decodeFloats, decodeRowsWith)");
     let _ = writeln!(s, "import {prefix}.FixedVec");
-    let _ = writeln!(s, "import {prefix}.Spec (cellBase, cellPad, openContents)");
     let _ = writeln!(s, "import {prefix}.Weights (Array (..), arrays)");
     bundle_imports(&mut s, &[]);
     bundle_body_begin(
         &mut s,
         "VecE, VecA, VecH, FoldPiece, OpenClosed (ocOpen, ocFull, ocWonByUs, ocWonByThem), \
-         splitOpenClosed, Net (every field starts with net), net, genZeroChunk, genZero3, \
+         Net (every field starts with net), net, genZeroChunk, genZero3, \
          foldRow, lineFeature, accumulateRows, hiddenOf, wdlOf, policyLogits",
     );
     let _ = writeln!(s, "type VecE = {}", Names::vec(e));
@@ -171,13 +170,6 @@ data OpenClosed a = OpenClosed
   , ocWonByThem :: !a
   }}
   deriving (Functor)
-
--- | Splits a decoded per-content array into its table and whatever follows the table, failing
--- with the array's name if it is shorter than Gen.Spec says.
-splitOpenClosed :: String -> [a] -> (OpenClosed a, [a])
-splitOpenClosed name xs = case splitAt openContents xs of
-  (open, full : me : them : rest) -> (OpenClosed open full me them, rest)
-  _ -> error ("net: array " ++ name ++ " is shorter than Gen.Spec says")
 "#,
         last_open = OPEN_CONTENTS - 1
     );
@@ -312,9 +304,12 @@ splitOpenClosed name xs = case splitAt openContents xs of
     );
     let _ = writeln!(
         s,
-        "      table name xs = case splitOpenClosed name xs of\n\
-         \x20       (t, []) -> t\n\
-         \x20       _ -> error (\"net: array \" ++ name ++ \" is longer than Gen.Spec says\")"
+        "      table name open decided = case decided of\n\
+         \x20       [full, me, them] -> OpenClosed open full me them\n\
+         \x20       _ -> error (\"net: array \" ++ name ++ \"_decided is not 3 rows\")\n\
+         \x20     single name xs = case xs of\n\
+         \x20       [x] -> x\n\
+         \x20       _ -> error (\"net: array \" ++ name ++ \" is not 1 row\")"
     );
     let _ = writeln!(s, "      expected = {}", hs_strings(manifest_names));
     let _ = writeln!(s, "   in case arrays of");
@@ -361,21 +356,21 @@ splitOpenClosed name xs = case splitAt openContents xs of
         step += 1;
         i
     };
-    // The content array: the per-content table, then no-forced, the cell rows and the pad.
-    let _ = writeln!(
-        s,
-        "              (contentTable, contentRest) = splitOpenClosed \"content\" (rows {CONTENT_ROWS} {e} fromListRest{e} a{})\n\
-         \x20             (noForcedRow, cellRows, padRow) = case contentRest of\n\
-         \x20               noF : rest | (cells, [pad]) <- splitAt (cellPad - cellBase) rest -> (noF, cells, pad)\n\
-         \x20               _ -> error \"net: array content does not end in the no-forced, cell and pad rows of Gen.Spec\"",
-        next()
-    );
     let _ = writeln!(s, "           in Net");
+    // The content table in its parts: open, decided, no-forced, the cell rows and the pad.
+    let content_rows = |rows: usize, i: usize| format!("rows {rows} {e} fromListRest{e} a{i}");
     let mut inits = vec![
-        "netContent = contentTable".to_string(),
-        "netNoForced = noForcedRow".to_string(),
-        "netCells = cellRows".to_string(),
-        "netPad = padRow".to_string(),
+        format!(
+            "netContent = table \"content\" ({}) ({})",
+            content_rows(OPEN_CONTENTS, next()),
+            content_rows(CONTENTS - OPEN_CONTENTS, next())
+        ),
+        format!(
+            "netNoForced = single \"no_forced\" ({})",
+            content_rows(1, next())
+        ),
+        format!("netCells = {}", content_rows(CELL_PAD - CELL_BASE, next())),
+        format!("netPad = single \"cell_pad\" ({})", content_rows(1, next())),
     ];
     let mix_list: Vec<String> = (0..BOARDS)
         .map(|_| format!("pieces (rows {a} {e} fromListRest{e} a{})", next()))
@@ -428,12 +423,17 @@ splitOpenClosed name xs = case splitAt openContents xs of
         inits.push(format!("netPolicy{b} = policyTables !! {b}"));
         inits.push(format!("netPolicyBias{b} = policyBiases !! {b}"));
     }
+    let local_rows =
+        |rows: usize, i: usize| format!("rows {rows} {CELLS} fromListRest{CELLS} a{i}");
     inits.push(format!(
-        "netLocal = table \"local\" (rows {CONTENTS} {CELLS} fromListRest{CELLS} a{})",
-        next()
+        "netLocal = table \"local\" ({}) ({})",
+        local_rows(OPEN_CONTENTS, next()),
+        local_rows(CONTENTS - OPEN_CONTENTS, next())
     ));
     inits.push(format!(
-        "netSend = table \"send\" (floats {CONTENTS} 1 a{})",
+        "netSend = table \"send\" (floats {OPEN_CONTENTS} 1 a{}) (floats {} 1 a{})",
+        next(),
+        CONTENTS - OPEN_CONTENTS,
         next()
     ));
     assert_eq!(step, manifest_names.len(), "one decode per array");
