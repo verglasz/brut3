@@ -238,12 +238,13 @@ runs and prune passes and adds one per run.
   peak residency instead of 18).
 - `FixedVec.hs` (module `Gen.FixedVec`): the fixed-width vector family for exactly the
   shapes the model needs, from `export::vecgen`. Hand-written code that needs more shapes
-  passes them with `--vec-extra "--int32 512 --rows 9:128"` (the flags are listed in
-  `export --help`: `--float`, `--int32`, `--int16`, `--nest`, `--rows`, `--dense`,
-  `--concat`, `--sum`, `--alias`); `--no-fixed-vec` keeps a hand-written module instead.
-  Without `--model`, `export --vec-extra "..." --out <dir>` writes FixedVec.hs for the
-  extra shapes alone. The export prints the `--vec-extra` flags that make the same module
-  without a model, and `Net.hs` names them in its header.
+  passes them after `--`, `export ... -- --int32 512 --rows 9:128`, or as one string
+  among the other options, `--vec-extra "--int32 512 --rows 9:128"` (both may be given;
+  the flags are listed in `export --help`: `--float`, `--int32`, `--int16`, `--nest`,
+  `--rows`, `--dense`, `--concat`, `--sum`, `--alias`); `--no-fixed-vec` keeps a
+  hand-written module instead. Without `--model`, `export --out <dir> -- <flags>` writes
+  FixedVec.hs for those shapes alone. The export prints the flags that make the same
+  module without a model, and `Net.hs` names them in its header.
 - `Net.hs`: the `Net` record decoded from the arrays on first use (`net`), `foldRow`,
   `accumulateRows`, `hiddenOf`, `wdlOf`, `policyLogits`. Imports `Gen.FixedVec` and aliases
   `VecE`/`VecA`/`VecH`. Layout per the project's vector codegen notes

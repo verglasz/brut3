@@ -36,7 +36,7 @@ pub struct ExportOptions {
     pub chunk: usize,
     /// Reference book lookups to emit.
     pub lookups: usize,
-    /// Extra `FixedVec` shapes beyond the model's (the export's `--vec-extra` flags).
+    /// Extra `FixedVec` shapes beyond the model's (the export's FixedVec flags).
     pub vec_extra: Option<VecSpec>,
     /// Whether to write `<prefix>/FixedVec.hs` at all.
     pub fixed_vec: bool,
@@ -63,7 +63,7 @@ pub struct Report {
     /// Bytes of int16 weights and the number of base64 string literals holding them.
     pub stream_bytes: usize,
     pub chunks: usize,
-    /// The `FixedVec` module's shapes, if one was generated: the `--vec-extra` flags that make
+    /// The `FixedVec` module's shapes, if one was generated: the FixedVec flags that make
     /// the same module without a model.
     pub vec_flags: Option<String>,
     /// Largest deviations of the dequantised weights from the exact ones over the reference

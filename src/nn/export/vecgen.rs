@@ -1,5 +1,6 @@
 //! `FixedVec.hs`: the fixed-width vector family, for exactly the shapes the generated
-//! network needs plus the ones hand-written code asks for (`export --vec-extra`).
+//! network needs plus the ones hand-written code asks for (`export -- <flags>` or
+//! `--vec-extra "<flags>"`).
 //!
 //! A flat `VecN` is a strict record of `N` unpacked `Float` (or `Int32`/`Int16`). A nested
 //! `VecN` (`N = K x M`) is a strict record of `K` boxed `VecM` chunks whose helpers delegate
@@ -14,7 +15,7 @@ use super::haskell::{BODY_BEGIN, BODY_END, IMPORTS_BEGIN, IMPORTS_END};
 /// Soft line width for wrapped field lists.
 const LINE: usize = 92;
 
-/// What to generate, in the terms of the `--vec-extra` flags.
+/// What to generate, in the terms of the export's FixedVec flags.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct VecSpec {
     pub floats: BTreeSet<usize>,
@@ -43,7 +44,7 @@ impl VecSpec {
         }
     }
 
-    /// Parses the `--vec-extra` flags: `--float N..`, `--int32 N..`, `--int16 N..`,
+    /// Parses the export's FixedVec flags: `--float N..`, `--int32 N..`, `--int16 N..`,
     /// `--nest N=KxM,..`, `--rows M:N,..`, `--dense M:N,..`, `--concat K:N,..`, `--sum K:N,..`,
     /// `--alias NAME=N,..`, `--module NAME`.
     pub fn parse_args(words: &[&str]) -> Result<Self, String> {
@@ -51,7 +52,7 @@ impl VecSpec {
         let mut i = 0;
         let num = |w: &str| {
             w.parse::<usize>()
-                .map_err(|_| format!("--vec-extra: expected a number, got {w:?}"))
+                .map_err(|_| format!("FixedVec flags: expected a number, got {w:?}"))
         };
         let pairs = |w: &str| -> Result<Vec<(usize, usize)>, String> {
             w.split(',')
@@ -59,7 +60,7 @@ impl VecSpec {
                 .map(|p| {
                     let (a, b) = p
                         .split_once(':')
-                        .ok_or_else(|| format!("--vec-extra: expected M:N, got {p:?}"))?;
+                        .ok_or_else(|| format!("FixedVec flags: expected M:N, got {p:?}"))?;
                     Ok((num(a)?, num(b)?))
                 })
                 .collect()
@@ -70,7 +71,7 @@ impl VecSpec {
                 words
                     .get(i + 1)
                     .copied()
-                    .ok_or_else(|| format!("--vec-extra: {flag} needs a value"))
+                    .ok_or_else(|| format!("FixedVec flags: {flag} needs a value"))
             };
             match flag {
                 "--float" | "--int32" | "--int16" => {
@@ -85,22 +86,22 @@ impl VecSpec {
                         j += 1;
                     }
                     if j == i + 1 {
-                        return Err(format!("--vec-extra: {flag} needs at least one width"));
+                        return Err(format!("FixedVec flags: {flag} needs at least one width"));
                     }
                     i = j;
                     continue;
                 }
                 "--nest" => {
                     for part in value(i)?.split(',').filter(|p| !p.is_empty()) {
-                        let (n, km) = part
-                            .split_once('=')
-                            .ok_or_else(|| format!("--vec-extra: expected N=KxM, got {part:?}"))?;
-                        let (k, m) = km
-                            .split_once('x')
-                            .ok_or_else(|| format!("--vec-extra: expected N=KxM, got {part:?}"))?;
+                        let (n, km) = part.split_once('=').ok_or_else(|| {
+                            format!("FixedVec flags: expected N=KxM, got {part:?}")
+                        })?;
+                        let (k, m) = km.split_once('x').ok_or_else(|| {
+                            format!("FixedVec flags: expected N=KxM, got {part:?}")
+                        })?;
                         let (n, k, m) = (num(n)?, num(k)?, num(m)?);
                         if k * m != n {
-                            return Err(format!("--vec-extra: --nest {part}: {k}x{m} != {n}"));
+                            return Err(format!("FixedVec flags: --nest {part}: {k}x{m} != {n}"));
                         }
                         spec.nest.insert(n, (k, m));
                     }
@@ -111,14 +112,14 @@ impl VecSpec {
                 "--sum" => spec.sums.extend(pairs(value(i)?)?),
                 "--alias" => {
                     for part in value(i)?.split(',').filter(|p| !p.is_empty()) {
-                        let (name, w) = part
-                            .split_once('=')
-                            .ok_or_else(|| format!("--vec-extra: expected NAME=N, got {part:?}"))?;
+                        let (name, w) = part.split_once('=').ok_or_else(|| {
+                            format!("FixedVec flags: expected NAME=N, got {part:?}")
+                        })?;
                         spec.aliases.push((name.to_string(), num(w)?));
                     }
                 }
                 "--module" => spec.module = value(i)?.to_string(),
-                other => return Err(format!("--vec-extra: unknown flag {other:?}")),
+                other => return Err(format!("FixedVec flags: unknown flag {other:?}")),
             }
             i += 2;
         }
@@ -152,7 +153,7 @@ impl VecSpec {
         }
     }
 
-    /// The shapes as `--vec-extra` flags: what makes the same module on its own.
+    /// The shapes as the export's FixedVec flags: what makes the same module on its own.
     pub fn flags(&self) -> String {
         let nums = |s: &BTreeSet<usize>| {
             s.iter()

@@ -56,7 +56,7 @@ enum Command {
     #[cfg(feature = "nn")]
     Export {
         /// Model stem (`<stem>.bpk` + `<stem>.json`), an nnue model.
-        #[arg(long, required_unless_present_any = ["book", "vec_extra"])]
+        #[arg(long, required_unless_present_any = ["book", "vec_extra", "vec_flags"])]
         model: Option<std::path::PathBuf>,
         /// Opening book file (from `book`) to export as Gen/Book.hs.
         #[arg(long)]
@@ -79,9 +79,17 @@ enum Command {
         /// Reference book lookups to emit for the port's tests.
         #[arg(long, default_value_t = 40)]
         lookups: usize,
-        /// Extra FixedVec.hs shapes for hand-written code, on top of the model's, e.g.
-        /// `--vec-extra "--int32 512 --rows 9:128"`. Without --model, FixedVec.hs holds only
-        /// these. Widths that a flag needs get their vector type too. Flags:
+        /// The same flags as VEC_FLAGS (after `--`), as one quoted string, to give them among
+        /// the other options: `--vec-extra "--int32 512 --rows 9:128"`. Both may be given.
+        #[arg(long, allow_hyphen_values = true)]
+        vec_extra: Option<String>,
+        /// Do not write FixedVec.hs (keep a hand-generated one).
+        #[arg(long)]
+        no_fixed_vec: bool,
+        /// Extra FixedVec.hs shapes for hand-written code, on top of the model's, after `--`:
+        /// `export --model m --out lib -- --int32 512 --rows 9:128`. Without --model,
+        /// FixedVec.hs holds only these. Widths that a flag needs get their vector type too.
+        /// Flags:
         ///   --float N ..     VecN of Float: fromListN, fromListRestN, toListN, indexN,
         ///                    replicateN, mapN, combineN, addN, subN, sumN, dotN, scaleN,
         ///                    reluN, and for flat N <= 64 maskedMaxN, maskedExpN
@@ -98,11 +106,8 @@ enum Command {
         ///   --concat K:N,..  concatK_N: K vectors of width N into one of width K * N
         ///   --sum K:N,..     sumK_N: the componentwise sum of K vectors of width N
         ///   --alias NAME=N,.. type NAME = VecN
-        #[arg(long, allow_hyphen_values = true, verbatim_doc_comment)]
-        vec_extra: Option<String>,
-        /// Do not write FixedVec.hs (keep a hand-generated one).
-        #[arg(long)]
-        no_fixed_vec: bool,
+        #[arg(last = true, verbatim_doc_comment)]
+        vec_flags: Vec<String>,
     },
     /// Build or deepen an opening book by searching the positions of the first plies with a
     /// search agent, e.g. `book --search "mcts-nn models/big cuda 100000 16" --out models/book.txt`.
@@ -483,6 +488,7 @@ fn main() -> ExitCode {
             lookups,
             vec_extra,
             no_fixed_vec,
+            vec_flags,
         } => export(
             model.as_deref(),
             book.as_deref(),
@@ -492,7 +498,11 @@ fn main() -> ExitCode {
             positions,
             seed,
             lookups,
-            vec_extra.as_deref(),
+            vec_extra
+                .iter()
+                .flat_map(|s| s.split_whitespace().map(str::to_string))
+                .chain(vec_flags)
+                .collect(),
             !no_fixed_vec,
         ),
         #[cfg(feature = "nn")]
@@ -1060,7 +1070,7 @@ fn export(
     positions: usize,
     seed: u64,
     lookups: usize,
-    vec_extra: Option<&str>,
+    vec_flags: Vec<String>,
     fixed_vec: bool,
 ) -> Result<(), String> {
     use ultimate_ttt_burn::book::Book;
@@ -1105,11 +1115,13 @@ fn export(
         }
         None => None,
     };
-    let vec_extra = match vec_extra {
-        Some(flags) => Some(VecSpec::parse_args(
-            &flags.split_whitespace().collect::<Vec<_>>(),
-        )?),
-        None => None,
+    // --vec-extra's words, then the ones after `--`.
+    let vec_extra = if vec_flags.is_empty() {
+        None
+    } else {
+        Some(VecSpec::parse_args(
+            &vec_flags.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?)
     };
     let opts = ExportOptions {
         prefix: module,
@@ -1136,7 +1148,9 @@ fn export(
         );
     }
     if let Some(flags) = &report.vec_flags {
-        println!("FixedVec shapes (without a model: --vec-extra \"{flags}\")");
+        println!(
+            "FixedVec shapes (the same module without a model: export --out <dir> -- {flags})"
+        );
     }
     if let Some(stats) = &report.book {
         println!(

@@ -139,7 +139,7 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
     let _ = writeln!(
         s,
         "-- {prefix}.FixedVec is written by the same export; without a model, the same module is\n\
-         -- `export --vec-extra \"{}\"`.\n",
+         -- `export --out <dir> -- {}`.\n",
         vec_spec(names, prefix).flags()
     );
     let _ = writeln!(s, "import Decode (chunksOf, decodeFloats, decodeRowsWith)");
