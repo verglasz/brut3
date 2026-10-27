@@ -4,7 +4,6 @@
 //! every call is a plain match.
 
 use std::fmt;
-#[cfg(feature = "nn")]
 use std::path::PathBuf;
 
 use super::{Evaluation, Evaluations, GreedyAgent, MinimaxAgent, RandomAgent, UtttAgent};
