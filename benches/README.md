@@ -33,7 +33,7 @@ the same thing without saving it.
 | `game/copy + apply + outcome`, `game/outcome_after` | the result after a move, the long way and the bitboard shortcut that `expand` uses |
 | `game/transform` | one board symmetry (book and data augmentation) |
 | `rng/random_range` | drawing a move number |
-| `pick/iter().nth(k)` | turning that number into a move by walking the legal-move bits |
+| `pick/MoveSet::nth(k)` | turning that number into a move |
 | `agent/RandomAgent::choose_move` | the two above plus move generation: one playout step |
 | `eval/random playout` | one rollout to the end from a pool position |
 | `eval/heuristic::score` | the static evaluation used by the greedy and minimax agents |

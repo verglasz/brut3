@@ -258,6 +258,11 @@ pub trait MoveSet: Clone + IntoIterator<Item = Move> {
     fn remove(&mut self, mv: Move);
     fn iter(&self) -> impl Iterator<Item = Move> + '_;
 
+    /// The `k`-th move in [`MoveSet::iter`] order, if there are more than `k`.
+    fn nth(&self, k: usize) -> Option<Move> {
+        self.iter().nth(k)
+    }
+
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -302,6 +307,10 @@ impl MoveSet for MoveList {
 
     fn iter(&self) -> impl Iterator<Item = Move> + '_ {
         self.0.iter().copied()
+    }
+
+    fn nth(&self, k: usize) -> Option<Move> {
+        self.0.get(k).copied()
     }
 }
 

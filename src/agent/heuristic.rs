@@ -100,7 +100,7 @@ mod tests {
                 assert!((-1.0..=1.0).contains(&v));
                 let legal = s.legal_moves();
                 let k = rng.random_range(0..legal.len());
-                s.apply(legal.iter().nth(k).unwrap());
+                s.apply(legal.nth(k).unwrap());
             }
         }
     }

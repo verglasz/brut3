@@ -118,7 +118,7 @@ fn pools() -> Pools {
 
 fn random_move(s: &BitState, rng: &mut SmallRng) -> Move {
     let legal = s.legal_moves();
-    legal.iter().nth(rng.random_range(0..legal.len())).unwrap()
+    legal.nth(rng.random_range(0..legal.len())).unwrap()
 }
 
 /// A cheap, deterministic, position-dependent leaf value, so that the trees get some shape
@@ -212,10 +212,10 @@ fn main() {
             })
             .collect();
         h.bench(
-            &format!("pick/iter().nth(k) ({name})"),
+            &format!("pick/MoveSet::nth(k) ({name})"),
             1,
             &picks,
-            |(legal, k)| legal.iter().nth(*k).unwrap().index() as u64,
+            |(legal, k)| legal.nth(*k).unwrap().index() as u64,
         );
         let mut agent = RandomAgent::<BitState>::new(3);
         h.bench(

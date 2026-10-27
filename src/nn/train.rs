@@ -953,7 +953,7 @@ pub(crate) mod tests {
                     search_value: None,
                 });
                 let k = rng.random_range(0..legal.len());
-                state.apply(legal.iter().nth(k).unwrap());
+                state.apply(legal.nth(k).unwrap());
             }
         }
         data

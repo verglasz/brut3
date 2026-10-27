@@ -30,7 +30,7 @@ impl<S: GameState> UtttAgent for RandomAgent<S> {
         let legal = state.legal_moves();
         assert!(!legal.is_empty(), "choose_move called on a terminal state");
         let k = self.rng.random_range(0..legal.len());
-        legal.iter().nth(k).expect("k < len")
+        legal.nth(k).expect("k < len")
     }
 }
 

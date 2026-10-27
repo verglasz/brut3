@@ -50,6 +50,27 @@ const WIN: [bool; 512] = {
     table
 };
 
+/// `SQUARES[mask]`: the squares set in the 9-bit `mask` in increasing order, padded with zeros;
+/// entry `9` is how many there are.
+const SQUARES: [[u8; 10]; 512] = {
+    let mut table = [[0u8; 10]; 512];
+    let mut mask = 0usize;
+    while mask < 512 {
+        let mut n = 0;
+        let mut square = 0;
+        while square < 9 {
+            if mask >> square & 1 != 0 {
+                table[mask][n] = square as u8;
+                n += 1;
+            }
+            square += 1;
+        }
+        table[mask][9] = n as u8;
+        mask += 1;
+    }
+    table
+};
+
 /// A set of moves as one bit per [`Move::index`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct BitMoveSet(u128);
@@ -87,6 +108,29 @@ impl MoveSet for BitMoveSet {
 
     fn iter(&self) -> impl Iterator<Item = Move> + '_ {
         BitMoveIter(self.0)
+    }
+
+    /// Steps through the boards' 9-bit chunks from the first one holding a move (in a forced
+    /// position the only one), counting and selecting with [`SQUARES`].
+    #[inline]
+    fn nth(&self, mut k: usize) -> Option<Move> {
+        if self.0 == 0 {
+            return None;
+        }
+        let mut board = self.0.trailing_zeros() as usize / 9;
+        while board < 9 {
+            let row = &SQUARES[(self.0 >> (board * 9)) as usize & FULL as usize];
+            let n = row[9] as usize;
+            if k < n {
+                return Some(Move::new(
+                    Square::from_index(board),
+                    Square::from_index(row[k] as usize),
+                ));
+            }
+            k -= n;
+            board += 1;
+        }
+        None
     }
 }
 
@@ -469,6 +513,10 @@ mod tests {
                     next.apply(*mv);
                     assert_eq!(bit.outcome_after(*mv), next.outcome(), "{mv}\n{pos}");
                 }
+                // `ref_moves` is sorted, which is the bit set's iteration order.
+                for k in 0..=ref_moves.len() {
+                    assert_eq!(bit_moves.nth(k), ref_moves.get(k).copied(), "{k}\n{pos}");
+                }
                 let mv = ref_moves[rng.random_range(0..ref_moves.len())];
                 pos.apply(mv);
                 bit.apply(mv);
@@ -499,7 +547,7 @@ mod tests {
             while s.outcome().is_none() {
                 let legal = s.legal_moves();
                 let k = rng.random_range(0..legal.len());
-                s.apply(legal.iter().nth(k).unwrap());
+                s.apply(legal.nth(k).unwrap());
                 moves += 1;
             }
         }

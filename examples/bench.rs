@@ -42,7 +42,7 @@ fn main() {
             while s.outcome().is_none() {
                 let legal = s.legal_moves();
                 let k = rng.random_range(0..legal.len());
-                s.apply(legal.iter().nth(k).unwrap());
+                s.apply(legal.nth(k).unwrap());
                 moves += 1;
             }
         }
@@ -133,7 +133,7 @@ fn network_benchmarks() {
             positions.push(s);
             let legal = s.legal_moves();
             let k = rng.random_range(0..legal.len());
-            s.apply(legal.iter().nth(k).unwrap());
+            s.apply(legal.nth(k).unwrap());
         }
     }
     for (name, words) in [
