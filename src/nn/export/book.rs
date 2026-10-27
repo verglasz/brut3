@@ -268,7 +268,8 @@ bookEntries = go (map (\b -> fromIntegral (fromIntegral b :: Word8)) (decodeByte
     );
     let _ = writeln!(
         c,
-        "-- | {} entries of 25 bytes each (three little-endian Word64 then the move), base64.",
+        "-- | {} entries of {ENTRY_BYTES} bytes each, ascending by key, as one base64 text: the nine board\n\
+         -- codes of the key (little-endian Word16, see BookKey in Book), the forced board and the move.",
         entries.len()
     );
     let names: Vec<String> = (0..pieces.len()).map(|i| format!("book_{i}")).collect();
