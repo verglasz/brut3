@@ -151,21 +151,24 @@ re-runnable to deepen (`--plies 10`). Depth 8 ≈ 74k raw entries before symmetr
 
 **Canonical form**: of the 8 images of a position (the same square mapping applied to board
 and square coordinates and to the forced board; mappings in `game/symmetry.rs`), the one with
-the lexicographically smallest key. Key = per board nine characters by `board*9+square`: an
-open board's cell digits (0 empty, 1 X, 2 O), or nine times `3`/`4`/`5` for a board won by X,
-won by O or full; then the forced board digit (9 = free) and the side to move (0 X, 1 O).
-Positions that differ only inside decided boards play the same, so they share a key and an
-entry (the marks no longer tell whose turn it is, hence the last digit). Entries store the
-move in that frame; lookup maps back through the inverse symmetry (the quarter turns are each
-other's inverses, the rest are self-inverse). Ties between symmetries are harmless (symmetric
-positions, equivalent moves). File lines: `KEY MOVE VALUE move:visits,...`, moves in the
-key's frame. A key stands for one position (`state_of_key`): a won board as the winner's top
-row, a full one as `XOX OXX OXO`, and as last move (only its square counts: it sets the
-forced board) a fitting mark of the side that just moved, else any cell on the right square.
-Files from before these keys, with 82-digit positions in place of keys, still load: every
-line is canonicalised, and lines that share a key pool their searches (same moves: visits
-add up, the value is the visit-weighted mean, the best move the most visited; the
-107,798-entry book had no such pair). A position's ply is its depth in the book's walk. Agents use a book by ending their spec with
+the lexicographically smallest key. Key = per board nine characters by `board*9+square`,
+from the side to move's view: an open board's cell digits (0 empty, 1 the side to move's,
+2 the opponent's), or nine times `3`/`4`/`5` for a board won by the side to move, won by the
+opponent or full; then the forced board digit (9 = free). Positions that differ only inside
+decided boards, or only by swapping the colours along with the side to move, play the same,
+so they share a key and an entry. Entries store the move in that frame; lookup maps back
+through the inverse symmetry (the quarter turns are each other's inverses, the rest are
+self-inverse). Ties between symmetries are harmless (symmetric positions, equivalent moves).
+File: `#` header lines, the line `format 2`, then lines `KEY MOVE VALUE move:visits,...`,
+moves in the key's frame. A key stands for one position (`state_of_key`), with X to move: a
+won board as the winner's top row, a full one as `XOX OXX OXO`, and as last move (only its
+square counts: it sets the forced board) a fitting mark of O, else any cell on the right
+square. Files without the format line are older and still load: lines start with absolute
+cells and the forced board (82 digits) or, for a while, an absolute key and the side to move
+(83 digits). Every line is canonicalised, and lines that share a key pool their searches
+(same moves: visits add up, the value is the visit-weighted mean, the best move the most
+visited); the 107,798-entry book had 4 such lines. A position's ply is its depth in the
+book's walk. Agents use a book by ending their spec with
 `book <file>` (`mcts`, `nn`, `mcts-nn`), e.g. `benchmark "mcts-nn models/m cuda 1000 16 book
 models/book.txt" "mcts-nn models/m cuda 1000 16"`: book moves are played instantly, in
 lockstep matches too, and the search starts at the first position outside the book.
@@ -263,19 +266,19 @@ runs and prune passes and adds one per run.
   replays the references from their ids through `Net` and checks the deviations, and
   `bench n`, which times accumulator + MLP + value head + nine policy logits.
 - `Book.hs` (with `--book models/book.txt`, with or without a model): `bookEntries`, the
-  decoded canonical entries, `boardCode`, `bookKey cells forced toMove`,
-  `bookKeyOfBoards codes forced toMove` and the eight `squarePermutations`. An entry is 20
-  bytes: nine little-endian `Word16` board codes (an open board's digits as a base-3
-  number, square 0 most significant, 0..19682; 19683 won by X, 19684 won by O, 19685
-  full), `2 * forced + toMove`, the move index. A `BookKey` is three `Word64`s packing
-  three codes each in base 19686, the last times 20 plus `2 * forced + toMove`. The engine
-  should build a balanced tree from `bookEntries` and compute keys from its own bitboards.
+  decoded canonical entries, `bookKeyOfBoards codes forced` and the eight
+  `squarePermutations`. An entry is 20 bytes: nine little-endian `Word16` board codes (an
+  open board's digits from the side to move's view as a base-3 number, square 0 most
+  significant, 0..19682; 19683 won by the side to move, 19684 won by the opponent, 19685
+  full), the forced board, the move index. A `BookKey` is three `Word64`s packing three
+  codes each in base 19686, the last times 10 plus the forced board. The engine should
+  build a balanced tree from `bookEntries` and compute board codes from its own bitboards.
   Bytes go through `Word8`, so `Decode.decodeBytes` may return `Int8` or `Word8`.
 - `BookContent.hs`: only the data, `bookText`, the sorted byte stream in base64 literals.
 - Every exported item carries a one-line Haddock comment (`FixedVec.hs` excepted: it
   follows `gen/vecgen.py`). `Weights.hs` and `BookContent.hs` open their bodies with a
   DATA BLOB WARNING giving a rough size (from the data's shape), so readers skip them.
-- `BookTest.hs` (verification only): a reference `canonicalKey`/`lookupBook` by linear
+- `BookTest.hs` (verification only): the reference `boardCode`, `canonicalKey`/`lookupBook` by linear
   search, and `bookRefs`/`bookTest`: book positions under random symmetries plus a few
   book positions with a decided board and a few off-book ones, with the move Rust's
   `Book::lookup` gives. Word order is key-string order, so "smallest image, first symmetry

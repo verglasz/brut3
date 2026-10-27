@@ -15,13 +15,15 @@
 //! move, so that deepening the book later can extend the frontier from the file alone and
 //! re-choose moves from their children's values.
 //!
-//! File format: lines of `KEY MOVE VALUE VISITS`, where `KEY` is the canonical [`Key`],
-//! `MOVE` the chosen move's index, `VALUE` the root value for the side to move, and `VISITS` a
-//! comma-separated list of `move:count` over the moves, then `dropped` for an entry pruned
-//! from the shipped book. Lines starting with `#` are comments. Files from before keys left
-//! out decided boards' cells have 82-digit positions (81 cells and the forced board) in place
-//! of keys; loading canonicalises every line and pools the searches of lines that share a
-//! key: the positions have the same moves, so their visits add up.
+//! File format: comment lines starting with `#`, the line [`FORMAT_LINE`], then lines of
+//! `KEY MOVE VALUE VISITS`, where `KEY` is the canonical [`Key`], `MOVE` the chosen move's
+//! index, `VALUE` the root value for the side to move, and `VISITS` a comma-separated list of
+//! `move:count` over the moves, then `dropped` for an entry pruned from the shipped book.
+//! Files without the format line are older: their lines start with a position's absolute
+//! cells (81 digits, 1 X, 2 O) and forced board, or for a while with a key in absolute colours
+//! followed by the side to move (83 digits). Loading canonicalises every line and pools the
+//! searches of lines that share a key: the positions have the same moves, so their visits add
+//! up.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
@@ -32,14 +34,18 @@ use crate::game::{BitState, BoardStatus, GameState, Move, Player, Position, Squa
 use crate::mcts::{MctsConfig, SearchResult};
 use crate::selfplay::search_positions;
 
-/// A book position's key: per board, nine characters in [`Move::index`] order, the cell
-/// digits of an open board (0 empty, 1 X, 2 O) or nine times `3` (won by X), `4` (won by O) or
-/// `5` (full) for a decided one; then the forced board digit (9 for a free choice) and the
-/// side to move (0 X, 1 O), which the marks no longer tell.
+/// A book position's key, from the side to move's view: per board, nine characters in
+/// [`Move::index`] order, the cell digits of an open board (0 empty, 1 the side to move's,
+/// 2 the opponent's) or nine times `3` (won by the side to move), `4` (won by the opponent)
+/// or `5` (full) for a decided one; then the forced board digit (9 for a free choice). The
+/// rules treat both players alike, so a position and its colour-swapped twin share a key.
 pub type Key = String;
 
 /// Characters in a [`Key`].
-pub const KEY_LEN: usize = Move::COUNT + 2;
+pub const KEY_LEN: usize = Move::COUNT + 1;
+
+/// The line before the entries of a book file whose lines start with keys.
+pub const FORMAT_LINE: &str = "format 2";
 
 /// What the search found from a position, in the position's canonical frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -148,28 +154,52 @@ fn cell_digit(cell: Option<Player>) -> char {
 
 /// The key of `state` as it stands (no canonicalisation).
 pub fn key_of(state: &BitState) -> Key {
+    let me = state.to_move();
     let mut key = String::with_capacity(KEY_LEN);
     for board in 0..9 {
         let decided = match state.board_status(Square::from_index(board)) {
             BoardStatus::Open => None,
-            BoardStatus::Won(Player::X) => Some('3'),
-            BoardStatus::Won(Player::O) => Some('4'),
+            BoardStatus::Won(p) if p == me => Some('3'),
+            BoardStatus::Won(_) => Some('4'),
             BoardStatus::Full => Some('5'),
         };
         for square in 0..9 {
-            key.push(
-                decided.unwrap_or_else(|| {
-                    cell_digit(state.cell(Move::from_index(board * 9 + square)))
-                }),
-            );
+            key.push(decided.unwrap_or_else(|| {
+                match state.cell(Move::from_index(board * 9 + square)) {
+                    None => '0',
+                    Some(p) if p == me => '1',
+                    Some(_) => '2',
+                }
+            }));
         }
     }
     key.push(forced_digit(state));
-    key.push(match state.to_move() {
-        Player::X => '0',
-        Player::O => '1',
-    });
     key
+}
+
+/// A key as the book wrote it for a while: absolute digits (1 X, 2 O; 3 won by X, 4 won by
+/// O), then the side to move (0 X, 1 O). The same key from the side to move's view.
+fn key_of_absolute(key: &str) -> Result<Key, String> {
+    let (digits, to_move) = key.split_at(Move::COUNT + 1);
+    let swap = match to_move {
+        "0" => false,
+        "1" => true,
+        _ => return Err(format!("bad key {key:?}")),
+    };
+    Ok(digits
+        .chars()
+        .enumerate()
+        .map(|(i, c)| match c {
+            '1' | '2' | '3' | '4' if swap && i < Move::COUNT => {
+                char::from(if c == '1' || c == '3' {
+                    c as u8 + 1
+                } else {
+                    c as u8 - 1
+                })
+            }
+            c => c,
+        })
+        .collect())
 }
 
 /// The position's cells and forced board as the file stores them: 81 cell digits by
@@ -218,21 +248,17 @@ fn decided_cells(status: BoardStatus) -> [Option<Player>; 9] {
     }
 }
 
-/// The position a key stands for, in the key's frame: the open boards as the key gives them,
-/// each decided board as [`decided_cells`], and as the last move (whose square is all the
-/// rules read of it: it sets the forced board) the first mark of the side that just moved
-/// that sends play to the key's forced board, or to a decided board when the choice is free,
-/// else the first cell that does.
+/// The position a key stands for, in the key's frame, with X to move: the open boards as
+/// the key gives them, each decided board as [`decided_cells`], and as the last move (whose
+/// square is all the rules read of it: it sets the forced board) the first mark of O that
+/// sends play to the key's forced board, or to a decided board when the choice is free, else
+/// the first cell that does.
 pub fn state_of_key(key: &str) -> Result<BitState, String> {
     let digits = key.as_bytes();
     if digits.len() != KEY_LEN || !digits.iter().all(u8::is_ascii_digit) {
         return Err(format!("bad key {key:?}"));
     }
-    let to_move = match digits[KEY_LEN - 1] {
-        b'0' => Player::X,
-        b'1' => Player::O,
-        _ => return Err(format!("{key:?}: bad side to move")),
-    };
+    let to_move = Player::X;
     let mut position = Position::initial();
     let mut status = [BoardStatus::Open; 9];
     for (board, s) in status.iter_mut().enumerate() {
@@ -590,17 +616,31 @@ impl Book {
         Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
     }
 
+    /// Reads a book file (see the module documentation for the formats).
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut book = Book::default();
+        // Whether the lines start with keys: after the format line.
+        let mut keys = false;
+        let mut lines = 0usize;
         for (i, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            if line == FORMAT_LINE {
+                if lines > 0 {
+                    return Err(format!("line {}: format line after entries", i + 1));
+                }
+                keys = true;
+                continue;
+            }
+            lines += 1;
             let (position, entry) =
                 parse_entry(line).map_err(|e| format!("line {}: {e}", i + 1))?;
-            let state = if position.len() == KEY_LEN {
+            let state = if keys {
                 state_of_key(&position)
+            } else if position.len() == Move::COUNT + 2 {
+                key_of_absolute(&position).and_then(|key| state_of_key(&key))
             } else {
                 state_of_cells(&position)
             }
@@ -628,6 +668,7 @@ impl Book {
         for line in header {
             let _ = writeln!(out, "# {line}");
         }
+        let _ = writeln!(out, "{FORMAT_LINE}");
         for key in keys {
             let e = &self.entries[key];
             let _ = write!(out, "{key} {} {:.4}", e.best.index(), e.value);
@@ -786,11 +827,12 @@ pub struct Extension {
     pub researched: usize,
 }
 
-/// A line's key (or, in old files, cells as [`cells_of`] writes them) and entry.
+/// A line's first field (a key, or in older files a position: see [`Book::parse`]) and
+/// entry.
 fn parse_entry(line: &str) -> Result<(String, Entry), String> {
     let mut fields = line.split_whitespace();
     let key = fields.next().ok_or("empty line")?;
-    if ![KEY_LEN, Move::COUNT + 1].contains(&key.len()) || !key.bytes().all(|b| b.is_ascii_digit())
+    if ![KEY_LEN, Move::COUNT + 2].contains(&key.len()) || !key.bytes().all(|b| b.is_ascii_digit())
     {
         return Err(format!("bad key {key:?}"));
     }
@@ -870,7 +912,7 @@ mod tests {
     #[test]
     fn keys_and_canonical_forms() {
         let initial = BitState::initial();
-        assert_eq!(key_of(&initial), format!("{}90", "0".repeat(81)));
+        assert_eq!(key_of(&initial), format!("{}9", "0".repeat(81)));
         let (sym, image, key) = canonical(&initial);
         assert_eq!(sym, Symmetry::Identity);
         assert_eq!(image, initial);
@@ -891,7 +933,6 @@ mod tests {
         let forced: usize = key[81..82].parse().unwrap();
         assert!(forced < 9);
         assert_eq!(image.forced_board(), Some(Square::from_index(forced)));
-        assert_eq!(&key[82..], "0", "X to move");
     }
 
     #[test]
@@ -902,9 +943,14 @@ mod tests {
         let a = state_of_cells(&format!("111220000{rest}9")).unwrap();
         let b = state_of_cells(&format!("111200200{rest}9")).unwrap();
         assert_ne!(cells_of(&a), cells_of(&b));
-        assert_eq!(key_of(&a), format!("{}{rest}91", "3".repeat(9)));
+        // O to move: board 0 is won by the opponent.
+        assert_eq!(key_of(&a), format!("{}{rest}9", "4".repeat(9)));
         assert_eq!(key_of(&a), key_of(&b));
         assert_eq!(canonical(&a).2, canonical(&b).2);
+        // The colour-swapped twin, X to move with O's line on board 0, shares the key.
+        let twin = state_of_cells(&format!("222110100{rest}9")).unwrap();
+        assert_eq!(twin.to_move(), Player::X);
+        assert_eq!(key_of(&twin), key_of(&a));
 
         // A file holding both pools their searches under one entry.
         let text = format!(
@@ -929,10 +975,10 @@ mod tests {
         assert_eq!(entry.best, Move::from_index(41), "most visits once pooled");
         assert!((entry.value - (0.1 * 8.0 + 0.2 * 6.0) / 14.0).abs() < 1e-6);
         assert_eq!(book.live_len(), 1, "live if either line was");
-        // The position the key stands for: X's top row on the won board, which the canonical
-        // frame puts last.
+        // The position the key stands for, with X to move: O's top row on the won board, which
+        // the canonical frame puts last.
         let (key, state) = &book.positions()[0];
-        assert_eq!(cells_of(state), format!("{rest}1110000009"));
+        assert_eq!(cells_of(state), format!("{rest}2220000009"));
         assert_eq!(*key, key_of(state));
         // Saved, the line holds the key.
         let path = std::env::temp_dir().join(format!("uttt-pool-{}.txt", std::process::id()));
@@ -940,7 +986,10 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let best = book.get(key).unwrap().best.index();
-        assert!(text.starts_with(&format!("{key} {best} ")), "{text}");
+        assert!(
+            text.starts_with(&format!("{FORMAT_LINE}\n{key} {best} ")),
+            "{text}"
+        );
         let back = Book::parse(&text).unwrap();
         let (saved, read) = (book.get(key).unwrap(), back.get(key).unwrap());
         assert_eq!((&read.best, &read.visits), (&saved.best, &saved.visits));
@@ -960,7 +1009,7 @@ mod tests {
                     // From the key alone: the same key, side to move and moves.
                     let made = state_of_key(&key_of(&state)).expect("a key's position");
                     assert_eq!(key_of(&made), key_of(&state));
-                    assert_eq!(made.to_move(), state.to_move());
+                    assert_eq!(made.to_move(), Player::X);
                     assert_eq!(made.legal_moves_vec(), state.legal_moves_vec());
                     assert_eq!(back.to_move(), state.to_move());
                     assert_eq!(back.legal_moves_vec(), state.legal_moves_vec());
@@ -973,15 +1022,15 @@ mod tests {
         assert!(state_of_cells(&format!("1{}9", "1".repeat(80))).is_err());
         assert!(state_of_cells("01").is_err());
         assert_eq!(
-            state_of_key(&format!("{}90", "0".repeat(81))),
+            state_of_key(&format!("{}9", "0".repeat(81))),
             Ok(BitState::initial())
         );
-        assert!(state_of_key(&format!("{}40", "0".repeat(81))).is_err());
+        assert!(state_of_key(&format!("{}4", "0".repeat(81))).is_err());
         assert!(
-            state_of_key(&format!("1{}91", "0".repeat(80))).is_err(),
+            state_of_key(&format!("1{}9", "0".repeat(80))).is_err(),
             "free, nothing decided"
         );
-        assert!(state_of_key(&format!("{}{}91", "3".repeat(8), "0".repeat(73))).is_err());
+        assert!(state_of_key(&format!("{}{}9", "3".repeat(8), "0".repeat(73))).is_err());
     }
 
     #[test]
@@ -1148,7 +1197,12 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let back = Book::load(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert!(text.lines().next().unwrap().ends_with(" dropped"), "{text}");
+        assert_eq!(text.lines().next(), Some(FORMAT_LINE));
+        assert!(text.lines().nth(1).unwrap().ends_with(" dropped"), "{text}");
+        // Keys only count as keys after the format line: without it, the root's key reads
+        // as the old format's cells, and the other line's (O to move, so its digits are
+        // colour-swapped) does not.
+        assert!(Book::parse(text.strip_prefix(FORMAT_LINE).unwrap()).is_err());
         assert_eq!(back.entries, book.entries);
     }
 

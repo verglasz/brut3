@@ -2,13 +2,13 @@
 //! its decoding and the square permutations of the eight symmetries (`Book.hs`), and
 //! reference lookups that pin down the canonicalisation (`BookTest.hs`).
 //!
-//! A book key ([`crate::book::Key`]) becomes nine board codes, an open board's nine digits
-//! (0 empty, 1 X, 2 O) as a base-3 number with square 0 most significant (0..19682) or 19683,
-//! 19684, 19685 for a board won by X, won by O or full, plus the forced board (9 = free) and
-//! the side to move (0 X, 1 O). In Haskell a key is three `Word64`s, each packing three codes
-//! in base 19686, the last one times 20 plus `2 * forced + toMove`. Comparing the words in
-//! order is the same as comparing the key strings, so "the smallest image" means the same
-//! thing on both sides.
+//! A book key ([`crate::book::Key`], from the side to move's view) becomes nine board codes,
+//! an open board's nine digits (0 empty, 1 the side to move's, 2 the opponent's) as a base-3
+//! number with square 0 most significant (0..19682) or 19683, 19684, 19685 for a board won by
+//! the side to move, won by the opponent or full, plus the forced board (9 = free). In
+//! Haskell a key is three `Word64`s, each packing three codes in base 19686, the last one
+//! times ten plus the forced board. Comparing the words in order is the same as comparing the
+//! key strings, so "the smallest image" means the same thing on both sides.
 
 use std::fmt::Write as _;
 
@@ -20,16 +20,17 @@ use super::haskell::{
 };
 use super::quant::base64;
 use crate::book::{Book, KEY_LEN, Key, key_of};
-use crate::game::{BitState, GameState, Move, Player, Square, Symmetry};
+use crate::game::{BitState, GameState, Move, Square, Symmetry};
 
-/// Bytes per entry: nine little-endian `Word16` board codes, `2 * forced + toMove`, the move.
+/// Bytes per entry: nine little-endian `Word16` board codes, the forced board, the move.
 const ENTRY_BYTES: usize = 20;
 
-/// The first code of a decided board: won by X; then won by O, full.
+/// The first code of a decided board: won by the side to move; then won by the opponent,
+/// full.
 const DECIDED_CODE: u16 = 19683;
 
-/// A key's nine board codes and `2 * forced + to_move`. In this order they compare like the
-/// key strings.
+/// A key's nine board codes and forced board. In this order they compare like the key
+/// strings.
 pub fn board_codes(key: &Key) -> ([u16; 9], u8) {
     let digits: Vec<u8> = key.bytes().map(|b| b - b'0').collect();
     assert_eq!(digits.len(), KEY_LEN, "book key");
@@ -41,10 +42,10 @@ pub fn board_codes(key: &Key) -> ([u16; 9], u8) {
             cells.iter().fold(0u16, |acc, &d| acc * 3 + u16::from(d))
         }
     });
-    (codes, 2 * digits[81] + digits[82])
+    (codes, digits[81])
 }
 
-/// Every entry as `(board codes, 2 * forced + to_move, best move index)`, sorted by key.
+/// Every entry as `(board codes, forced board, best move index)`, sorted by key.
 pub fn entries(book: &Book) -> Vec<([u16; 9], u8, usize)> {
     let mut out: Vec<_> = book
         .entries()
@@ -59,11 +60,11 @@ pub fn entries(book: &Book) -> Vec<([u16; 9], u8, usize)> {
 
 fn encode(entries: &[([u16; 9], u8, usize)]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(entries.len() * ENTRY_BYTES);
-    for (codes, forced_to_move, mv) in entries {
+    for (codes, forced, mv) in entries {
         for c in codes {
             bytes.extend_from_slice(&c.to_le_bytes());
         }
-        bytes.push(*forced_to_move);
+        bytes.push(*forced);
         bytes.push(*mv as u8);
     }
     bytes
@@ -188,44 +189,31 @@ pub fn book_modules(
     banner(
         &mut s,
         &format!("{prefix}.Book"),
-        "(BookKey, boardCode, bookKey, bookKeyOfBoards, bookEntries, squarePermutations)",
+        "(BookKey, bookKeyOfBoards, bookEntries, squarePermutations)",
     );
     let _ = writeln!(s, "import Decode (decodeBytes)");
     let _ = writeln!(s, "import {prefix}.BookContent (bookText)");
     bundle_imports(&mut s, &["import Data.Word (Word64, Word8)"]);
     bundle_body_begin(
         &mut s,
-        "BookKey, boardCode, bookKey, bookKeyOfBoards, squarePermutations, bookEntries",
+        "BookKey, bookKeyOfBoards, squarePermutations, bookEntries",
     );
     s.push_str(
-        r#"-- | A position's key: nine board codes (see boardCode), the forced board (0..8, or 9 when
--- free) and the side to move (0 X, 1 O), as three words that each pack three codes in base
--- 19686, the last one times 20 plus 2 * forced + toMove. Positions that differ only inside
--- decided boards share a key.
+        r#"-- | A position's key, from the side to move's view: its nine board codes and its forced
+-- board (0..8, or 9 when free), as three words that each pack three codes in base 19686, the
+-- last one times ten plus the forced board. A board's code: an open board's nine cells (0
+-- empty, 1 the side to move's, 2 the opponent's) as a base-3 number, square 0 most
+-- significant (0..19682); 19683 if the side to move won it, 19684 if the opponent did, 19685
+-- if it is full. Keys compare like the Rust book's key strings. Positions that differ only
+-- inside decided boards, or only by swapping colours along with the side to move, share a
+-- key.
 type BookKey = (Word64, Word64, Word64)
 
--- | A board's code from its nine cells (0 empty, 1 X, 2 O): 19683 if X has a line, 19684 if
--- O has, 19685 if it is full, otherwise the digits as a base-3 number, square 0 most
--- significant.
-boardCode :: [Int] -> Int
-boardCode cells
-  | won 1 = 19683
-  | won 2 = 19684
-  | all (/= 0) cells = 19685
-  | otherwise = foldl (\acc d -> acc * 3 + d) 0 cells
-  where
-    won v = any (all (\q -> cells !! q == v)) [[0, 1, 2], [3, 4, 5], [6, 7, 8], [0, 3, 6], [1, 4, 7], [2, 5, 8], [0, 4, 8], [2, 4, 6]]
-
--- | The key of 81 cells (by board * 9 + square), the forced board (9 when free) and the side
--- to move (0 X, 1 O), in the frame they are given in.
-bookKey :: [Int] -> Int -> Int -> BookKey
-bookKey cells = bookKeyOfBoards [boardCode (take 9 (drop (9 * b) cells)) | b <- [0 .. 8]]
-
--- | The key of nine board codes, the forced board and the side to move.
-bookKeyOfBoards :: [Int] -> Int -> Int -> BookKey
-bookKeyOfBoards codes forcedBoard toMove =
+-- | The key of nine board codes (by board) and the forced board.
+bookKeyOfBoards :: [Int] -> Int -> BookKey
+bookKeyOfBoards codes forcedBoard =
   let word = foldl (\acc c -> acc * 19686 + fromIntegral c) 0
-   in (word (take 3 codes), word (take 3 (drop 3 codes)), word (drop 6 codes) * 20 + fromIntegral (2 * forcedBoard + toMove))
+   in (word (take 3 codes), word (take 3 (drop 3 codes)), word (drop 6 codes) * 10 + fromIntegral forcedBoard)
 
 -- | Image of square i under each of the eight symmetries (identity first). A symmetry maps
 -- the cell at (board b, square q) to (p !! b, p !! q) and the forced board b to p !! b.
@@ -250,7 +238,7 @@ bookEntries = go (map (\b -> fromIntegral (fromIntegral b :: Word8)) (decodeByte
       let (entry, rest) = splitAt 20 bytes
           code i = entry !! (2 * i) + 256 * entry !! (2 * i + 1)
        in if length entry == 20
-            then (bookKeyOfBoards (map code [0 .. 8]) (entry !! 18 `div` 2) (entry !! 18 `mod` 2), entry !! 19) : go rest
+            then (bookKeyOfBoards (map code [0 .. 8]) (entry !! 18), entry !! 19) : go rest
             else error "bookEntries: ragged book stream"
 "#,
     );
@@ -290,7 +278,7 @@ bookEntries = go (map (\b -> fromIntegral (fromIntegral b :: Word8)) (decodeByte
     banner(
         &mut t,
         &format!("{prefix}.BookTest"),
-        "(canonicalKey, lookupBook, bookRefs, bookTest)",
+        "(boardCode, canonicalKey, lookupBook, bookRefs, bookTest)",
     );
     let _ = writeln!(t, "import Data.List (minimumBy)");
     let _ = writeln!(t, "import Data.Ord (comparing)");
@@ -303,46 +291,62 @@ permuteCells p cells =
   let inv = [length (takeWhile (/= i) p) | i <- [0 .. 8]]
    in [cells !! ((inv !! b) * 9 + inv !! q) | b <- [0 .. 8], q <- [0 .. 8]]
 
+-- | A board's code from its nine cells (see BookKey).
+boardCode :: [Int] -> Int
+boardCode cells
+  | won 1 = 19683
+  | won 2 = 19684
+  | all (/= 0) cells = 19685
+  | otherwise = foldl (\acc d -> acc * 3 + d) 0 cells
+  where
+    won v = any (all (\q -> cells !! q == v)) [[0, 1, 2], [3, 4, 5], [6, 7, 8], [0, 3, 6], [1, 4, 7], [2, 5, 8], [0, 4, 8], [2, 4, 6]]
+
+-- | The key of 81 cells (by board * 9 + square, from the side to move's view) and the
+-- forced board.
+keyOfCells :: [Int] -> Int -> BookKey
+keyOfCells cells = bookKeyOfBoards [boardCode (take 9 (drop (9 * b) cells)) | b <- [0 .. 8]]
+
 -- | The smallest key among the position's eight images, with the permutation that produced
 -- it (the first one on ties, as the book was built).
-canonicalKey :: [Int] -> Int -> Int -> (BookKey, [Int])
-canonicalKey cells forced toMove =
+canonicalKey :: [Int] -> Int -> (BookKey, [Int])
+canonicalKey cells forced =
   minimumBy (comparing fst)
-    [ (bookKey (permuteCells p cells) (if forced == 9 then 9 else p !! forced) toMove, p)
+    [ (keyOfCells (permuteCells p cells) (if forced == 9 then 9 else p !! forced), p)
     | p <- squarePermutations
     ]
 
 -- | The book move for a position, in the position's own frame. A linear search: the search
 -- engine should build a balanced tree from bookEntries instead.
-lookupBook :: [Int] -> Int -> Int -> Maybe Int
-lookupBook cells forced toMove =
-  let (key, p) = canonicalKey cells forced toMove
+lookupBook :: [Int] -> Int -> Maybe Int
+lookupBook cells forced =
+  let (key, p) = canonicalKey cells forced
       inv = [length (takeWhile (/= i) p) | i <- [0 .. 8]]
    in case lookup key bookEntries of
         Nothing -> Nothing
         Just m -> Just ((inv !! (m `div` 9)) * 9 + inv !! (m `mod` 9))
 
--- | Positions (cells, forced board, side to move) with the move the Rust book gives for them,
--- -1 if the position is not in the book. Mostly book positions under a random symmetry.
-bookRefs :: [([Int], Int, Int, Int)]
+-- | Positions (cells from the side to move's view: 0 empty, 1 its, 2 the opponent's; forced
+-- board) with the move the Rust book gives for them, -1 if the position is not in the book.
+-- Mostly book positions under a random symmetry, with either side to move.
+bookRefs :: [([Int], Int, Int)]
 bookRefs =
 "#,
     );
     let s_main = s;
     let mut s = t;
     for (i, (state, expected)) in refs.iter().enumerate() {
+        let me = state.to_move();
         let cells = (0..Move::COUNT).map(|i| match state.cell(Move::from_index(i)) {
             None => 0,
-            Some(Player::X) => 1,
-            Some(Player::O) => 2,
+            Some(p) if p == me => 1,
+            Some(_) => 2,
         });
         let _ = writeln!(
             s,
-            "  {} ({}, {}, {}, {})",
+            "  {} ({}, {}, {})",
             if i == 0 { "[" } else { "," },
             hs_list(cells),
             state.forced_board().map_or(9, |b| b.index()),
-            usize::from(state.to_move() == Player::O),
             expected.map_or(-1, |m| m.index() as i64)
         );
     }
@@ -351,7 +355,7 @@ bookRefs =
         r#"-- | Looks every reference position up and compares.
 bookTest :: IO Bool
 bookTest = do
-  let results = [(expected, maybe (-1) id (lookupBook cells forced toMove)) | (cells, forced, toMove, expected) <- bookRefs]
+  let results = [(expected, maybe (-1) id (lookupBook cells forced)) | (cells, forced, expected) <- bookRefs]
       bad = length (filter (uncurry (/=)) results)
   putStrLn ("book test: " ++ show (length bookEntries) ++ " entries, " ++ show (length results) ++ " lookups, " ++ show bad ++ " mismatches")
   return (bad == 0)
@@ -371,14 +375,14 @@ mod tests {
     use super::*;
     use crate::book::canonical;
 
-    /// The three words from board codes, as `bookKeyOfBoards` computes them.
+    /// The three words of a key, as `bookKeyOfBoards` packs them.
     fn words(key: &Key) -> [u64; 3] {
-        let (codes, forced_to_move) = board_codes(key);
+        let (codes, forced) = board_codes(key);
         let word = |bs: &[u16]| bs.iter().fold(0u64, |acc, &c| acc * 19686 + u64::from(c));
         [
             word(&codes[0..3]),
             word(&codes[3..6]),
-            word(&codes[6..9]) * 20 + u64::from(forced_to_move),
+            word(&codes[6..9]) * 10 + u64::from(forced),
         ]
     }
 

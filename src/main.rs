@@ -543,7 +543,7 @@ fn prune_book(args: &PruneArgs) -> Result<(), String> {
     let live_before = book.live_len();
     if book.coalesced() > 0 {
         println!(
-            "{} lines pooled into others' entries (positions differing only inside decided boards)",
+            "{} lines pooled into others' entries (the same position up to decided boards' cells and colours)",
             book.coalesced()
         );
     }
@@ -716,7 +716,7 @@ fn book(
         println!("extending {} ({} entries)", out.display(), book.len());
         if book.coalesced() > 0 {
             println!(
-                "  {} lines pooled into others' entries (positions differing only inside decided boards)",
+                "  {} lines pooled into others' entries (the same position up to decided boards' cells and colours)",
                 book.coalesced()
             );
         }
