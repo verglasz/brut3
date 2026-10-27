@@ -405,8 +405,15 @@ impl Nnue {
     }
 
     /// Everything after the accumulator: the MLP, the value heads and the policy, which also
-    /// reads the nine boards' content ids (`[n, BOARDS]`).
-    fn heads(&self, acc: Tensor<2>, contents: Tensor<2, Int>) -> Prediction {
+    /// reads the nine boards' contents (`[n, BOARDS]`) in the policy tables `local_policy`
+    /// (`[_, CELLS]`) and `send_policy` (`[_, 1]`), the model's own or re-indexed copies.
+    fn heads(
+        &self,
+        acc: Tensor<2>,
+        contents: Tensor<2, Int>,
+        local_policy: Tensor<2>,
+        send_policy: Tensor<2>,
+    ) -> Prediction {
         let n = contents.dims()[0];
         let mut h = relu(self.hidden[0].forward(acc.clone()));
         for layer in &self.hidden[1..] {
@@ -416,8 +423,8 @@ impl Nnue {
         let wdl = self.value.forward(h.clone()) + self.value_skip.forward(acc);
 
         // Board-major `[n, 9, 9]` is `Move::index` order (`board * 9 + square`).
-        let local = lookup(&self.local_policy, contents.clone());
-        let send = lookup(&self.send_policy, contents).reshape([n, 1, CELLS]);
+        let local = rows(local_policy, contents.clone());
+        let send = rows(send_policy, contents).reshape([n, 1, CELLS]);
         let policy = self.policy.forward(h).reshape([n, BOARDS, CELLS]) + local + send;
         Prediction {
             wdl,
@@ -426,7 +433,8 @@ impl Nnue {
     }
 
     /// The same network for inference, with its first layer folded into one table of
-    /// accumulator rows (see [`FoldedNnue`]). Computed here on the model's device.
+    /// accumulator rows indexed by raw board code (see [`FoldedNnue`]). Computed here on the
+    /// model's device.
     pub fn fold(&self) -> FoldedNnue {
         let device = self.content.weight.device();
         let d_e = self.config.d_embed;
@@ -438,26 +446,40 @@ impl Nnue {
         let tokens = lookup(&self.content, ids)
             .sum_dim(1)
             .reshape([CONTENTS + 1, d_e]);
-        let contents = tokens.clone().slice([0..CONTENTS]);
+        // Spread over the raw codes; codes no game reaches get zero rows (and so zero
+        // products), never read.
+        let (to_compact, reachable) = raw_contents();
+        let to_compact =
+            Tensor::<1, Int>::from_data(TensorData::new(to_compact, [RAW_CONTENTS]), &device);
+        let reachable =
+            Tensor::<2>::from_data(TensorData::new(reachable, [RAW_CONTENTS, 1]), &device);
+        let spread = |table: Tensor<2>| table.select(0, to_compact.clone()) * reachable.clone();
+        let raw_tokens = spread(tokens.clone().slice([0..CONTENTS]));
         let mix = self.mix.weight.val();
         let mut parts: Vec<Tensor<2>> = (0..BOARDS)
             .map(|k| {
-                contents
+                raw_tokens
                     .clone()
                     .matmul(mix.clone().slice([k * d_e..(k + 1) * d_e]))
             })
             .collect();
-        // Every position has exactly one forced token, so the layer's bias rides on its rows.
-        let forced = tokens.matmul(self.forced_mix.weight.val());
-        parts.push(match &self.mix.bias {
-            Some(bias) => forced + bias.val().unsqueeze::<2>(),
-            None => forced,
-        });
+        // Every position has exactly one forced token, so the layer's bias rides on its rows
+        // (only on the reachable ones and "no forced board", the others staying zero).
+        let forced_tokens =
+            Tensor::cat(vec![raw_tokens, tokens.slice([CONTENTS..CONTENTS + 1])], 0);
+        let mut forced = forced_tokens.matmul(self.forced_mix.weight.val());
+        if let Some(bias) = &self.mix.bias {
+            let used = Tensor::cat(vec![reachable.clone(), Tensor::ones([1, 1], &device)], 0);
+            forced = forced + bias.val().unsqueeze::<2>() * used;
+        }
+        parts.push(forced);
         parts.push(self.features.weight.val());
-        let offsets = (0..BOARDS).map(|k| (k * CONTENTS) as i32).collect();
+        let offsets = (0..BOARDS).map(|k| (k * RAW_CONTENTS) as i32).collect();
         FoldedNnue {
             table: Tensor::cat(parts, 0),
             offsets: Tensor::from_data(TensorData::new(offsets, [1, BOARDS]), &device),
+            local_policy: spread(self.local_policy.weight.val()),
+            send_policy: spread(self.send_policy.weight.val()),
             net: self.clone(),
         }
     }
@@ -479,7 +501,12 @@ impl Model for Nnue {
             .reshape([n, BOARDS, IDS_PER_BOARD])
             .slice([0..n, 0..BOARDS, 0..1])
             .reshape([n, BOARDS]);
-        self.heads(relu(self.accumulate(ids)), contents)
+        self.heads(
+            relu(self.accumulate(ids)),
+            contents,
+            self.local_policy.weight.val(),
+            self.send_policy.weight.val(),
+        )
     }
 }
 
@@ -508,44 +535,109 @@ fn token_ids() -> Vec<i32> {
     ids
 }
 
+/// For every raw code, its compact content id (0 where unreachable) and whether a game can
+/// reach it (1 or 0).
+fn raw_contents() -> (Vec<i32>, Vec<f32>) {
+    (0..RAW_CONTENTS)
+        .map(|code| match compact_id(code) {
+            Some(c) => (c as i32, 1.0),
+            None => (0, 0.0),
+        })
+        .unzip()
+}
+
+/// `TERNARY[mask]`: the base-3 number with digit 1 where the 9-bit `mask` has its bits, so
+/// that `TERNARY[mine] + 2 * TERNARY[theirs]` is a board's raw code, as [`content_id`] reads it.
+static TERNARY: [u16; 512] = {
+    let mut table = [0u16; 512];
+    let mut mask = 0;
+    while mask < 512 {
+        let (mut code, mut pow, mut cell) = (0u16, 1u16, 0);
+        while cell < CELLS {
+            if mask >> cell & 1 != 0 {
+                code += pow;
+            }
+            pow *= 3;
+            cell += 1;
+        }
+        table[mask] = code;
+        mask += 1;
+    }
+    table
+};
+
 /// Rows of the folded table: the nine board tables, the forced table, the feature rows.
-const FORCED_TABLE: usize = BOARDS * CONTENTS;
-const FEATURE_TABLE: usize = FORCED_TABLE + CONTENTS + 1;
+const FORCED_TABLE: usize = BOARDS * RAW_CONTENTS;
+const NO_FORCED_ROW: usize = FORCED_TABLE + RAW_CONTENTS;
+const FEATURE_TABLE: usize = NO_FORCED_ROW + 1;
 /// Rows of the folded table one position reads: one per board, the forced token, the
 /// features.
 pub const FOLDED_IDS: usize = BOARDS + 1 + FEATURE_IDS;
 
 /// [`Nnue`] for inference with the first layer folded into a table, as the Haskell export's
-/// engine computes it: a board's token only depends on its compact content, so `W_k token(c)`
-/// is precomputed for every board `k` and content `c` (and the forced token's product, with
-/// the bias), and the accumulator is a sum of [`FOLDED_IDS`] table rows instead of the
-/// `9 d_embed x d_acc` product. Built eagerly, by [`Nnue::fold`]: about
-/// `9 x 11,097 x d_acc` floats (217 MB at `d_acc` 512) on the model's device.
+/// engine computes it: a board's token only depends on its content, so `W_k token(c)` is
+/// precomputed for every board `k` and content `c` (and the forced token's product, with the
+/// bias), and the accumulator is a sum of [`FOLDED_IDS`] table rows instead of the
+/// `9 d_embed x d_acc` product.
+///
+/// The tables are indexed by raw base-3 board code, which [`folded_ids`] reads straight from
+/// the bitboard's masks, not by compact content id: that skips a lookup per board for about
+/// `9 x 19,683 x d_acc` floats (346 MiB at `d_acc` 512, against 195 MiB compact; the rows of
+/// unreachable codes stay zero). Built eagerly, by [`Nnue::fold`], on the model's device.
 #[derive(Debug)]
 pub struct FoldedNnue {
-    /// `[9 CONTENTS + CONTENTS + 1 + FEATURE_ROWS, d_acc]`: board `k`'s content `c` at row
-    /// `k CONTENTS + c`, then the forced tokens with the bias, then the feature rows.
+    /// `[10 RAW_CONTENTS + 1 + FEATURE_ROWS, d_acc]`: board `k` with raw code `r` at row
+    /// `k RAW_CONTENTS + r`, then the forced tokens with the bias (raw codes, then "no forced
+    /// board"), then the feature rows.
     table: Tensor<2>,
-    /// `[1, BOARDS]`: the first row of each board table, to read the content ids back.
+    /// `[1, BOARDS]`: the first row of each board table, to read the raw codes back.
     offsets: Tensor<2, Int>,
+    /// The network's policy tables by raw code: `[RAW_CONTENTS, CELLS]` and `[RAW_CONTENTS, 1]`.
+    local_policy: Tensor<2>,
+    send_policy: Tensor<2>,
     /// The network the table was folded from, for everything after the accumulator.
     net: Nnue,
 }
 
-/// Writes the rows of the folded table that `state` reads into `out`.
+/// Writes the rows of the folded table that `state` reads into `out`: the same position as
+/// [`nnue_ids`] describes, from the bitboard's masks directly.
 pub fn folded_ids(state: &BitState, out: &mut [i32; FOLDED_IDS]) {
-    let mut ids = [0i32; IDS];
-    nnue_ids(state, &mut ids);
-    for k in 0..BOARDS {
-        out[k] = (k * CONTENTS) as i32 + ids[k * IDS_PER_BOARD];
+    let me = state.to_move();
+    let them = me.other();
+    let (won_by_me, won_by_them) = (state.big_marks(me), state.big_marks(them));
+    let done = state.done_mask();
+    let mut codes = [0usize; BOARDS];
+    let mut status = [0usize; BOARDS];
+    let mut open_marks = 0;
+    for b in 0..BOARDS {
+        let (mine, theirs) = (state.board_marks(me, b), state.board_marks(them, b));
+        codes[b] = TERNARY[mine as usize] as usize + 2 * TERNARY[theirs as usize] as usize;
+        out[b] = (b * RAW_CONTENTS + codes[b]) as i32;
+        // As `status` reads the compact content: open, mine, theirs, full.
+        status[b] = if won_by_me >> b & 1 != 0 {
+            1
+        } else if won_by_them >> b & 1 != 0 {
+            2
+        } else if done >> b & 1 != 0 {
+            3
+        } else {
+            open_marks += (mine | theirs).count_ones() as usize;
+            0
+        };
     }
-    out[BOARDS] = FORCED_TABLE as i32 + ids[BOARDS * IDS_PER_BOARD];
-    for (o, &f) in out[BOARDS + 1..]
-        .iter_mut()
-        .zip(&ids[TOKENS * IDS_PER_BOARD..])
-    {
-        *o = FEATURE_TABLE as i32 + f;
+    let forced = state.forced_board().map(|sq| sq.index());
+    out[BOARDS] = match forced {
+        Some(b) => FORCED_TABLE + codes[b],
+        None => NO_FORCED_ROW,
+    } as i32;
+    let features = &mut out[BOARDS + 1..];
+    features[0] = (FEATURE_TABLE + FORCED_BASE + forced.unwrap_or(BOARDS)) as i32;
+    for (l, line) in LINES.iter().enumerate() {
+        let code = status[line[0]] * 16 + status[line[1]] * 4 + status[line[2]];
+        features[1 + l] = (FEATURE_TABLE + LINE_BASE + l * LINE_STATES + code) as i32;
     }
+    features[1 + LINES.len()] = (FEATURE_TABLE + DECIDED_BASE + done.count_ones() as usize) as i32;
+    features[2 + LINES.len()] = (FEATURE_TABLE + OPEN_MARKS_BASE + open_marks) as i32;
 }
 
 impl Predictor for FoldedNnue {
@@ -566,8 +658,13 @@ impl Predictor for FoldedNnue {
         let acc = rows(self.table.clone(), ids.clone())
             .sum_dim(1)
             .reshape([n, d_acc]);
-        let contents = ids.slice([0..n, 0..BOARDS]) - self.offsets.clone().expand([n, BOARDS]);
-        self.net.heads(relu(acc), contents)
+        let codes = ids.slice([0..n, 0..BOARDS]) - self.offsets.clone().expand([n, BOARDS]);
+        self.net.heads(
+            relu(acc),
+            codes,
+            self.local_policy.clone(),
+            self.send_policy.clone(),
+        )
     }
 }
 

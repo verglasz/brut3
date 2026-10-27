@@ -40,7 +40,7 @@ the same thing without saving it.
 | `eval/heuristic::score` | the static evaluation used by the greedy and minimax agents |
 | `mcts/search per sim` | a 10,000-simulation search from 16 roots with fake leaf values, per simulation: selection, expansion, backup and the claim/resolve round trip, without any evaluator. With uniform priors, with a prior row per leaf (as a network gives), and claiming 16 leaves per round |
 | `mcts/dirichlet` | root noise for 81 moves |
-| `nn/encode_into`, `nn/nnue_ids` | network inputs for one position (with the `nn` feature) |
+| `nn/encode_into`, `nn/nnue_ids`, `nn/folded_ids` | network inputs for one position (with the `nn` feature); `folded_ids` is the folded NNUE's 21 table rows |
 
 ## Pitfalls met so far
 

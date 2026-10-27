@@ -281,7 +281,7 @@ fn main() {
 /// Encoding positions into network inputs, which self-play does on the CPU for every leaf.
 #[cfg(feature = "nn")]
 fn network_inputs(h: &Harness, p: &Pools) {
-    use brut3::nn::nnue::{IDS, nnue_ids};
+    use brut3::nn::nnue::{FOLDED_IDS, IDS, folded_ids, nnue_ids};
     use brut3::nn::{FEATURES, encode_into};
 
     let mut features = [0.0f32; FEATURES];
@@ -293,5 +293,10 @@ fn network_inputs(h: &Harness, p: &Pools) {
     h.bench("nn/nnue_ids", 1, &p.all, |s| {
         nnue_ids(s, &mut ids);
         ids[0] as u64
+    });
+    let mut folded = [0i32; FOLDED_IDS];
+    h.bench("nn/folded_ids", 1, &p.all, |s| {
+        folded_ids(s, &mut folded);
+        folded.iter().map(|&i| i as u64).sum()
     });
 }
