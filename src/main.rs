@@ -61,7 +61,9 @@ enum Command {
         /// Opening book file (from `book`) to export as Gen/Book.hs.
         #[arg(long)]
         book: Option<std::path::PathBuf>,
-        /// Directory to write `<module>/*.hs` under.
+        /// Directory to write `<module>/*.hs` under, or `-` to print every file to stdout
+        /// instead, each after a line `-- file: <module>/<name>.hs` with a blank line around
+        /// it (messages then go to stderr).
         #[arg(long)]
         out: std::path::PathBuf,
         /// Module prefix and directory name.
@@ -1077,6 +1079,14 @@ fn export(
     use ultimate_ttt_burn::nn::export::{ExportOptions, VecSpec, Weights, write_all};
     use ultimate_ttt_burn::nn::{AnyModel, BackendKind};
 
+    // With `--out -` the files go to stdout, so the messages go to stderr.
+    let to_stdout = out == std::path::Path::new("-");
+    macro_rules! say {
+        ($($t:tt)*) => {
+            if to_stdout { eprintln!($($t)*) } else { println!($($t)*) }
+        };
+    }
+
     let weights = match model {
         Some(model) => {
             let backend = match backend {
@@ -1093,7 +1103,7 @@ fn export(
                     ));
                 }
             };
-            println!(
+            say!(
                 "{}: {} parameters",
                 weights.config_display(),
                 weights.parameters()
@@ -1105,7 +1115,7 @@ fn export(
     let book = match book {
         Some(path) => {
             let book = Book::load(path)?;
-            println!(
+            say!(
                 "book {}: {} entries ({} dropped)",
                 path.display(),
                 book.live_len(),
@@ -1134,10 +1144,15 @@ fn export(
     };
     let report = write_all(weights.as_ref(), book.as_ref(), out, &opts)?;
     for (path, bytes) in &report.files {
-        println!("wrote {} ({} bytes)", path.display(), bytes);
+        say!(
+            "{} {} ({} bytes)",
+            if to_stdout { "printed" } else { "wrote" },
+            path.display(),
+            bytes
+        );
     }
     if weights.is_some() {
-        println!(
+        say!(
             "int16 weights: {} bytes in {} literals; quantisation error over the reference positions: \
              wdl {:.2e}, value {:.2e}, policy {:.2e}",
             report.stream_bytes,
@@ -1148,14 +1163,15 @@ fn export(
         );
     }
     if let Some(flags) = &report.vec_flags {
-        println!(
-            "FixedVec shapes (the same module without a model: export --out <dir> -- {flags})"
-        );
+        say!("FixedVec shapes (the same module without a model: export --out <dir> -- {flags})");
     }
     if let Some(stats) = &report.book {
-        println!(
+        say!(
             "book: {} entries, {} bytes in {} literals, {} reference lookups",
-            stats.entries, stats.bytes, stats.literals, stats.lookups
+            stats.entries,
+            stats.bytes,
+            stats.literals,
+            stats.lookups
         );
     }
     Ok(())

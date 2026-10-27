@@ -218,7 +218,8 @@ runs and prune passes and adds one per run.
 ## Haskell export (`export` command, `src/nn/export/`)
 
 `export --model <stem> --out <dir> [--module Gen] [--positions 16] [--seed 1]` writes, under
-`<dir>/Gen/`:
+`<dir>/Gen/` (`--out -` prints the files to stdout instead, each after a line
+`-- file: Gen/<name>.hs` with a blank line around it, and the messages to stderr):
 
 - `Spec.hs`: widths, every id convention, the open-content checksum (`h <- (h * 1000003 +
   code) mod 2^32` over open raw codes ascending), parameter count and folded MACs.

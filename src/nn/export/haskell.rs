@@ -75,7 +75,9 @@ pub struct Report {
     pub book: Option<super::book::BookStats>,
 }
 
-/// Writes every generated module under `out`: the network's modules for `weights`, the
+/// Writes every generated module under `out` (or prints them all to stdout if `out` is `-`,
+/// each after a line `-- file: <module>/<name>.hs` with a blank line around it): the
+/// network's modules for `weights`, the
 /// opening book's for `book`, and `FixedVec` for the network's shapes plus `opts.vec_extra`
 /// (without a network, for the extra shapes alone, if any). The network and book modules
 /// import the Haskell project's hand-written `Decode`.
@@ -85,13 +87,30 @@ pub fn write_all(
     out: &Path,
     opts: &ExportOptions,
 ) -> Result<Report, String> {
-    let dir = out.join(&opts.prefix);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    // `-`: every file to stdout instead, each after a `-- file: <module>/<name>.hs` line.
+    let to_stdout = out == Path::new("-");
+    let dir = if to_stdout {
+        PathBuf::from(&opts.prefix)
+    } else {
+        out.join(&opts.prefix)
+    };
+    if !to_stdout {
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
     let mut report = Report::default();
     let mut emit = |name: &str, text: String| -> Result<(), String> {
         let path = dir.join(format!("{name}.hs"));
-        std::fs::write(&path, &text)
-            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        if to_stdout {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            write!(stdout, "\n-- file: {}\n\n{text}", path.display())
+                .and_then(|()| stdout.flush())
+                .map_err(|e| format!("cannot print {}: {e}", path.display()))?;
+        } else {
+            std::fs::write(&path, &text)
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        }
         report.files.push((path, text.len()));
         Ok(())
     };
