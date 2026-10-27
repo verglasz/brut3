@@ -626,6 +626,21 @@ impl<'a> Gen<'a> {
         self.layout(&Expr::app(items[0].clone(), &items[1..]), indent);
     }
 
+    /// A definition `head = sum`: the sum on the head's line if the head is one line and the
+    /// whole fits in `SUM_LINE` columns, else below it, laid out along its tree.
+    fn definition(&mut self, head: Vec<String>, body: &Sum) {
+        let flat = body.inline();
+        match head.as_slice() {
+            [line] if line.len() + 1 + flat.len() <= SUM_LINE => {
+                self.push(format!("{line} {flat}"));
+            }
+            _ => {
+                self.out.extend(head);
+                self.out.extend(body.layout(2));
+            }
+        }
+    }
+
     fn layout(&mut self, e: &Expr, indent: usize) {
         self.out.extend(e.layout(indent));
     }
@@ -778,8 +793,9 @@ impl<'a> Gen<'a> {
         let (sm, dt) = (f("sum"), f("dot"));
         self.push(format!("-- {sm} v: the sum of the coordinates of v"));
         self.push(format!("{sm} :: {t} -> {elem}"));
-        self.apply(&self.pattern_head(&format!("{sm} ({t}"), &a, ") ="), 0);
-        self.out.extend(sum_tree(&a).layout(2));
+        let items = self.pattern_head(&format!("{sm} ({t}"), &a, ") =");
+        let head = Expr::app(items[0].clone(), &items[1..]);
+        self.definition(head.layout(0), &sum_tree(&a));
         if n >= 32 {
             self.push(format!("{{-# NOINLINE {sm} #-}}"));
         }
@@ -1030,8 +1046,10 @@ impl<'a> Gen<'a> {
         let (sm, dt) = (f("sum"), f("dot"));
         self.push(format!("{sm} :: {t} -> {elem}"));
         let sums: Vec<String> = c.iter().map(|ci| format!("{} {ci}", g("sum"))).collect();
-        self.push(format!("{sm} ({t} {}) =", c.join(" ")));
-        self.out.extend(sum_tree(&sums).layout(2));
+        self.definition(
+            vec![format!("{sm} ({t} {}) =", c.join(" "))],
+            &sum_tree(&sums),
+        );
         self.push("");
         self.push(format!(
             "-- {dt} u v: the dot product, as the sum of the chunk dot products"
