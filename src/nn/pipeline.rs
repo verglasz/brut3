@@ -15,7 +15,7 @@ use super::games;
 use super::nnue_v2::NnueV2;
 use super::train::{Dataset, Sample, TrainOptions, TrainReport, generate_threaded, train};
 use crate::agent::AgentSpec;
-use crate::benchmark::{MatchResult, play_match_with};
+use crate::benchmark::{MatchResult, MatchSettings, play_match_with};
 use crate::seed::derive_seed;
 use crate::selfplay::{MatchExploration, SelfPlayConfig, SelfPlayStats};
 
@@ -526,12 +526,16 @@ pub fn run_loop(
             seed: generation as u64,
             book: None,
         };
+        let match_settings = MatchSettings {
+            exploration: cfg.eval_exploration.clone(),
+            threads: cfg.threads,
+            concurrent: 0,
+        };
         let eval = play_match_with(
             &searcher(&candidate_path),
             &searcher(&best),
             cfg.eval_games,
-            &cfg.eval_exploration,
-            cfg.threads,
+            &match_settings,
             |_| {},
         )?;
         let promoted = eval.score_a() >= cfg.promote_threshold;
@@ -557,8 +561,7 @@ pub fn run_loop(
                 &searcher(&candidate_path),
                 baseline,
                 cfg.baseline_games,
-                &cfg.eval_exploration,
-                cfg.threads,
+                &match_settings,
                 |_| {},
             )?;
             log(format!(

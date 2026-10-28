@@ -197,10 +197,16 @@ enum Command {
         /// Search vs search: Dirichlet alpha of the root noise (0 disables it).
         #[arg(long, default_value_t = 0.0)]
         dirichlet_alpha: f32,
-        /// Search vs search: threads each playing its share of a match's games (0 = one per
-        /// core). A network runs on one thread of its own that batches them all.
+        /// Threads playing (0 = one per core). Each works through the pairings in order,
+        /// taking games from the one it is on and moving on once its games are all handed
+        /// out, so several pairings can play at a time. A network runs on one thread of its
+        /// own that batches every thread's leaves.
         #[arg(long, default_value_t = 1)]
         threads: usize,
+        /// Most games in flight at once over all threads (0 = every game of a match at once):
+        /// each game of a search holds a tree, so this bounds the memory.
+        #[arg(long, default_value_t = 0)]
+        concurrent: usize,
         /// Agent specs, one per argument, quoted when they contain spaces.
         #[arg(required = true, num_args = 2..)]
         specs: Vec<String>,
@@ -524,8 +530,16 @@ fn main() -> ExitCode {
             temperature_moves,
             dirichlet_alpha,
             threads,
+            concurrent,
             specs,
-        } => benchmark(games, temperature_moves, dirichlet_alpha, threads, &specs),
+        } => benchmark(
+            games,
+            temperature_moves,
+            dirichlet_alpha,
+            threads,
+            concurrent,
+            &specs,
+        ),
         Command::Serve { addr, specs } => serve(&addr, &specs),
         Command::Book {
             search,
@@ -1141,9 +1155,10 @@ fn benchmark(
     temperature_moves: usize,
     dirichlet_alpha: f32,
     threads: usize,
+    concurrent: usize,
     specs: &[String],
 ) -> Result<(), String> {
-    use brut3::benchmark::round_robin_with;
+    use brut3::benchmark::{MatchSettings, round_robin_with};
     use brut3::selfplay::MatchExploration;
     let exploration = MatchExploration {
         temperature_moves,
@@ -1157,7 +1172,22 @@ fn benchmark(
         })
         .collect::<Result<Vec<_>, _>>()?;
     println!("round robin, {games} games per pair:");
-    let tournament = round_robin_with(&specs, games, &exploration, threads, |m| println!("  {m}"))?;
+    let settings = MatchSettings {
+        exploration,
+        threads,
+        concurrent,
+    };
+    // A line every hundred games of a pairing, and the result when it is done.
+    let progress = |p: &brut3::benchmark::Progress| {
+        let t = &p.tally;
+        if t.games % 100 == 0 && t.games < p.games {
+            println!(
+                "  {} vs {}: {}/{} games, {}-{}-{} so far",
+                p.a, p.b, t.games, p.games, t.a_wins, t.draws, t.b_wins
+            );
+        }
+    };
+    let tournament = round_robin_with(&specs, games, &settings, progress, |m| println!("  {m}"))?;
     print!("\n{}", tournament.table());
     Ok(())
 }

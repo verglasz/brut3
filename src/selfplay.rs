@@ -397,14 +397,6 @@ pub fn search_threads(threads: usize, games: usize) -> usize {
     .clamp(1, games.max(1))
 }
 
-/// Share `t` of `parts` contiguous shares of `games` games, the first `games % parts` one
-/// longer.
-pub fn share(games: usize, parts: usize, t: usize) -> std::ops::Range<usize> {
-    let (base, extra) = (games / parts, games % parts);
-    let start = t * base + t.min(extra);
-    start..start + base + usize::from(t < extra)
-}
-
 /// One side of a [`lockstep_match`]: a search with `search`'s simulations, per-tree batch,
 /// exploration constant, virtual loss and move temperature, over `evaluator`'s leaf
 /// evaluations. This is what an `mcts` or `mcts-nn` agent is, taken apart so that many of
@@ -440,6 +432,32 @@ pub struct MatchTally {
     pub moves: usize,
 }
 
+impl MatchTally {
+    /// What this tally has gained since `earlier`, an earlier state of it.
+    pub fn since(&self, earlier: &MatchTally) -> MatchTally {
+        MatchTally {
+            games: self.games - earlier.games,
+            a_wins: self.a_wins - earlier.a_wins,
+            b_wins: self.b_wins - earlier.b_wins,
+            draws: self.draws - earlier.draws,
+            a_wins_as_x: self.a_wins_as_x - earlier.a_wins_as_x,
+            a_wins_as_o: self.a_wins_as_o - earlier.a_wins_as_o,
+            moves: self.moves - earlier.moves,
+        }
+    }
+
+    /// Adds another part of the same match.
+    pub fn add(&mut self, other: &MatchTally) {
+        self.games += other.games;
+        self.a_wins += other.a_wins;
+        self.b_wins += other.b_wins;
+        self.draws += other.draws;
+        self.a_wins_as_x += other.a_wins_as_x;
+        self.a_wins_as_o += other.a_wins_as_o;
+        self.moves += other.moves;
+    }
+}
+
 struct MatchGame {
     state: BitState,
     /// The search of the side to move.
@@ -456,6 +474,22 @@ struct MatchGame {
 }
 
 impl MatchGame {
+    /// Game number `g` of a match, before any move: `a` takes X in even-numbered games, and
+    /// each side's randomness is seeded with its seed plus `g`.
+    fn new(g: usize, searches: (&MctsConfig, &MctsConfig)) -> Self {
+        Self {
+            state: BitState::initial(),
+            tree: SearchTree::new(BitState::initial(), 0, 1.0, 0.0),
+            a_plays: if g % 2 == 0 { Player::X } else { Player::O },
+            rngs: [
+                SmallRng::seed_from_u64(searches.0.seed.wrapping_add(g as u64)),
+                SmallRng::seed_from_u64(searches.1.seed.wrapping_add(g as u64)),
+            ],
+            plies: 0,
+            finished: false,
+        }
+    }
+
     fn a_to_move(&self) -> bool {
         self.state.to_move() == self.a_plays
     }
@@ -465,7 +499,7 @@ impl MatchGame {
     }
 
     /// Applies `mv`, counting it and the game's end if it ends the game.
-    fn play(&mut self, mv: Move, tally: &mut MatchTally, on_game: &mut impl FnMut(usize)) {
+    fn play(&mut self, mv: Move, tally: &mut MatchTally, on_game: &mut impl FnMut(&MatchTally)) {
         self.state.apply(mv.into());
         self.plies += 1;
         tally.moves += 1;
@@ -484,7 +518,7 @@ impl MatchGame {
                 Outcome::Draw => tally.draws += 1,
             }
             self.finished = true;
-            on_game(tally.games);
+            on_game(tally);
         }
     }
 
@@ -493,7 +527,7 @@ impl MatchGame {
         &mut self,
         books: (Option<&Book>, Option<&Book>),
         tally: &mut MatchTally,
-        on_game: &mut impl FnMut(usize),
+        on_game: &mut impl FnMut(&MatchTally),
     ) {
         while !self.finished {
             let book = if self.a_to_move() { books.0 } else { books.1 };
@@ -592,7 +626,7 @@ fn advance_match(
     books: (Option<&Book>, Option<&Book>),
     exploration: &MatchExploration,
     tally: &mut MatchTally,
-    on_game: &mut impl FnMut(usize),
+    on_game: &mut impl FnMut(&MatchTally),
 ) {
     let search = if side_a { searches.0 } else { searches.1 };
     for game in games.iter_mut() {
@@ -633,49 +667,69 @@ pub fn lockstep_match<A: UtttAgent<State = BitState>, B: UtttAgent<State = BitSt
     b: Side<'_, B>,
     games: usize,
     exploration: &MatchExploration,
-    on_game: impl FnMut(usize),
+    mut on_game: impl FnMut(usize),
 ) -> MatchTally {
-    lockstep_match_games(a, b, 0..games, exploration, on_game)
+    let mut numbers = 0..games;
+    lockstep_match_games(
+        a,
+        b,
+        || numbers.next(),
+        games.max(1),
+        exploration,
+        |tally| on_game(tally.games),
+    )
 }
 
-/// [`lockstep_match`] for the games numbered `games` of a longer match: each game's colours
-/// and seeds follow its number, so a match split into ranges (over threads) plays the same
-/// games as the whole. `on_game` counts this range's games.
+/// [`lockstep_match`] over the games `next_game` hands out, at most `concurrent` at a time:
+/// when one ends, the next takes its place. Each game's colours and seeds follow its number, so
+/// a match whose numbers are shared out among several callers (threads drawing from one
+/// counter) plays the same games as the whole. `on_game` gets this call's tally after each
+/// finished game.
 pub fn lockstep_match_games<A: UtttAgent<State = BitState>, B: UtttAgent<State = BitState>>(
     a: Side<'_, A>,
     b: Side<'_, B>,
-    games: std::ops::Range<usize>,
+    mut next_game: impl FnMut() -> Option<usize>,
+    concurrent: usize,
     exploration: &MatchExploration,
-    mut on_game: impl FnMut(usize),
+    mut on_game: impl FnMut(&MatchTally),
 ) -> MatchTally {
+    assert!(concurrent > 0, "at least one game at a time");
     let mut tally = MatchTally::default();
-    let mut active: Vec<MatchGame> = Vec::with_capacity(games.len());
     let books = (a.book, b.book);
-    for g in games {
-        let a_plays = if g % 2 == 0 { Player::X } else { Player::O };
-        let rngs = [
-            SmallRng::seed_from_u64(a.search.seed.wrapping_add(g as u64)),
-            SmallRng::seed_from_u64(b.search.seed.wrapping_add(g as u64)),
-        ];
-        let mut game = MatchGame {
-            state: BitState::initial(),
-            tree: SearchTree::new(BitState::initial(), 0, 1.0, 0.0),
-            a_plays,
-            rngs,
-            plies: 0,
-            finished: false,
-        };
+    let searches = (&a.search, &b.search);
+    // The next game that needs a search, starting games (and playing their book moves) until
+    // one does; `None` once the numbers run out.
+    let mut start = |tally: &mut MatchTally, on_game: &mut dyn FnMut(&MatchTally)| loop {
+        let g = next_game()?;
+        let mut game = MatchGame::new(g, searches);
         // Book moves first; the first position outside both books gets the search.
-        game.play_book_moves(books, &mut tally, &mut on_game);
+        game.play_book_moves(books, tally, &mut |t: &MatchTally| on_game(t));
         if !game.finished {
             let a_next = game.a_to_move();
-            let next = if a_next { &a.search } else { &b.search };
+            let next = if a_next { searches.0 } else { searches.1 };
             game.tree = search_tree(&mut game, a_next, next, exploration);
+            return Some(game);
         }
-        active.push(game);
+    };
+    let mut active: Vec<MatchGame> = Vec::with_capacity(concurrent);
+    while active.len() < concurrent {
+        match start(&mut tally, &mut on_game) {
+            Some(game) => active.push(game),
+            None => break,
+        }
     }
+    // Finished games give their slots to new ones. A slot is free between rounds: a game ends
+    // on its own side's move, so the other side's batch in flight does not hold it.
+    let mut refill =
+        |active: &mut [MatchGame], tally: &mut MatchTally, on_game: &mut dyn FnMut(&MatchTally)| {
+            for slot in active.iter_mut().filter(|g| g.finished) {
+                match start(tally, on_game) {
+                    Some(game) => *slot = game,
+                    None => return,
+                }
+            }
+        };
     let (mut batch_a, mut batch_b) = (SideBatch::default(), SideBatch::default());
-    let searches = (&a.search, &b.search);
 
     // Same interleaving as self-play, with the two sides as the two groups.
     let mut current_a = true;
@@ -695,6 +749,7 @@ pub fn lockstep_match_games<A: UtttAgent<State = BitState>, B: UtttAgent<State =
                 &mut tally,
                 &mut on_game,
             );
+            refill(&mut active, &mut tally, &mut on_game);
         } else {
             batch_a.claim(&mut active, true, a.search.batch_size);
             batch_b.finish(&mut active, b.evaluator);
@@ -708,6 +763,7 @@ pub fn lockstep_match_games<A: UtttAgent<State = BitState>, B: UtttAgent<State =
                 &mut tally,
                 &mut on_game,
             );
+            refill(&mut active, &mut tally, &mut on_game);
         }
         current_a = !current_a;
     }
