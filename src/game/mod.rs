@@ -401,6 +401,26 @@ pub trait GameState: Clone {
         self.outcome()
     }
 
+    /// [`GameState::outcome`], or a draw when the game is dead: moves are left but neither
+    /// player can complete a line of boards any more. For searches and playouts, which can stop
+    /// there; the rules play a dead game on. The default knows no dead games.
+    fn settled(&self) -> Option<Outcome> {
+        self.outcome()
+    }
+
+    /// [`GameState::outcome_after`], or a draw when the move leaves the game dead and is one
+    /// that decides its board, where a game most often dies; a game killed by any other move
+    /// (one that takes a board's last open line from a player) is caught at the next board
+    /// decided. A dead game stays dead, so that is only late, never wrong.
+    fn settled_after(&self, mv: Self::Move) -> Option<Outcome> {
+        self.outcome_after(mv)
+    }
+
+    /// [`GameState::play`] with the result of [`GameState::settled_after`]: for playouts.
+    fn play_settled(&mut self, mv: Self::Move) -> Option<Outcome> {
+        self.play(mv)
+    }
+
     /// A uniformly random legal move (by [`uniform_index`]). The game must not be over.
     /// Implementations override this to pick without building the whole move set.
     fn random_move<R: RngCore + ?Sized>(&self, rng: &mut R) -> Self::Move {

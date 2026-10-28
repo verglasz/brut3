@@ -34,8 +34,9 @@ impl<S: GameState> UtttAgent for RandomAgent<S> {
         state.random_move(&mut self.rng).into()
     }
 
-    /// A random playout to the end, in the state's own moves ([`GameState::random_move`] and
-    /// [`GameState::play`]): monomorphised for a state, it is that state's specialised loop.
+    /// A random playout until the game is settled (over or dead), in the state's own moves
+    /// ([`GameState::random_move`] and [`GameState::play_settled`]): monomorphised for a state,
+    /// it is that state's specialised loop.
     fn evaluate(&mut self, state: &S) -> Evaluation {
         let me = state.to_move();
         if let Some(outcome) = state.outcome() {
@@ -44,7 +45,7 @@ impl<S: GameState> UtttAgent for RandomAgent<S> {
         let mut s = state.clone();
         loop {
             let mv = s.random_move(&mut self.rng);
-            if let Some(outcome) = s.play(mv) {
+            if let Some(outcome) = s.play_settled(mv) {
                 return Evaluation::value_only(outcome.value_for(me));
             }
         }

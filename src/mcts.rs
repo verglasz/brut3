@@ -485,7 +485,7 @@ impl<S: GameState> SearchTree<S> {
                 mv,
                 prior,
                 child: NO_NODE,
-                terminal: state.outcome_after(mv),
+                terminal: state.settled_after(mv),
             });
         }
 

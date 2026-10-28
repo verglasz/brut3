@@ -132,17 +132,20 @@ pub trait UtttAgent {
 
     /// Evaluates a position for tree search.
     ///
-    /// The default plays the game out with [`UtttAgent::choose_move`] and reports the result
-    /// with no priors. Terminal states are evaluated exactly.
+    /// The default plays the game out with [`UtttAgent::choose_move`] (until it is settled:
+    /// see [`GameState::play_settled`]) and reports the result with no priors. Terminal states
+    /// are evaluated exactly.
     fn evaluate(&mut self, state: &Self::State) -> Evaluation {
         let me = state.to_move();
+        if let Some(outcome) = state.outcome() {
+            return Evaluation::value_only(outcome.value_for(me));
+        }
         let mut s = state.clone();
         loop {
-            if let Some(outcome) = s.outcome() {
+            let mv = self.choose_move(&s);
+            if let Some(outcome) = s.play_settled(mv.into()) {
                 return Evaluation::value_only(outcome.value_for(me));
             }
-            let mv = self.choose_move(&s);
-            s.apply(mv.into());
         }
     }
 

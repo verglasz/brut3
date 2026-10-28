@@ -56,6 +56,25 @@ const WIN: [bool; 512] = {
     table
 };
 
+/// `FREE_LINE[mask]` is true if some line holds none of the squares of the 9-bit `mask`: a
+/// player whose opponent holds `mask` on an open board can still win it.
+const FREE_LINE: [bool; 512] = {
+    let mut table = [false; 512];
+    let mut mask = 0usize;
+    while mask < 512 {
+        let mut i = 0;
+        while i < 8 {
+            if mask & LINE_MASKS[i] as usize == 0 {
+                table[mask] = true;
+                break;
+            }
+            i += 1;
+        }
+        mask += 1;
+    }
+    table
+};
+
 /// `SQUARES[mask]`: the squares set in the 9-bit `mask` in increasing order, padded with zeros;
 /// entry `9` is how many there are.
 const SQUARES: [[u8; 10]; 512] = {
@@ -345,6 +364,23 @@ impl BitState {
         self.last_move.map(Move::from)
     }
 
+    /// Whether neither player can complete a line of boards any more: each line of boards
+    /// holds, for each player, a board they cannot win (won by the other, full, or open with
+    /// no line free of the other's marks).
+    fn dead(&self) -> bool {
+        let open = &SQUARES[(!self.done & FULL) as usize];
+        let mut winnable = self.big;
+        for &b in &open[..open[9] as usize] {
+            let b = b as usize;
+            for p in 0..2 {
+                if FREE_LINE[self.marks[1 - p][b] as usize] {
+                    winnable[p] |= 1 << b;
+                }
+            }
+        }
+        !WIN[winnable[0] as usize] && !WIN[winnable[1] as usize]
+    }
+
     // --- Mask accessors for in-crate heuristics. Not public: the bit layout is private. ---
 
     pub(crate) fn board_marks(&self, player: Player, board: usize) -> u16 {
@@ -518,6 +554,33 @@ impl GameState for BitState {
         }
     }
 
+    fn settled(&self) -> Option<Outcome> {
+        self.outcome()
+            .or_else(|| self.dead().then_some(Outcome::Draw))
+    }
+
+    /// A move that leaves its board open is answered as in [`GameState::outcome_after`];
+    /// only one that decides it pays for the copy and the dead check.
+    #[inline]
+    fn settled_after(&self, mv: BitMove) -> Option<Outcome> {
+        let (p, b) = (self.to_move.index(), mv.board());
+        let marks = self.marks[p][b] | 1 << mv.square();
+        if !WIN[marks as usize] && self.occupied(b) | 1 << mv.square() != FULL {
+            return None;
+        }
+        let mut next = *self;
+        next.play_settled(mv)
+    }
+
+    #[inline]
+    fn play_settled(&mut self, mv: BitMove) -> Option<Outcome> {
+        let done = self.done;
+        match self.play(mv) {
+            None if self.done != done && self.dead() => Some(Outcome::Draw),
+            outcome => outcome,
+        }
+    }
+
     fn transform(&self, symmetry: Symmetry) -> Self {
         let mut out = Self {
             marks: [[0; 9]; 2],
@@ -547,6 +610,58 @@ mod tests {
 
     use super::*;
     use crate::game::sq;
+
+    #[test]
+    fn dead_games_settle_as_draws_once_a_board_closes() {
+        // Boards won along their top rows: X 0, 2, 3, 7; O 1, 4, 6. O holds two of board 5's
+        // top row and is sent there; board 8 is empty. X can still take boards 5 and 8 down the
+        // right column, until O wins board 5:
+        //   X O X
+        //   X O O
+        //   O X .
+        let mut p = Position::initial();
+        for (board, who) in [
+            (0, Player::X),
+            (2, Player::X),
+            (3, Player::X),
+            (7, Player::X),
+        ]
+        .into_iter()
+        .chain([(1, Player::O), (4, Player::O), (6, Player::O)])
+        {
+            for square in 0..3 {
+                p.set_cell(
+                    Move::new(Square::from_index(board), Square::from_index(square)),
+                    Some(who),
+                );
+            }
+        }
+        for square in 0..2 {
+            p.set_cell(
+                Move::new(Square::from_index(5), Square::from_index(square)),
+                Some(Player::O),
+            );
+        }
+        let last = Move::new(Square::from_index(0), Square::from_index(5));
+        p.set_cell(last, Some(Player::X));
+        p.set_to_move(Player::O);
+        p.set_last_move(Some(last));
+        let s = BitState::from_position(&p);
+        assert_eq!((s.outcome(), s.settled()), (None, None));
+
+        let win = BitMove::from(Move::new(Square::from_index(5), Square::from_index(2)));
+        assert_eq!(s.outcome_after(win), None);
+        assert_eq!(s.settled_after(win), Some(Outcome::Draw));
+        let mut after = s;
+        assert_eq!(after.play_settled(win), Some(Outcome::Draw));
+        assert_eq!(after.outcome(), None, "the rules play on");
+        assert_eq!(after.settled(), Some(Outcome::Draw));
+        assert!(!after.legal_moves().is_empty());
+
+        // A move that leaves board 5 open is not checked, and does not kill the game here.
+        let quiet = BitMove::from(Move::new(Square::from_index(5), Square::from_index(4)));
+        assert_eq!(s.settled_after(quiet), None);
+    }
 
     #[test]
     fn win_table_matches_lines() {
