@@ -276,13 +276,15 @@ pub fn self_play<A: UtttAgent<State = BitState>>(
 
 /// Searches every position of `states` with `search`'s settings over `evaluator`, up to
 /// `concurrent` at once in two alternating groups as in [`self_play`], and returns their
-/// root results in order. `on_done` is called after each finished search with the count so
-/// far.
+/// root results in order. `root_priors(i)` gives position `i`'s root priors in place of its
+/// evaluation's (see [`SearchTree::with_root_priors`]), if any. `on_done` is called after each
+/// finished search with the count so far.
 pub fn search_positions<A: UtttAgent<State = BitState>>(
     evaluator: &mut A,
     states: &[BitState],
     search: &MctsConfig,
     concurrent: usize,
+    root_priors: impl Fn(usize) -> Option<[f32; Move::COUNT]>,
     mut on_done: impl FnMut(usize),
 ) -> Vec<crate::mcts::SearchResult> {
     struct Pending {
@@ -328,14 +330,22 @@ pub fn search_positions<A: UtttAgent<State = BitState>>(
         }
     }
 
-    let new_tree = |index: usize| Pending {
-        index,
-        tree: SearchTree::new(
+    let new_tree = |index: usize| {
+        // The callers take the most visited move.
+        let tree = SearchTree::new(
             states[index],
             search.simulations,
             search.c_puct,
             search.virtual_loss,
-        ),
+        )
+        .with_early_stop(search.early_stop);
+        Pending {
+            index,
+            tree: match root_priors(index) {
+                Some(priors) => tree.with_root_priors(priors),
+                None => tree,
+            },
+        }
     };
     let mut results: Vec<Option<crate::mcts::SearchResult>> = vec![None; states.len()];
     let mut done = 0;
@@ -529,23 +539,27 @@ impl SideBatch {
     }
 }
 
+/// The search for `game`'s next move by the side whose search settings are `search`: it may
+/// stop early once the move is decided, unless the move is sampled.
 fn search_tree(
-    state: BitState,
+    game: &mut MatchGame,
+    a_next: bool,
     search: &MctsConfig,
-    root_noise: Option<(f32, f32)>,
-    rng: &mut SmallRng,
+    exploration: &MatchExploration,
 ) -> SearchTree<BitState> {
+    let sampled = game.plies < exploration.temperature_moves || search.temperature != 0.0;
     let tree = SearchTree::new(
-        state,
+        game.state,
         search.simulations,
         search.c_puct,
         search.virtual_loss,
-    );
-    match root_noise {
+    )
+    .with_early_stop(if sampled { 0 } else { search.early_stop });
+    match exploration.root_noise {
         Some((alpha, fraction)) => tree.with_root_noise(RootNoise {
             alpha,
             fraction,
-            seed: rng.random(),
+            seed: game.rng(a_next).random(),
         }),
         None => tree,
     }
@@ -584,7 +598,7 @@ fn advance_match(
         if !game.finished {
             let a_next = game.a_to_move();
             let next = if a_next { searches.0 } else { searches.1 };
-            game.tree = search_tree(game.state, next, exploration.root_noise, game.rng(a_next));
+            game.tree = search_tree(game, a_next, next, exploration);
         }
     }
 }
@@ -625,7 +639,7 @@ pub fn lockstep_match<A: UtttAgent<State = BitState>, B: UtttAgent<State = BitSt
         if !game.finished {
             let a_next = game.a_to_move();
             let next = if a_next { &a.search } else { &b.search };
-            game.tree = search_tree(game.state, next, exploration.root_noise, game.rng(a_next));
+            game.tree = search_tree(&mut game, a_next, next, exploration);
         }
         active.push(game);
     }

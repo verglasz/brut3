@@ -34,6 +34,12 @@ pub struct MctsConfig {
     /// the rest of the batch is selected. Keeps one round from piling onto a single leaf.
     pub virtual_loss: f32,
     pub seed: u64,
+    /// Every this many simulations, the search stops once its most visited root move leads the
+    /// next by more than the simulations left, so that no further search could change which
+    /// move is most visited; `0` always spends the whole budget. Only searches that play the
+    /// most visited move stop early (temperature `0`); their visit counts then fall short of
+    /// the budget.
+    pub early_stop: u32,
 }
 
 impl Default for MctsConfig {
@@ -45,6 +51,7 @@ impl Default for MctsConfig {
             batch_size: 1,
             virtual_loss: 1.0,
             seed: 0x5EED,
+            early_stop: 200,
         }
     }
 }
@@ -216,6 +223,14 @@ pub struct SearchTree<S: GameState> {
     completed: u32,
     budget: u32,
     noise: Option<(RootNoise, SmallRng)>,
+    /// Priors for the root's moves in place of its evaluation's, taken at its expansion.
+    root_priors: Option<Box<[f32; Move::COUNT]>>,
+    /// Simulations between checks for an early stop (see [`MctsConfig::early_stop`]), `0` for
+    /// none; the next check is due at `next_check` completed simulations.
+    early_stop: u32,
+    next_check: u32,
+    /// The most visited root move can no longer be overtaken: the search is over.
+    settled: bool,
 }
 
 impl<S: GameState> SearchTree<S> {
@@ -233,7 +248,26 @@ impl<S: GameState> SearchTree<S> {
             completed: 0,
             budget: simulations,
             noise: None,
+            root_priors: None,
+            early_stop: 0,
+            next_check: 0,
+            settled: false,
         }
+    }
+
+    /// Stops the search once the most visited root move leads the next by more than the
+    /// simulations left, checked every `interval` simulations (`0`: never).
+    pub fn with_early_stop(mut self, interval: u32) -> Self {
+        self.early_stop = interval;
+        self.next_check = interval;
+        self
+    }
+
+    /// Expands the root with `priors` (a row indexed by `Move::index`, normalised over the
+    /// legal moves) instead of the priors of its evaluation; its value is still evaluated.
+    pub fn with_root_priors(mut self, priors: [f32; Move::COUNT]) -> Self {
+        self.root_priors = Some(Box::new(priors));
+        self
     }
 
     /// Mixes Dirichlet noise into the root priors when the root gets expanded.
@@ -248,7 +282,7 @@ impl<S: GameState> SearchTree<S> {
     }
 
     pub fn is_done(&self) -> bool {
-        self.completed >= self.budget || self.nodes[0].outcome.is_some()
+        self.settled || self.completed >= self.budget || self.nodes[0].outcome.is_some()
     }
 
     pub fn completed(&self) -> u32 {
@@ -285,6 +319,9 @@ impl<S: GameState> SearchTree<S> {
                 Selection::Blocked => break,
             }
         }
+        if self.claimed.is_empty() {
+            self.check_early_stop();
+        }
         self.claimed.len()
     }
 
@@ -300,17 +337,46 @@ impl<S: GameState> SearchTree<S> {
             let idx = *idx;
             self.remove_virtual_loss(idx);
             self.nodes[idx as usize].pending = false;
+            let root_priors = if idx == 0 {
+                self.root_priors.take()
+            } else {
+                None
+            };
             let value = self.expand(
                 idx,
                 state,
                 evaluations.value(offset + i),
-                evaluations.priors(offset + i),
+                root_priors
+                    .as_deref()
+                    .or_else(|| evaluations.priors(offset + i)),
             );
             self.backup(idx, value);
             self.completed += 1;
         }
         self.claimed = claimed;
         self.claimed.clear();
+        self.check_early_stop();
+    }
+
+    /// When a check is due (and no leaf is in flight), settles the search if its most visited
+    /// root move leads the next by more than the simulations left: even if every one of them
+    /// went to the runner-up, it would stay behind.
+    fn check_early_stop(&mut self) {
+        if self.early_stop == 0 || self.completed < self.next_check || !self.nodes[0].expanded {
+            return;
+        }
+        self.next_check = self.completed + self.early_stop;
+        let (mut first, mut second) = (0, 0);
+        for e in self.nodes[0].edges() {
+            let n = self.edge_visits(&self.edges[e]);
+            if n > first {
+                second = first;
+                first = n;
+            } else if n > second {
+                second = n;
+            }
+        }
+        self.settled = first - second > self.budget.saturating_sub(self.completed);
     }
 
     /// The known result behind an edge: the child's (possibly proven) outcome if it exists,
@@ -700,6 +766,9 @@ impl<A: UtttAgent> Mcts<A> {
             self.cfg.c_puct,
             self.cfg.virtual_loss,
         );
+        if self.cfg.temperature == 0.0 {
+            tree = tree.with_early_stop(self.cfg.early_stop);
+        }
         while !tree.is_done() {
             self.states.clear();
             if tree.claim(self.cfg.batch_size, &mut self.states) > 0 {
@@ -959,6 +1028,61 @@ mod tests {
             priors.iter().all(|p| *p >= 0.75 / 81.0 - 1e-6),
             "uniform part kept"
         );
+    }
+
+    #[test]
+    fn early_stop_only_once_the_leader_cannot_be_overtaken() {
+        let budget = 20_000;
+        let search = |row: Option<[f32; Move::COUNT]>, interval: u32| {
+            let mut agent = RandomAgent::<BitState>::new(1);
+            let (mut states, mut evals) = (Vec::new(), Evaluations::default());
+            let mut tree =
+                SearchTree::new(BitState::initial(), budget, 1.4, 1.0).with_early_stop(interval);
+            if let Some(row) = row {
+                tree = tree.with_root_priors(row);
+            }
+            while !tree.is_done() {
+                states.clear();
+                if tree.claim(8, &mut states) > 0 {
+                    evals.clear();
+                    agent.evaluate_batch(&states, &mut evals);
+                    tree.resolve(&evals, 0);
+                }
+            }
+            tree.assert_consistent();
+            (tree.completed(), tree.result())
+        };
+        // Nearly all the prior on one move: it runs away with the visits.
+        let mut row = [0.0001; Move::COUNT];
+        row[40] = 1.0;
+        let (completed, result) = search(Some(row), 200);
+        assert!(completed < budget, "stopped early: {completed}");
+        let mut visits: Vec<u32> = result.visits.iter().map(|(_, n)| *n).collect();
+        visits.sort_unstable_by(|a, b| b.cmp(a));
+        assert!(visits[0] - visits[1] > budget - completed, "{visits:?}");
+        assert_eq!(result.best_move(), Some(Move::from_index(40)));
+        // Without checks the whole budget is spent.
+        assert_eq!(search(Some(row), 0).0, budget);
+    }
+
+    #[test]
+    fn root_priors_replace_the_roots_evaluation() {
+        let mut row = [0.0; Move::COUNT];
+        row[40] = 3.0;
+        row[0] = 1.0;
+        let mut agent = RandomAgent::<BitState>::new(1);
+        let (mut states, mut evals) = (Vec::new(), Evaluations::default());
+        let mut tree = SearchTree::new(BitState::initial(), 1, 1.4, 1.0).with_root_priors(row);
+        tree.claim(1, &mut states);
+        agent.evaluate_batch(&states, &mut evals);
+        tree.resolve(&evals, 0);
+        let prior_of = |i: usize| {
+            let children = tree.root_children();
+            children.iter().find(|c| c.0.index() == i).unwrap().1
+        };
+        assert!((prior_of(40) - 0.75).abs() < 1e-6);
+        assert!((prior_of(0) - 0.25).abs() < 1e-6);
+        assert_eq!(prior_of(1), 0.0);
     }
 
     #[test]

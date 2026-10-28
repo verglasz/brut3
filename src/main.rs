@@ -121,7 +121,8 @@ enum Command {
     },
     /// Build or deepen an opening book by searching the positions of the first plies with a
     /// search agent, e.g. `book --search "mcts-nn models/big cuda 100000 16" --out models/book.txt`.
-    /// An existing book file is extended.
+    /// An existing book file is extended, and its entries to --plies whose search had fewer
+    /// simulations are searched again with their visit shares as the root priors.
     Book {
         /// The search that evaluates each position: `mcts [simulations] [seed]` or
         /// `mcts-nn <weights> [backend] [simulations] [batch] [seed]`.
@@ -136,14 +137,33 @@ enum Command {
         /// Smallest share of a position's visits for an opponent reply to be covered.
         #[arg(long, default_value_t = 0.01)]
         min_prior: f32,
-        /// Positions searched at once (the evaluator batch is concurrent / 2 x the search's batch).
+        /// Cover every opponent reply at the plies below this one, without searching the
+        /// positions where only the opponent moves (they are marked open).
+        #[arg(long, default_value_t = 0)]
+        dense_plies: usize,
+        /// Simulations for the positions where only the opponent moves, past --dense-plies,
+        /// searched for their replies' shares (default: the search's own).
+        #[arg(long)]
+        reply_simulations: Option<u32>,
+        /// Positions searched at once per thread (the evaluator batch is concurrent / 2 x the
+        /// search's batch, per thread).
         #[arg(long, default_value_t = 256)]
         concurrent: usize,
+        /// Search threads, each taking its share of every round's positions (0 = one per
+        /// core). With a network they share one evaluator thread, which batches all their
+        /// leaves together.
+        #[arg(long, default_value_t = 1)]
+        threads: usize,
         /// Only extend the main lines: new positions must be reached by their parent's book
         /// move, whichever side plays it, so each round deepens the principal variation from
         /// every leaf (to --plies) without opening new reply branches.
         #[arg(long)]
         main_lines: bool,
+        /// Keep every entry already in the book whatever its search's budget: only missing
+        /// positions are searched (dropped entries come back from their stored search). By
+        /// default, entries a search of this budget could improve on are searched again.
+        #[arg(long)]
+        keep_searched: bool,
     },
     /// Mark the entries of an opening book that the shipped book can do without, e.g.
     /// `prune-book --book models/book.txt --agent "mcts-nn models/m cuda 800 16" --out
@@ -151,6 +171,12 @@ enum Command {
     /// skip them, while `book` and the walks of later passes still use them, so the book can
     /// be pruned in passes (say, different settings from different plies) and deepened again.
     PruneBook(PruneArgs),
+    /// Show what an opening book file holds, without searching: its header, its entries,
+    /// dropped entries and open positions by ply, and the visits of their searches.
+    BookStats {
+        /// Book file to read.
+        book: std::path::PathBuf,
+    },
     /// Round-robin tournament between agents, e.g. `benchmark "mcts 400" "nn models/value" random`.
     Benchmark {
         /// Games per pair of agents (colours alternate; game g uses each agent's seed + g).
@@ -485,10 +511,28 @@ fn main() -> ExitCode {
             out,
             plies,
             min_prior,
+            dense_plies,
+            reply_simulations,
             concurrent,
+            threads,
             main_lines,
-        } => book(&search, &out, plies, min_prior, concurrent, main_lines),
+            keep_searched,
+        } => book(
+            &search,
+            &out,
+            brut3::book::BookConfig {
+                plies,
+                min_prior,
+                dense_plies,
+                reply_simulations,
+                concurrent,
+                main_lines,
+                keep_searched,
+            },
+            threads,
+        ),
         Command::PruneBook(args) => prune_book(&args),
+        Command::BookStats { book } => book_stats(&book),
         #[cfg(feature = "nn")]
         Command::ImportUtttai { paths, out } => import_utttai(&paths, &out),
         #[cfg(feature = "nn")]
@@ -546,6 +590,176 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn book_stats(path: &std::path::Path) -> Result<(), String> {
+    use std::collections::{BTreeMap, HashMap};
+
+    use brut3::book::{Book, Reached};
+
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let book = Book::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    println!("{}", path.display());
+    for line in text.lines().map_while(|l| l.strip_prefix('#')) {
+        println!("  # {}", line.trim());
+    }
+    println!(
+        "{} entries ({} live, {} dropped), {} open positions{}",
+        book.len(),
+        book.live_len(),
+        book.len() - book.live_len(),
+        book.open_len(),
+        if book.coalesced() > 0 {
+            format!(", {} lines pooled into others' entries", book.coalesced())
+        } else {
+            String::new()
+        }
+    );
+
+    #[derive(Default)]
+    struct Ply {
+        live: usize,
+        dropped: usize,
+        open: usize,
+        visits: Vec<u32>,
+    }
+    let mut by_ply: BTreeMap<usize, Ply> = BTreeMap::new();
+    // How many searches had each budget (visits + 1: the root's own evaluation).
+    let mut budgets: HashMap<u32, usize> = HashMap::new();
+    let mut open_reached = 0;
+    for (key, ply) in book.plies() {
+        let row = by_ply.entry(ply).or_default();
+        match book.get(&key) {
+            Some(entry) => {
+                let visits: u32 = entry.visits.iter().map(|(_, n)| n).sum();
+                if entry.dropped {
+                    row.dropped += 1;
+                } else {
+                    row.live += 1;
+                }
+                row.visits.push(visits);
+                *budgets.entry(visits + 1).or_default() += 1;
+            }
+            None => {
+                row.open += 1;
+                open_reached += 1;
+            }
+        }
+    }
+    println!();
+    println!(
+        "{:>4} {:>8} {:>8} {:>8}   {:>9} {:>9} {:>9}",
+        "ply", "live", "dropped", "open", "min", "median", "max"
+    );
+    for (ply, row) in &mut by_ply {
+        row.visits.sort_unstable();
+        let at = |q: f64| {
+            row.visits
+                .get(((row.visits.len().saturating_sub(1)) as f64 * q) as usize)
+                .map_or("-".to_string(), |v| v.to_string())
+        };
+        println!(
+            "{ply:>4} {:>8} {:>8} {:>8}   {:>9} {:>9} {:>9}",
+            row.live,
+            row.dropped,
+            row.open,
+            at(0.0),
+            at(0.5),
+            at(1.0)
+        );
+    }
+    println!(
+        "(min, median and max of the entries' visits; a ply is the fewest moves reaching a position)"
+    );
+    if open_reached < book.open_len() {
+        println!(
+            "{} open positions not reached from the start",
+            book.open_len() - open_reached
+        );
+    }
+
+    // Where play leaves the book, by side and ply: how often (the reach of its leaves) and
+    // how (by the book's own last move, by a reply it does not cover, or out of an open
+    // position not finished yet).
+    #[derive(Default)]
+    struct Leaves {
+        count: usize,
+        reach: f64,
+        book_move: f64,
+        reply: f64,
+        open_reply: f64,
+    }
+    let mut leaves: BTreeMap<(usize, usize), Leaves> = BTreeMap::new();
+    let mut unfinished = 0;
+    for leaf in book.open_leaves() {
+        let side = usize::from(leaf.book == brut3::game::Player::O);
+        let row = leaves.entry((leaf.ply, side)).or_default();
+        row.count += 1;
+        row.reach += leaf.reach;
+        match leaf.reached {
+            Reached::BookMove => row.book_move += leaf.reach,
+            Reached::Reply(_) => row.reply += leaf.reach,
+            Reached::OpenReply => {
+                row.open_reply += leaf.reach;
+                unfinished += 1;
+            }
+        }
+    }
+    println!();
+    println!(
+        "open leaves: where play leaves the book (the book's moves against an opponent replying by the searches' visit shares)"
+    );
+    let pct = |p: f64| format!("{:.2}%", 100.0 * p);
+    for (side, name) in [(0, "X"), (1, "O")] {
+        println!("  book as {name}:");
+        println!(
+            "  {:>4} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9}",
+            "ply", "leaves", "leave", "by move", "by reply", "open", "in book"
+        );
+        let mut inside = 1.0;
+        for ((ply, _), row) in leaves.iter().filter(|((_, s), _)| *s == side) {
+            inside -= row.reach;
+            println!(
+                "  {ply:>4} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9}",
+                row.count,
+                pct(row.reach),
+                pct(row.book_move),
+                pct(row.reply),
+                pct(row.open_reply),
+                pct(inside.max(0.0))
+            );
+        }
+    }
+    println!(
+        "(leave: the probability that play leaves the book at that ply, by the book's own last move, by a reply it does not cover or by one out of an open position not searched yet; in book: still in it after that ply, or in a game that ended inside it)"
+    );
+    if unfinished > 0 {
+        println!("{unfinished} open leaves after open positions: run `book` again to search them");
+    }
+
+    // The budgets most searches had; the rest (early stops, proven roots, pooled lines) in one.
+    let mut common: Vec<(u32, usize)> = budgets.into_iter().collect();
+    common.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let floor = (book.len() / 200).max(1);
+    let shown = common
+        .iter()
+        .take(8)
+        .take_while(|(_, n)| *n >= floor)
+        .count();
+    println!();
+    println!("searches by simulations (visits + 1):");
+    for (budget, n) in &common[..shown] {
+        println!("  {budget:>9} {n:>8}");
+    }
+    let rest = &common[shown..];
+    if !rest.is_empty() {
+        let count: usize = rest.iter().map(|(_, n)| n).sum();
+        let lo = rest.iter().map(|(b, _)| b).min().expect("some");
+        let hi = rest.iter().map(|(b, _)| b).max().expect("some");
+        println!("  {count:>18} more, from {lo} to {hi}");
+    }
+    Ok(())
 }
 
 fn prune_book(args: &PruneArgs) -> Result<(), String> {
@@ -652,12 +866,17 @@ fn prune_book(args: &PruneArgs) -> Result<(), String> {
             }
         };
         let choices: Vec<Option<(Move, Vec<(Move, f32)>)>> = match spec.search_parts()? {
-            Some((mut evaluator, search, _)) => {
-                search_positions(&mut evaluator, &states, &search, args.concurrent, progress)
-                    .into_iter()
-                    .map(|r| Some((r.best_move()?, r.policy())))
-                    .collect()
-            }
+            Some((mut evaluator, search, _)) => search_positions(
+                &mut evaluator,
+                &states,
+                &search,
+                args.concurrent,
+                |_| None,
+                progress,
+            )
+            .into_iter()
+            .map(|r| Some((r.best_move()?, r.policy())))
+            .collect(),
             None => {
                 let mut agent = spec.build()?;
                 states
@@ -737,23 +956,24 @@ fn prune_book(args: &PruneArgs) -> Result<(), String> {
 fn book(
     search: &str,
     out: &std::path::Path,
-    plies: usize,
-    min_prior: f32,
-    concurrent: usize,
-    main_lines: bool,
+    cfg: brut3::book::BookConfig,
+    threads: usize,
 ) -> Result<(), String> {
-    use std::io::Write;
-    use std::time::Instant;
-
-    use brut3::book::{Book, BookConfig};
+    use brut3::book::Book;
 
     let words: Vec<&str> = search.split_whitespace().collect();
     let spec = AgentSpec::parse(&words)?;
-    let (mut evaluator, search_cfg, _) = spec
-        .search_parts()?
+    let search_cfg = spec
+        .search_config()
         .ok_or_else(|| format!("{spec} is not a search; use mcts or mcts-nn"))?;
+    let threads = match threads {
+        0 => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+        n => n,
+    };
     // The header keeps the lines of earlier runs and prune passes, after a fresh count.
-    let (mut book, mut history) = if out.exists() {
+    let (book, mut history) = if out.exists() {
         let text = std::fs::read_to_string(out)
             .map_err(|e| format!("cannot read {}: {e}", out.display()))?;
         let book = Book::parse(&text).map_err(|e| format!("{}: {e}", out.display()))?;
@@ -774,38 +994,97 @@ fn book(
     } else {
         (Book::default(), Vec::new())
     };
-    let cfg = BookConfig {
-        plies,
-        min_prior,
-        concurrent,
-        main_lines,
-    };
-    let run = if main_lines {
+    let plies = cfg.plies;
+    let mut run = if cfg.main_lines {
         format!("main lines to ply {plies} searched by {spec}")
     } else {
-        format!("to ply {plies} searched by {spec}; replies covered from {min_prior} of the visits")
+        format!(
+            "to ply {plies} searched by {spec}; replies covered from {} of the visits",
+            cfg.min_prior
+        )
     };
-    println!("book {run}");
+    if cfg.keep_searched {
+        run.push_str("; existing entries kept");
+    }
+    if cfg.dense_plies > 0 {
+        run.push_str(&format!(", all of them below ply {}", cfg.dense_plies));
+    }
+    if let Some(n) = cfg.reply_simulations {
+        run.push_str(&format!(
+            "; the opponent's positions searched with {n} simulations"
+        ));
+    }
+    println!("book {run} ({threads} search thread(s))");
     if !history.contains(&run) {
         history.push(run);
     }
+    #[cfg(feature = "nn")]
+    if threads > 1 && matches!(spec, AgentSpec::MctsNn { .. }) {
+        // The network evaluates on a thread of its own that batches every search thread's
+        // leaves together (see EvalServer).
+        let spec = spec.clone();
+        let server = brut3::nn::EvalServer::spawn(
+            move || {
+                spec.leaf_evaluator()?
+                    .ok_or_else(|| format!("{spec} is not a search"))
+            },
+            brut3::nn::MAX_BATCH,
+        )?;
+        let mut clients: Vec<_> = (0..threads).map(|_| server.client()).collect();
+        return extend_book(book, &mut clients, &search_cfg, &cfg, out, &history);
+    }
+    let mut evaluators = (0..threads)
+        .map(|t| {
+            spec.offset_seed(t as u64)
+                .leaf_evaluator()?
+                .ok_or_else(|| format!("{spec} is not a search"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    extend_book(book, &mut evaluators, &search_cfg, &cfg, out, &history)
+}
+
+/// Extends `book` with a search thread per evaluator, saving it to `out` after every round
+/// under a header of `history`.
+fn extend_book<A: brut3::agent::UtttAgent<State = brut3::game::BitState> + Send>(
+    mut book: brut3::book::Book,
+    evaluators: &mut [A],
+    search_cfg: &brut3::mcts::MctsConfig,
+    cfg: &brut3::book::BookConfig,
+    out: &std::path::Path,
+    history: &[String],
+) -> Result<(), String> {
+    use std::cell::Cell;
+    use std::io::Write;
+    use std::time::Instant;
+
+    use brut3::book::Book;
+
     let start = Instant::now();
-    let round_start = std::cell::Cell::new(Instant::now());
+    let round_start = Cell::new(Instant::now());
+    // Threads report their searches in bursts, so the progress line is redrawn every 50
+    // positions crossed rather than on multiples of 50.
+    let shown = Cell::new(0);
     let save = |book: &Book| {
-        let mut header = vec![format!("ultimate-ttt opening book: {} entries", book.len())];
+        let mut header = vec![format!(
+            "ultimate-ttt opening book: {} entries, {} open positions",
+            book.len(),
+            book.open_len()
+        )];
         header.extend(history.iter().cloned());
         book.save(out, &header)
     };
     let added = book.extend(
-        &mut evaluator,
-        &search_cfg,
-        &cfg,
+        evaluators,
+        search_cfg,
+        cfg,
         |line| {
             round_start.set(Instant::now());
+            shown.set(0);
             println!("{line}");
         },
         |done, total| {
-            if done.is_multiple_of(50) || done == total {
+            if done / 50 != shown.get() / 50 || done == total {
+                shown.set(done);
                 print!(
                     "\r  {done}/{total} ({:.0}s)",
                     round_start.get().elapsed().as_secs_f32()
@@ -823,12 +1102,14 @@ fn book(
         },
     )?;
     println!(
-        "added {} entries, made {} dropped ones live again and searched {} again in {:.0}s; {} entries saved to {}",
+        "added {} entries, made {} dropped ones live again, searched {} again and opened {} opponent positions in {:.0}s; {} entries and {} open positions saved to {}",
         added.added,
         added.revived,
         added.researched,
+        added.opened,
         start.elapsed().as_secs_f32(),
         book.len(),
+        book.open_len(),
         out.display()
     );
     Ok(())

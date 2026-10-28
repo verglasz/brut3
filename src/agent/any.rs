@@ -188,36 +188,49 @@ impl AgentSpec {
     /// lockstep ([`crate::selfplay::lockstep_match`]). `None` for agents that are not
     /// searches. Fails for network weights or a book that cannot be loaded.
     pub fn search_parts(&self) -> Result<Option<(AnyAgent, MctsConfig, Option<Book>)>, String> {
-        Ok(match self {
+        let (Some(search), Some(evaluator)) = (self.search_config(), self.leaf_evaluator()?) else {
+            return Ok(None);
+        };
+        Ok(Some((evaluator, search, self.load_book()?)))
+    }
+
+    /// For a search agent: its search settings, without loading anything.
+    pub fn search_config(&self) -> Option<MctsConfig> {
+        match self {
             AgentSpec::Mcts {
                 simulations, seed, ..
-            } => Some((
-                AnyAgent::Random(RandomAgent::new(seed ^ 0x9E37_79B9_7F4A_7C15)),
-                MctsConfig {
-                    simulations: *simulations,
-                    seed: *seed,
-                    ..Default::default()
-                },
-                self.load_book()?,
-            )),
+            } => Some(MctsConfig {
+                simulations: *simulations,
+                seed: *seed,
+                ..Default::default()
+            }),
             #[cfg(feature = "nn")]
             AgentSpec::MctsNn {
-                path,
-                backend,
                 simulations,
                 batch_size,
                 seed,
                 ..
-            } => Some((
-                AnyAgent::Nn(NetAgent::load(path, *backend)?),
-                MctsConfig {
-                    simulations: *simulations,
-                    batch_size: *batch_size,
-                    seed: *seed,
-                    ..Default::default()
-                },
-                self.load_book()?,
-            )),
+            } => Some(MctsConfig {
+                simulations: *simulations,
+                batch_size: *batch_size,
+                seed: *seed,
+                ..Default::default()
+            }),
+            _ => None,
+        }
+    }
+
+    /// For a search agent: the leaf evaluator it searches over (random playouts, or the
+    /// network). Fails for network weights that cannot be loaded.
+    pub fn leaf_evaluator(&self) -> Result<Option<AnyAgent>, String> {
+        Ok(match self {
+            AgentSpec::Mcts { seed, .. } => Some(AnyAgent::Random(RandomAgent::new(
+                seed ^ 0x9E37_79B9_7F4A_7C15,
+            ))),
+            #[cfg(feature = "nn")]
+            AgentSpec::MctsNn { path, backend, .. } => {
+                Some(AnyAgent::Nn(NetAgent::load(path, *backend)?))
+            }
             _ => None,
         })
     }
