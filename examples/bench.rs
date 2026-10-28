@@ -1,5 +1,5 @@
 //! Throughput numbers for the engine, agents and (with the `nn` feature) network evaluators.
-//! Run with `cargo run --release --all-features --example bench [-- FILTER...]`: with
+//! Run with `cargo run --release --features full --example bench [-- FILTER...]`: with
 //! filters, only the cases whose label contains one of them.
 
 use std::sync::OnceLock;

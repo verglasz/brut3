@@ -13,13 +13,13 @@ filters=$(printf '%s' "${*:+-$*}" | tr -c 'A-Za-z0-9._-' '_')
 out="$here/results/micro-$(date +%F)-$commit$dirty$filters.txt"
 
 cd "$root"
-cargo bench --all-features --bench micro --no-run 2>/dev/null
+cargo bench --features full --bench micro --no-run 2>/dev/null
 
 {
   echo "# microbenchmarks, $(date -Iseconds), commit $commit$dirty${*:+, filters: $*}"
   echo "# $(rustc --version), $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
   echo "# median ns per unit over 15 samples [min .. max]"
-  cargo bench --all-features --bench micro -- "$@" 2>/dev/null
+  cargo bench --features full --bench micro -- "$@" 2>/dev/null
 } | tee "$out"
 
 echo "wrote $out" >&2

@@ -1,6 +1,6 @@
 //! Microbenchmarks: each component timed on its own, over pools of distinct positions from
 //! random games so that no single input gets specialised on. Run with `benches/run.sh`, or
-//! `cargo bench --all-features --bench micro [-- FILTER...]` to see the output without
+//! `cargo bench --features full --bench micro [-- FILTER...]` to see the output without
 //! saving it. See `benches/README.md`.
 
 use std::hint::black_box;

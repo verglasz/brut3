@@ -11,7 +11,7 @@ benches/run.sh [FILTER...]
 runs `micro.rs` and writes its output to `results/micro-<date>-<commit>[-dirty].txt`, so runs
 at different commits can be diffed. A filter keeps the benchmarks whose name contains it
 (`benches/run.sh mcts/ pick/`); filtered runs go to a file named after the filters too, so they
-do not replace a full run. `cargo bench --all-features --bench micro [-- FILTER...]` runs
+do not replace a full run. `cargo bench --features full --bench micro [-- FILTER...]` runs
 the same thing without saving it.
 
 ## How it measures

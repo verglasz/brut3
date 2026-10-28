@@ -4,7 +4,7 @@
 //! reported after a warm-up. In self-play a request is `concurrent / 2 x tree batch`
 //! positions: 4096 at 1024 games in flight, 8192 at 2048.
 //!
-//! `cargo run --release --all-features --example server_bench -- MODEL [THREADS] [SIZE]
+//! `cargo run --release --features full --example server_bench -- MODEL [THREADS] [SIZE]
 //! [DEPTH] [SECONDS] [BACKEND] [unfolded] [local]`, DEPTH being the server's batches in
 //! flight (1 or 2); `unfolded` evaluates an NNUE without its folded table; `local` skips the
 //! server and has every client evaluate its own requests with a network of its own (DEPTH is

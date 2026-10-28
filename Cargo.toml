@@ -19,12 +19,12 @@ tracing-subscriber = { version = "0.3.23", optional = true }
 [features]
 # Default: every backend that builds with no extra system requirements.
 default = ["flex", "wgpu"]
+# Every backend, without fusion: what development and most runs build (`--features full`).
+full = ["flex", "wgpu", "cuda", "cpu-mlir"]
 # Pulls in burn itself plus the pieces every backend needs: burn-train (autodiff, datasets, the
 # Learner with its TUI dashboard) for training. Backend selection among the compiled backends
 # is built into burn 0.22's `Device`. burn's default features are off so that kernel fusion
-# stays off on the CubeCL backends (see README: measured slower on every burn version so far).
-# To experiment with fusion, add "burn/fusion" here; it is not a cargo feature of this crate on
-# purpose, so that `--all-features` builds stay fusion-free.
+# stays off on the CubeCL backends unless `fusion` asks for it.
 nn = [
     "dep:burn",
     "burn/std",
@@ -51,6 +51,12 @@ wgpu = ["nn", "burn/wgpu"]
 cuda = ["nn", "burn/cuda"]
 # CubeCL CPU backend; downloads a prebuilt LLVM/MLIR 20 on first build.
 cpu-mlir = ["nn", "burn/cpu"]
+# Kernel fusion on the CubeCL backends (cuda, wgpu, cpu-mlir). burn decides it at compile time
+# for every device, and it pays only for training: on burn 0.22.1 a training step is about 16%
+# faster (medium nnue 6.9 against 8.2 ms on an RTX 2080), the inference server 40-70% slower
+# (see README). Build it in the `fusion` profile, so that it never replaces the unfused build:
+# `cargo build --profile fusion --features full,fusion` (target/fusion/brut3).
+fusion = ["nn", "burn/fusion"]
 
 # Component timings with a small harness of their own; see benches/README.md.
 [[bench]]
@@ -58,7 +64,7 @@ name = "micro"
 harness = false
 
 # Release with incremental compilation of this crate, for edit-build cycles:
-# `cargo build --profile quick --all-features` builds target/quick/brut3. A rebuild after an
+# `cargo build --profile quick --features full` builds target/quick/brut3. A rebuild after an
 # edit takes 2-4 s instead of ~16 s, but the code runs about a third slower (random playouts
 # +28%, search work per simulation +35%), because incremental builds cannot inline across
 # their many small codegen units. Use release for self-play, training and benchmarks.
@@ -66,6 +72,11 @@ harness = false
 [profile.quick]
 inherits = "release"
 incremental = true
+
+# Release with kernel fusion, for training (with `--features full,fusion`; see `fusion`): its
+# own target directory, so that switching between the fused and unfused builds rebuilds neither.
+[profile.fusion]
+inherits = "release"
 
 [profile.dev.package."*"]
 # No debug info for dependencies (burn, cubecl, ...), which are rarely stepped into: a full

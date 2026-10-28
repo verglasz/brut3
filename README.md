@@ -70,22 +70,25 @@ Default features are everything that builds with no extra system requirements. A
 through burn's runtime `Device`, which selects among the compiled-in backends at runtime
 (`--backend cuda`, `nn models/value wgpu`, ...), so one binary can exercise all of them;
 `backends` lists what a binary has. `cargo build --no-default-features` skips burn entirely for
-fast iteration on the engine. Development builds use `--all-features`.
+fast iteration on the engine. Development builds use `--features full`: every backend, without
+kernel fusion (`--all-features` would add it; see below).
 
 Known upstream issues worked around:
 
-- Kernel fusion is off on the CubeCL backends (cuda, wgpu, cpu-mlir): burn is built without its
-  default features and the pieces we need are enabled one by one (`nn` feature). History: in
-  burn 0.21 fusion miscomputed elementwise ops fused onto single-column matmuls and raced under
-  the Learner's threads; once those stopped biting it was still 20-40% slower, because its
-  deferred execution undoes the self-play pipelining (the device starts only at the readback)
-  and its graph exploration runs on the issuing thread. On burn 0.22.0 (the `fusion` feature
-  of 0.22.1 does not resolve: it needs an unpublished burn-remote) it is neutral on self-play
-  and about 10% slower per generation: steady state 106-108k against 109-114k simulations/s,
-  52-54 s against 45-48 s per reference generation. To experiment, add `burn/fusion` to the
-  `nn` feature in `Cargo.toml`; it is deliberately not a cargo feature, so `--all-features`
-  stays fusion-free. `nn/linear.rs` keeps a test of both heads against a host computation on
-  every compiled backend.
+- Kernel fusion is off on the CubeCL backends (cuda, wgpu, cpu-mlir) unless the `fusion` feature
+  asks for it: burn is built without its default features and the pieces we need are enabled one
+  by one (`nn` feature). burn decides fusion at compile time for every device, so it is all or
+  nothing per binary. On burn 0.22.1 it is correct (the `nn` tests pass) and helps training only:
+  a training step is about 16% faster (median over 25-step buckets, batch 2048, RTX 2080: medium
+  nnue 6.9 against 8.2 ms, nnue-v2 64-512-128-4 reglu 128 9.1 against 10.9 ms), while the
+  inference server is 40-70% slower at 4096 positions per batch (one client: medium 0.78M
+  against 1.29M positions/s, nnue-v2 0.37M against 1.23M), because fusion defers the work to
+  the readback and builds its graph on the issuing thread. So the default build (`--features
+  full`, every backend) has no fusion, and the fused one is a profile of its own for training:
+  `cargo build --profile fusion --features full,fusion` writes target/fusion/brut3 without
+  touching the unfused builds. (History: in burn 0.21 fusion miscomputed elementwise ops fused
+  onto single-column matmuls and raced under the Learner's threads; on 0.22.0 it was neutral on
+  self-play and about 10% slower per loop generation; 0.22.0's `fusion` did not resolve.)
 - On burn 0.21 the MLIR CPU backend (cubecl-cpu 0.10) panicked when the Learner's metric and
   checkpoint threads read tensors produced on the training thread, and `nn/train.rs` carried a
   workaround (eager host reads, no checkpoints there). The port to burn 0.22 dropped it, and
@@ -112,31 +115,36 @@ cargo test --no-default-features
 cargo build --release
 
 # Everything, including CUDA (needs nvcc / CUDA_PATH) and the MLIR CPU backend
-cargo build --release --all-features
-cargo test --all-features
-cargo run --release --all-features -- backends
+cargo build --release --features full
+cargo test --features full
+cargo run --release --features full -- backends
+
+# The same with kernel fusion, for training only (target/fusion/brut3; see "Known upstream
+# issues" on why it is a build of its own)
+cargo build --profile fusion --features full,fusion
+target/fusion/brut3 train --backend cuda ...
 
 # Train the value network on self-play data (live metrics dashboard), then play against it
-cargo run --release --all-features -- train --backend cuda --model linear --data-agent "mcts 50" --games 2000 --epochs 15
-cargo run --release --all-features -- play mcts-nn models/value cuda 400 16
+cargo run --release --features full -- train --backend cuda --model linear --data-agent "mcts 50" --games 2000 --epochs 15
+cargo run --release --features full -- play mcts-nn models/value cuda 400 16
 
 # Self-play data from the current network: 64 games searched at once, 200 simulations per move,
 # Dirichlet root noise, temperature sampling for the first 16 plies
-cargo run --release --all-features -- train --backend cuda --model "board-transformer 64 2 4" \
+cargo run --release --features full -- train --backend cuda --model "board-transformer 64 2 4" \
   --selfplay-evaluator "nn models/board cuda" --games 5000 --simulations 200 --concurrent 256 --tree-batch 8 --out models/board2
 
 # The whole loop: 10 generations of 1000 self-play games each, promotion matches of 20 games
-cargo run --release --all-features -- loop --backend cuda --model "board-transformer 64 2 4" --dir models/loop \
+cargo run --release --features full -- loop --backend cuda --model "board-transformer 64 2 4" --dir models/loop \
   --generations 10 --games 1000 --simulations 200 --eval-games 20 \
   --baseline random --baseline greedy --baseline "mcts 200" --baseline-games 10
-cargo run --release --all-features -- loop --dir models/loop --resume --generations 10
+cargo run --release --features full -- loop --dir models/loop --resume --generations 10
 
 # For scripts and CI: plain log lines instead of the dashboard
-cargo run --release --all-features -- train --backend flex --no-tui --artifact-dir artifacts/run1
+cargo run --release --features full -- train --backend flex --no-tui --artifact-dir artifacts/run1
 
 # A plain `cargo test` skips the tests that train networks or play many search games; include them
 # (in release, they are slow) with:
-cargo test --release --all-features -- --include-ignored
+cargo test --release --features full -- --include-ignored
 # Throughput numbers for engine, agents and search
 cargo test --release --no-default-features -- --ignored --nocapture
 cargo run --release --no-default-features --example bench
@@ -145,7 +153,7 @@ cargo run --release --no-default-features --example bench
 cargo run --release --no-default-features -- mcts 800 3
 
 # Play in the browser at http://127.0.0.1:8080 against any of the listed agents
-cargo run --release --all-features -- serve "mcts 800" "mcts-nn models/x cuda 400 16 book models/book.txt"
+cargo run --release --features full -- serve "mcts 800" "mcts-nn models/x cuda 400 16 book models/book.txt"
 ```
 
 In the REPL, moves are entered as `r1c2/r0c0` (board, then square) or as four digits
