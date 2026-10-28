@@ -14,10 +14,19 @@
 //! that starts at 0 (Bachlechner et al., "ReZero is all you need"): `h + a Block(h)`, or
 //! `ReLU(h + a (W h + b))` for the residual layers, so that the network starts as the
 //! projection alone and each layer's contribution grows as training wants it.
+//!
+//! The heads are the NNUE's with gates (see [`GATES`]): the stream mixes the value's own
+//! logits with the accumulator's skip, `(1 − g) V h + g S acc`, and scales each board's local
+//! policy table and each destination's send table by a gate of its own, so that no shortcut
+//! reaches the output unconditionally. The gates start with zero weights and biases of 1, the
+//! values they keep when weights saved before them are loaded (see [`NnueV2::load_weights`]).
+
+use std::path::Path;
 
 use burn::module::Param;
-use burn::nn::{Linear, LinearConfig};
+use burn::nn::{Initializer, Linear, LinearConfig};
 use burn::prelude::*;
+use burn::store::{ModuleRecord, RecordError};
 use burn::tensor::activation::relu;
 
 use super::model::{MOVES, Model, Prediction};
@@ -25,6 +34,7 @@ use super::nnue::{
     EndLayers,
     Ends,
     FoldedNnue,
+    GATES,
     NnueInput,
     NnueNet,
     ReGlu,
@@ -82,6 +92,10 @@ impl NnueV2Config {
                 .collect(),
             false => Vec::new(),
         };
+        let mut gates = LinearConfig::new(d_h, GATES)
+            .with_initializer(Initializer::Zeros)
+            .init(device);
+        gates.bias = Some(Param::from_tensor(Tensor::ones([GATES], device)));
         let e = EndLayers::new(self.d_embed, self.d_acc, d_h, device);
         NnueV2 {
             config: self.clone(),
@@ -100,6 +114,7 @@ impl NnueV2Config {
             policy: e.policy,
             local_policy: e.local_policy,
             send_policy: e.send_policy,
+            gates,
         }
     }
 }
@@ -130,6 +145,8 @@ pub struct NnueV2 {
     policy: Linear,
     local_policy: burn::nn::Embedding,
     send_policy: burn::nn::Embedding,
+    /// `h -> GATES`, through a sigmoid in the heads.
+    gates: Linear,
 }
 
 impl NnueV2 {
@@ -151,8 +168,31 @@ impl NnueV2 {
             Some(d_ff) => 2 * d_h * d_h + later * 3 * d_h * d_ff,
             None => (1 + later) * d_h * d_h,
         };
-        c.d_acc * d_h + rest + d_h * 3 + c.d_acc * 3 + d_h * MOVES
+        c.d_acc * d_h + rest + d_h * 3 + c.d_acc * 3 + d_h * MOVES + d_h * GATES
     }
+
+    /// Loads the weights saved at `path`, strictly, except that weights saved before the
+    /// heads had gates load too, the gates keeping their initial values.
+    pub fn load_weights(self, path: &Path) -> Result<Self, RecordError> {
+        let record = ModuleRecord::load(path)?;
+        match self.clone().try_load_record(record.clone()) {
+            Err(RecordError::Validation(e)) if only_gates_missing(&e) => {
+                self.try_load_record(record.allow_partial(true))
+            }
+            loaded => loaded,
+        }
+    }
+}
+
+/// Whether a validation error is about missing tensors, all of them the gates'. Burn reports
+/// them only as a message, `Missing tensors: ["gates.weight", ...]`.
+fn only_gates_missing(error: &str) -> bool {
+    let Some(list) = error.strip_prefix("Missing tensors: ") else {
+        return false;
+    };
+    // The quoted paths are the odd pieces between quotes.
+    let mut paths = list.split('"').skip(1).step_by(2).peekable();
+    paths.peek().is_some() && paths.all(|p| p.starts_with("gates."))
 }
 
 impl NnueNet for NnueV2 {
@@ -167,6 +207,7 @@ impl NnueNet for NnueV2 {
             policy: &self.policy,
             local_policy: &self.local_policy,
             send_policy: &self.send_policy,
+            gates: Some(&self.gates),
         }
     }
 
@@ -252,7 +293,25 @@ mod tests {
         let gated = small().with_reglu(Some(24)).init(&device);
         assert_eq!(
             gated.folded_macs(),
-            32 * 16 + 2 * 16 * 16 + 3 * 16 * 24 + 16 * 3 + 32 * 3 + 16 * MOVES
+            32 * 16 + 2 * 16 * 16 + 3 * 16 * 24 + 16 * 3 + 32 * 3 + 16 * MOVES + 16 * GATES
         );
+    }
+
+    #[test]
+    fn gates_start_constant_and_their_absence_alone_is_tolerated() {
+        let _lock = crate::nn::device_lock();
+        let device = BackendKind::preferred().device();
+        let model = small().init(&device);
+        let weight: f32 = model.gates.weight.val().abs().max().into_scalar();
+        let bias: f32 = model.gates.bias.as_ref().unwrap().val().min().into_scalar();
+        assert_eq!((weight, bias), (0.0, 1.0));
+        assert!(only_gates_missing(
+            r#"Missing tensors: ["gates.weight", "gates.bias"]"#
+        ));
+        assert!(!only_gates_missing(
+            r#"Missing tensors: ["gates.weight", "policy.bias"]"#
+        ));
+        assert!(!only_gates_missing("Missing tensors: []"));
+        assert!(!only_gates_missing(r#"Apply errors: ["gates.weight"]"#));
     }
 }

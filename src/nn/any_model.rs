@@ -355,7 +355,7 @@ impl AnyModel {
                     .valid(),
             ),
             AnyModel::NnueV2(m) => AnyModel::NnueV2(
-                m.try_load_file(ModelSpec::weights_path(path))
+                m.load_weights(&ModelSpec::weights_path(path))
                     .map_err(load_err)?
                     .valid(),
             ),

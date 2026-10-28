@@ -19,7 +19,7 @@
 
 use burn::nn::{Embedding, EmbeddingConfig, Initializer, Linear, LinearConfig};
 use burn::prelude::*;
-use burn::tensor::activation::relu;
+use burn::tensor::activation::{relu, sigmoid};
 
 use super::model::{MOVES, Model, Prediction, Predictor, Verdict};
 use crate::game::{BitState, GameState, LINES};
@@ -412,7 +412,16 @@ pub struct Ends<'a> {
     pub policy: &'a Linear,
     pub local_policy: &'a Embedding,
     pub send_policy: &'a Embedding,
+    /// The head gates, `[d_hidden, GATES]` (see [`GATES`]); `None` for heads that add every
+    /// term as it is.
+    pub gates: Option<&'a Linear>,
 }
+
+/// Outputs of the head gates' layer, all through a sigmoid: the value's mix `g`, then the
+/// nine boards' local-table gates `γ_b`, then the nine destinations' send-table gates `γ′_s`.
+/// The value is `(1 − g) V h + g S acc`, and a move's logit `(P h)[b, s] + γ_b L[c_b][s] +
+/// γ′_s T[c_s]`.
+pub const GATES: usize = 1 + 2 * BOARDS;
 
 /// An NNUE model: the shared first layer and heads ([`Ends`]) around hidden layers of its
 /// own, which is all the prediction, the folding and [`FoldedNnue`] need.
@@ -521,6 +530,7 @@ impl NnueNet for Nnue {
             policy: &self.policy,
             local_policy: &self.local_policy,
             send_policy: &self.send_policy,
+            gates: None,
         }
     }
 
@@ -574,7 +584,7 @@ fn accumulate(e: &Ends, ids: NnueInput) -> Tensor<2> {
 /// The heads: the value from the hidden state `h` and the rectified accumulator `acc`, and the
 /// policy, which also reads the nine boards' contents (`[n, BOARDS]`) in the policy tables
 /// `local_policy` (`[_, CELLS]`) and `send_policy` (`[_, 1]`), the model's own or re-indexed
-/// copies.
+/// copies. With gates, `h` weighs the skip and the tables (see [`GATES`]).
 fn heads(
     e: &Ends,
     h: Tensor<2>,
@@ -584,11 +594,25 @@ fn heads(
     send_policy: Tensor<2>,
 ) -> Prediction {
     let n = contents.dims()[0];
-    let wdl = e.value.forward(h.clone()) + e.value_skip.forward(acc);
+    let value = e.value.forward(h.clone());
+    let skip = e.value_skip.forward(acc);
     // Board-major `[n, 9, 9]` is `Move::index` order (`board * 9 + square`).
     let local = rows(local_policy, contents.clone());
     let send = rows(send_policy, contents).reshape([n, 1, CELLS]);
-    let policy = e.policy.forward(h).reshape([n, BOARDS, CELLS]) + local + send;
+    let global = e.policy.forward(h.clone()).reshape([n, BOARDS, CELLS]);
+    let (wdl, policy) = match e.gates {
+        None => (value + skip, global + local + send),
+        Some(gates) => {
+            let g = sigmoid(gates.forward(h));
+            let mix = g.clone().slice([0..n, 0..1]);
+            let local_gate = g.clone().slice([0..n, 1..1 + BOARDS]).reshape([n, BOARDS, 1]);
+            let send_gate = g.slice([0..n, 1 + BOARDS..GATES]).reshape([n, 1, CELLS]);
+            (
+                value.clone() + (skip - value) * mix,
+                global + local * local_gate + send * send_gate,
+            )
+        }
+    };
     Prediction {
         wdl,
         policy: policy.reshape([n, MOVES]),
