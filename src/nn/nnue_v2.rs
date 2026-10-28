@@ -1,0 +1,215 @@
+//! [`NnueV2`]: the NNUE's first layer and heads (see [`super::nnue`]) around reworked hidden
+//! layers. The accumulator's projection to the hidden width is left unrectified, `h0 = W acc +
+//! b`, and the first hidden layer reads it both ways:
+//!
+//! - with ReGLU (`reglu = Some(d_ff)`), `h = h0 + W_down (ReLU(h0) * (W_up h0 + b))`: the
+//!   projection is the gate itself, so this block has no gate matrix and its inner width is
+//!   the hidden width; the later layers are ordinary [`ReGlu`] blocks of inner width `d_ff`;
+//! - without, `h = ReLU(h0 + W ReLU(h0) + b)`, the later layers residual,
+//!   `h <- ReLU(h + W h + b)`.
+//!
+//! Neither `W_down` has a bias: the stream is only ever read by affine maps next.
+
+use burn::nn::{Linear, LinearConfig};
+use burn::prelude::*;
+use burn::tensor::activation::relu;
+
+use super::model::{MOVES, Model, Prediction};
+use super::nnue::{
+    EndLayers,
+    Ends,
+    FoldedNnue,
+    NnueInput,
+    NnueNet,
+    ReGlu,
+    fold,
+    nnue_input,
+    predict,
+};
+use crate::game::BitState;
+
+#[derive(Config, Debug, PartialEq)]
+pub struct NnueV2Config {
+    /// Width of the content embedding (the rank of the factored first layer).
+    #[config(default = 64)]
+    pub d_embed: usize,
+    /// Width of the accumulator (the folded tables' rows).
+    #[config(default = 256)]
+    pub d_acc: usize,
+    /// Width of the hidden state.
+    #[config(default = 32)]
+    pub d_hidden: usize,
+    /// Hidden layers: the projection from the accumulator, the first layer, then the others.
+    #[config(default = 2)]
+    pub layers: usize,
+    /// Inner width of the ReGLU blocks after the first layer; `None` for residual layers.
+    pub reglu: Option<usize>,
+}
+
+impl NnueV2Config {
+    pub fn init(&self, device: &Device) -> NnueV2 {
+        assert!(
+            self.layers >= 2,
+            "the projection and at least one hidden layer"
+        );
+        let (d_h, later) = (self.d_hidden, self.layers - 2);
+        let linear = |d_in, d_out| LinearConfig::new(d_in, d_out).init(device);
+        let (first_down, hidden, glu) = match self.reglu {
+            Some(d_ff) => (
+                Some(LinearConfig::new(d_h, d_h).with_bias(false).init(device)),
+                Vec::new(),
+                (0..later).map(|_| ReGlu::new(d_h, d_ff, device)).collect(),
+            ),
+            None => (
+                None,
+                (0..later).map(|_| linear(d_h, d_h)).collect(),
+                Vec::new(),
+            ),
+        };
+        let e = EndLayers::new(self.d_embed, self.d_acc, d_h, device);
+        NnueV2 {
+            config: self.clone(),
+            content: e.content,
+            mix: e.mix,
+            forced_mix: e.forced_mix,
+            features: e.features,
+            proj: linear(self.d_acc, d_h),
+            first: linear(d_h, d_h),
+            first_down,
+            hidden,
+            glu,
+            value: e.value,
+            value_skip: e.value_skip,
+            policy: e.policy,
+            local_policy: e.local_policy,
+            send_policy: e.send_policy,
+        }
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct NnueV2 {
+    #[module(skip)]
+    config: NnueV2Config,
+    content: burn::nn::Embedding,
+    mix: Linear,
+    forced_mix: Linear,
+    features: burn::nn::Embedding,
+    /// `acc -> h0`, without a ReLU.
+    proj: Linear,
+    /// The first layer's matrix: `W_up` of the gated layer, or `W` of the residual one.
+    first: Linear,
+    /// The gated first layer's `W_down`; `None` for the residual one.
+    first_down: Option<Linear>,
+    /// The residual layers after the first.
+    hidden: Vec<Linear>,
+    /// The ReGLU blocks after the first layer.
+    glu: Vec<ReGlu>,
+    value: Linear,
+    value_skip: Linear,
+    policy: Linear,
+    local_policy: burn::nn::Embedding,
+    send_policy: burn::nn::Embedding,
+}
+
+impl NnueV2 {
+    pub fn config(&self) -> NnueV2Config {
+        self.config.clone()
+    }
+
+    /// The same network for inference, with its first layer folded into one table (see
+    /// [`FoldedNnue`]).
+    pub fn fold(&self) -> FoldedNnue<NnueV2> {
+        fold(self)
+    }
+
+    /// Multiply-adds of one evaluation once the first layer is folded into tables.
+    pub fn folded_macs(&self) -> usize {
+        let c = &self.config;
+        let (d_h, later) = (c.d_hidden, c.layers - 2);
+        let rest = match c.reglu {
+            Some(d_ff) => 2 * d_h * d_h + later * 3 * d_h * d_ff,
+            None => (1 + later) * d_h * d_h,
+        };
+        c.d_acc * d_h + rest + d_h * 3 + c.d_acc * 3 + d_h * MOVES
+    }
+}
+
+impl NnueNet for NnueV2 {
+    fn ends(&self) -> Ends<'_> {
+        Ends {
+            content: &self.content,
+            mix: &self.mix,
+            forced_mix: &self.forced_mix,
+            features: &self.features,
+            value: &self.value,
+            value_skip: &self.value_skip,
+            policy: &self.policy,
+            local_policy: &self.local_policy,
+            send_policy: &self.send_policy,
+        }
+    }
+
+    fn trunk(&self, acc: Tensor<2>) -> Tensor<2> {
+        let h0 = self.proj.forward(acc);
+        let mut h = match &self.first_down {
+            Some(down) => h0.clone() + down.forward(relu(h0.clone()) * self.first.forward(h0)),
+            None => relu(h0.clone() + self.first.forward(relu(h0))),
+        };
+        for layer in &self.hidden {
+            h = relu(h.clone() + layer.forward(h));
+        }
+        for block in &self.glu {
+            h = h.clone() + block.forward(h);
+        }
+        h
+    }
+}
+
+impl Model for NnueV2 {
+    type Input = NnueInput;
+
+    fn encode(states: &[BitState], device: &Device) -> NnueInput {
+        nnue_input(states, device)
+    }
+
+    fn predict(&self, ids: NnueInput) -> Prediction {
+        predict(self, ids)
+    }
+}
+
+crate::nn::train::impl_train_steps!(NnueV2);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nn::BackendKind;
+    use crate::nn::nnue::assert_folds;
+
+    fn small() -> NnueV2Config {
+        NnueV2Config::new()
+            .with_d_embed(16)
+            .with_d_acc(32)
+            .with_d_hidden(16)
+            .with_layers(3)
+    }
+
+    #[test]
+    fn folds_with_residual_and_gated_layers() {
+        let _lock = crate::nn::device_lock();
+        let device = BackendKind::preferred().device();
+        for config in [small(), small().with_reglu(Some(24))] {
+            let model = config.init(&device);
+            match config.reglu {
+                Some(_) => assert_eq!((model.hidden.len(), model.glu.len()), (0, 1)),
+                None => assert_eq!((model.hidden.len(), model.glu.len()), (1, 0)),
+            }
+            assert_folds(&model, &device);
+        }
+        let gated = small().with_reglu(Some(24)).init(&device);
+        assert_eq!(
+            gated.folded_macs(),
+            32 * 16 + 2 * 16 * 16 + 3 * 16 * 24 + 16 * 3 + 32 * 3 + 16 * MOVES
+        );
+    }
+}

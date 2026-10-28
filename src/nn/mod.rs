@@ -22,6 +22,7 @@ pub mod heads;
 pub mod linear;
 pub mod model;
 pub mod nnue;
+pub mod nnue_v2;
 pub mod pipeline;
 pub mod server;
 pub mod train;
@@ -46,6 +47,7 @@ pub use encode::{FEATURES, encode_batch, encode_into};
 pub use linear::{LinearNet, LinearNetConfig};
 pub use model::{HostPrediction, MOVES, Model, Prediction, Verdict, expected_value};
 pub use nnue::{Nnue, NnueConfig};
+pub use nnue_v2::{NnueV2, NnueV2Config};
 pub use pipeline::{GenerationReport, LoopConfig, ReplayBuffer, run_loop, train_model};
 pub use server::{EvalServer, MAX_BATCH, RemoteEvaluator};
 pub use train::{

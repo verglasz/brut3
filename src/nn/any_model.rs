@@ -25,6 +25,7 @@ use super::heads::BodyConfig;
 use super::linear::{LinearNet, LinearNetConfig};
 use super::model::{HostPrediction, predict_host, predict_logits, predict_logits_tensor};
 use super::nnue::{Nnue, NnueConfig};
+use super::nnue_v2::{NnueV2, NnueV2Config};
 use crate::game::BitState;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -42,12 +43,16 @@ pub enum ModelSpec {
     /// Table-driven: content embeddings mixed into an accumulator, a small MLP, table-assisted
     /// policy. The first layer folds into lookups at export.
     Nnue(NnueConfig),
+    /// The NNUE's tables and heads around reworked hidden layers: an unrectified projection
+    /// that gates or feeds the first layer (see [`super::nnue_v2`]).
+    NnueV2(NnueV2Config),
 }
 
 impl ModelSpec {
     pub const NAMES: &str = "`linear`; `board-transformer`, `cell-transformer`, `board-v2` or \
          `cell-v2`, each followed by `[d_model] [layers] [heads]`; or `nnue` followed by \
-         `[d_embed] [d_acc] [d_hidden] [layers] [reglu D_FF]`";
+         `[d_embed] [d_acc] [d_hidden] [layers] [reglu D_FF]`; or `nnue-v2` likewise, with at least 2 \
+         layers";
 
     /// Parses a model name with optional hyperparameters, e.g. `linear`,
     /// `board-transformer 64 2 4` (`d_model`, layers, heads).
@@ -72,6 +77,7 @@ impl ModelSpec {
                 &words[1..],
             )?))),
             Some("nnue") => Ok(Self::Nnue(nnue(&words[1..])?)),
+            Some("nnue-v2") => Ok(Self::NnueV2(nnue_v2(&words[1..])?)),
             Some(other) => Err(format!("unknown model {other:?}; try {}", Self::NAMES)),
             None => Err(format!("missing model name; try {}", Self::NAMES)),
         }
@@ -85,6 +91,7 @@ impl ModelSpec {
             ModelSpec::BoardTransformerV2(cfg) => AnyModel::BoardTransformerV2(cfg.init(device)),
             ModelSpec::CellTransformerV2(cfg) => AnyModel::CellTransformerV2(cfg.init(device)),
             ModelSpec::Nnue(cfg) => AnyModel::Nnue(cfg.init(device)),
+            ModelSpec::NnueV2(cfg) => AnyModel::NnueV2(cfg.init(device)),
         }
     }
 
@@ -105,6 +112,20 @@ fn num(words: &[&str], i: usize, what: &str, default: usize) -> Result<usize, St
             .parse()
             .map_err(|_| format!("{what} must be a number, got {w:?}")),
     }
+}
+
+/// [`nnue`]'s words for an [`NnueV2Config`], which needs at least 2 layers.
+fn nnue_v2(words: &[&str]) -> Result<NnueV2Config, String> {
+    let c = nnue(words)?;
+    if c.layers < 2 {
+        return Err("nnue-v2 needs at least 2 layers: the projection and a hidden layer".into());
+    }
+    Ok(NnueV2Config::new()
+        .with_d_embed(c.d_embed)
+        .with_d_acc(c.d_acc)
+        .with_d_hidden(c.d_hidden)
+        .with_layers(c.layers)
+        .with_reglu(c.reglu))
 }
 
 /// `[d_embed] [d_acc] [d_hidden] [layers]`, each optional, then optionally `reglu D_FF` for
@@ -196,6 +217,17 @@ impl fmt::Display for ModelSpec {
                     Some(d_ff) => write!(f, ", ReGLU {d_ff})"),
                 }
             }
+            ModelSpec::NnueV2(cfg) => {
+                write!(
+                    f,
+                    "nnue-v2 (d_embed {}, d_acc {}, d_hidden {}, {} layers",
+                    cfg.d_embed, cfg.d_acc, cfg.d_hidden, cfg.layers
+                )?;
+                match cfg.reglu {
+                    None => write!(f, ")"),
+                    Some(d_ff) => write!(f, ", ReGLU {d_ff})"),
+                }
+            }
         }
     }
 }
@@ -210,6 +242,7 @@ pub enum AnyModel {
     BoardTransformerV2(BoardTransformerV2),
     CellTransformerV2(CellTransformerV2),
     Nnue(Nnue),
+    NnueV2(NnueV2),
 }
 
 /// Runs `$body` with `$m` bound to the model inside `$any`, whatever its kind.
@@ -222,6 +255,7 @@ macro_rules! with_model {
             AnyModel::BoardTransformerV2($m) => $body,
             AnyModel::CellTransformerV2($m) => $body,
             AnyModel::Nnue($m) => $body,
+            AnyModel::NnueV2($m) => $body,
         }
     };
 }
@@ -235,6 +269,7 @@ impl AnyModel {
             AnyModel::BoardTransformerV2(m) => ModelSpec::BoardTransformerV2(m.config()),
             AnyModel::CellTransformerV2(m) => ModelSpec::CellTransformerV2(m.config()),
             AnyModel::Nnue(m) => ModelSpec::Nnue(m.config()),
+            AnyModel::NnueV2(m) => ModelSpec::NnueV2(m.config()),
         }
     }
 
@@ -312,6 +347,11 @@ impl AnyModel {
                     .map_err(load_err)?
                     .valid(),
             ),
+            AnyModel::NnueV2(m) => AnyModel::NnueV2(
+                m.try_load_file(ModelSpec::weights_path(path))
+                    .map_err(load_err)?
+                    .valid(),
+            ),
         })
     }
 }
@@ -384,6 +424,11 @@ mod tests {
         }
         assert!(ModelSpec::parse(&["nnue", "reglu"]).is_err());
         assert!(ModelSpec::parse(&["nnue", "reglu", "0"]).is_err());
+        match ModelSpec::parse(&["nnue-v2", "64", "512", "128", "4", "reglu", "176"]).unwrap() {
+            ModelSpec::NnueV2(cfg) => assert_eq!((cfg.layers, cfg.reglu), (4, Some(176))),
+            other => panic!("parsed {other}"),
+        }
+        assert!(ModelSpec::parse(&["nnue-v2", "64", "512", "128", "1"]).is_err());
     }
 
     #[test]

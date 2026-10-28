@@ -315,7 +315,7 @@ pub struct NnueConfig {
     #[config(default = 2)]
     pub layers: usize,
     /// Inner width of the layers after the first as ReGLU blocks,
-    /// `h <- h + W_down (ReLU(W_gate h + b) * (W_up h + b)) + b` with `W_gate` and `W_up`
+    /// `h <- h + W_down (ReLU(W_gate h + b) * (W_up h + b))` with `W_gate` and `W_up`
     /// mapping to this width (see [`ReGlu`]); `None` keeps residual layers
     /// `h <- ReLU(h + W h + b)`. An `Option` so that specs saved before it existed, which lack
     /// the field, load as residual networks.
@@ -331,38 +331,66 @@ impl Default for NnueConfig {
 impl NnueConfig {
     pub fn init(&self, device: &Device) -> Nnue {
         assert!(self.layers >= 1, "at least one hidden layer");
-        let normal = |std: f64| Initializer::Normal { mean: 0.0, std };
         let mut hidden = vec![LinearConfig::new(self.d_acc, self.d_hidden).init(device)];
         let mut glu = Vec::new();
         for _ in 1..self.layers {
             match self.reglu {
-                Some(d_ff) => glu.push(ReGlu {
-                    gate: LinearConfig::new(self.d_hidden, d_ff).init(device),
-                    up: LinearConfig::new(self.d_hidden, d_ff).init(device),
-                    down: LinearConfig::new(d_ff, self.d_hidden).init(device),
-                }),
+                Some(d_ff) => glu.push(ReGlu::new(self.d_hidden, d_ff, device)),
                 None => hidden.push(LinearConfig::new(self.d_hidden, self.d_hidden).init(device)),
             }
         }
+        let e = EndLayers::new(self.d_embed, self.d_acc, self.d_hidden, device);
         Nnue {
             config: self.clone(),
-            content: EmbeddingConfig::new(CONTENT_ROWS, self.d_embed)
-                .with_initializer(normal(0.02))
-                .init(device),
-            mix: LinearConfig::new(BOARDS * self.d_embed, self.d_acc).init(device),
-            forced_mix: LinearConfig::new(self.d_embed, self.d_acc)
-                .with_bias(false)
-                .init(device),
-            features: EmbeddingConfig::new(FEATURE_ROWS, self.d_acc)
-                .with_initializer(normal(0.02))
-                .init(device),
+            content: e.content,
+            mix: e.mix,
+            forced_mix: e.forced_mix,
+            features: e.features,
             hidden,
             glu,
-            value: LinearConfig::new(self.d_hidden, Verdict::ALL.len()).init(device),
-            value_skip: LinearConfig::new(self.d_acc, Verdict::ALL.len())
+            value: e.value,
+            value_skip: e.value_skip,
+            policy: e.policy,
+            local_policy: e.local_policy,
+            send_policy: e.send_policy,
+        }
+    }
+}
+
+/// The layers every NNUE model has around its hidden ones, freshly initialised: the first
+/// layer's tables and matrices, and the heads. The models keep them as fields of their own,
+/// under these names, so that saved weights keep their names, and lend them out as [`Ends`].
+pub(crate) struct EndLayers {
+    pub content: Embedding,
+    pub mix: Linear,
+    pub forced_mix: Linear,
+    pub features: Embedding,
+    pub value: Linear,
+    pub value_skip: Linear,
+    pub policy: Linear,
+    pub local_policy: Embedding,
+    pub send_policy: Embedding,
+}
+
+impl EndLayers {
+    pub fn new(d_embed: usize, d_acc: usize, d_hidden: usize, device: &Device) -> Self {
+        let normal = |std: f64| Initializer::Normal { mean: 0.0, std };
+        Self {
+            content: EmbeddingConfig::new(CONTENT_ROWS, d_embed)
+                .with_initializer(normal(0.02))
+                .init(device),
+            mix: LinearConfig::new(BOARDS * d_embed, d_acc).init(device),
+            forced_mix: LinearConfig::new(d_embed, d_acc)
                 .with_bias(false)
                 .init(device),
-            policy: LinearConfig::new(self.d_hidden, MOVES).init(device),
+            features: EmbeddingConfig::new(FEATURE_ROWS, d_acc)
+                .with_initializer(normal(0.02))
+                .init(device),
+            value: LinearConfig::new(d_hidden, Verdict::ALL.len()).init(device),
+            value_skip: LinearConfig::new(d_acc, Verdict::ALL.len())
+                .with_bias(false)
+                .init(device),
+            policy: LinearConfig::new(d_hidden, MOVES).init(device),
             local_policy: EmbeddingConfig::new(CONTENTS, CELLS)
                 .with_initializer(normal(0.02))
                 .init(device),
@@ -373,9 +401,33 @@ impl NnueConfig {
     }
 }
 
-/// A gated hidden block: `h + W_down (ReLU(W_gate h + b) * (W_up h + b)) + b`, the ReLU-gated
+/// An NNUE model's layers around its hidden ones, borrowed (see [`EndLayers`]).
+pub struct Ends<'a> {
+    pub content: &'a Embedding,
+    pub mix: &'a Linear,
+    pub forced_mix: &'a Linear,
+    pub features: &'a Embedding,
+    pub value: &'a Linear,
+    pub value_skip: &'a Linear,
+    pub policy: &'a Linear,
+    pub local_policy: &'a Embedding,
+    pub send_policy: &'a Embedding,
+}
+
+/// An NNUE model: the shared first layer and heads ([`Ends`]) around hidden layers of its
+/// own, which is all the prediction, the folding and [`FoldedNnue`] need.
+pub trait NnueNet: Module {
+    fn ends(&self) -> Ends<'_>;
+
+    /// The hidden layers: from the rectified accumulator to the state the heads read.
+    fn trunk(&self, acc: Tensor<2>) -> Tensor<2>;
+}
+
+/// A gated hidden block: `h + W_down (ReLU(W_gate h + b) * (W_up h + b))`, the ReLU-gated
 /// linear unit of Shazeer's "GLU variants" (ReGLU) on a residual connection. Unlike the
 /// residual layers, the stream itself is not rectified, so it carries negative values on.
+/// `W_down` has no bias: whatever reads the stream next is affine (the next block's
+/// projections, the heads), so a constant added to it would fold into their biases.
 #[derive(Module, Debug)]
 pub struct ReGlu {
     gate: Linear,
@@ -384,8 +436,19 @@ pub struct ReGlu {
 }
 
 impl ReGlu {
+    /// A block on a `d_hidden` stream with `d_ff`-wide gate and up projections.
+    pub(crate) fn new(d_hidden: usize, d_ff: usize, device: &Device) -> Self {
+        Self {
+            gate: LinearConfig::new(d_hidden, d_ff).init(device),
+            up: LinearConfig::new(d_hidden, d_ff).init(device),
+            down: LinearConfig::new(d_ff, d_hidden)
+                .with_bias(false)
+                .init(device),
+        }
+    }
+
     /// The block's branch, to add to `h`.
-    fn forward(&self, h: Tensor<2>) -> Tensor<2> {
+    pub(crate) fn forward(&self, h: Tensor<2>) -> Tensor<2> {
         self.down
             .forward(relu(self.gate.forward(h.clone())) * self.up.forward(h))
     }
@@ -438,113 +501,38 @@ impl Nnue {
 }
 
 impl Nnue {
-    /// The accumulator before its ReLU: the board tokens through their matrices, the forced
-    /// token through its own, the feature rows and the bias.
-    fn accumulate(&self, ids: NnueInput) -> Tensor<2> {
-        let [n, _] = ids.dims();
-        let d_e = self.config.d_embed;
-        let d_acc = self.config.d_acc;
-        let token_ids = ids.clone().slice([0..n, 0..TOKENS * IDS_PER_BOARD]);
-        // Every token is the sum of its content row and its nine cell rows.
-        let tokens = lookup(&self.content, token_ids)
-            .reshape([n, TOKENS, IDS_PER_BOARD, d_e])
-            .sum_dim(2)
-            .reshape([n, TOKENS, d_e]);
-        let boards = tokens
-            .clone()
-            .slice([0..n, 0..BOARDS])
-            .reshape([n, BOARDS * d_e]);
-        let forced = tokens.slice([0..n, BOARDS..TOKENS]).reshape([n, d_e]);
-        let features = lookup(
-            &self.features,
-            ids.slice([0..n, TOKENS * IDS_PER_BOARD..IDS]),
-        )
-        .sum_dim(1)
-        .reshape([n, d_acc]);
-        self.mix.forward(boards) + self.forced_mix.forward(forced) + features
+    /// The same network for inference, with its first layer folded into one table of
+    /// accumulator rows indexed by raw board code (see [`FoldedNnue`]). Computed here on the
+    /// model's device.
+    pub fn fold(&self) -> FoldedNnue<Nnue> {
+        fold(self)
+    }
+}
+
+impl NnueNet for Nnue {
+    fn ends(&self) -> Ends<'_> {
+        Ends {
+            content: &self.content,
+            mix: &self.mix,
+            forced_mix: &self.forced_mix,
+            features: &self.features,
+            value: &self.value,
+            value_skip: &self.value_skip,
+            policy: &self.policy,
+            local_policy: &self.local_policy,
+            send_policy: &self.send_policy,
+        }
     }
 
-    /// Everything after the accumulator: the MLP, the value heads and the policy, which also
-    /// reads the nine boards' contents (`[n, BOARDS]`) in the policy tables `local_policy`
-    /// (`[_, CELLS]`) and `send_policy` (`[_, 1]`), the model's own or re-indexed copies.
-    fn heads(
-        &self,
-        acc: Tensor<2>,
-        contents: Tensor<2, Int>,
-        local_policy: Tensor<2>,
-        send_policy: Tensor<2>,
-    ) -> Prediction {
-        let n = contents.dims()[0];
-        let mut h = relu(self.hidden[0].forward(acc.clone()));
+    fn trunk(&self, acc: Tensor<2>) -> Tensor<2> {
+        let mut h = relu(self.hidden[0].forward(acc));
         for layer in &self.hidden[1..] {
             h = relu(h.clone() + layer.forward(h));
         }
         for block in &self.glu {
             h = h.clone() + block.forward(h);
         }
-
-        let wdl = self.value.forward(h.clone()) + self.value_skip.forward(acc);
-
-        // Board-major `[n, 9, 9]` is `Move::index` order (`board * 9 + square`).
-        let local = rows(local_policy, contents.clone());
-        let send = rows(send_policy, contents).reshape([n, 1, CELLS]);
-        let policy = self.policy.forward(h).reshape([n, BOARDS, CELLS]) + local + send;
-        Prediction {
-            wdl,
-            policy: policy.reshape([n, MOVES]),
-        }
-    }
-
-    /// The same network for inference, with its first layer folded into one table of
-    /// accumulator rows indexed by raw board code (see [`FoldedNnue`]). Computed here on the
-    /// model's device.
-    pub fn fold(&self) -> FoldedNnue {
-        let device = self.content.weight.device();
-        let d_e = self.config.d_embed;
-        let ids = Tensor::<2, Int>::from_data(
-            TensorData::new(token_ids(), [CONTENTS + 1, IDS_PER_BOARD]),
-            &device,
-        );
-        // The token of every content (rows 0..CONTENTS) and of "no forced board" (the last).
-        let tokens = lookup(&self.content, ids)
-            .sum_dim(1)
-            .reshape([CONTENTS + 1, d_e]);
-        // Spread over the raw codes; codes no game reaches get zero rows (and so zero
-        // products), never read.
-        let (to_compact, reachable) = raw_contents();
-        let to_compact =
-            Tensor::<1, Int>::from_data(TensorData::new(to_compact, [RAW_CONTENTS]), &device);
-        let reachable =
-            Tensor::<2>::from_data(TensorData::new(reachable, [RAW_CONTENTS, 1]), &device);
-        let spread = |table: Tensor<2>| table.select(0, to_compact.clone()) * reachable.clone();
-        let raw_tokens = spread(tokens.clone().slice([0..CONTENTS]));
-        let mix = self.mix.weight.val();
-        let mut parts: Vec<Tensor<2>> = (0..BOARDS)
-            .map(|k| {
-                raw_tokens
-                    .clone()
-                    .matmul(mix.clone().slice([k * d_e..(k + 1) * d_e]))
-            })
-            .collect();
-        // Every position has exactly one forced token, so the layer's bias rides on its rows
-        // (only on the reachable ones and "no forced board", the others staying zero).
-        let forced_tokens =
-            Tensor::cat(vec![raw_tokens, tokens.slice([CONTENTS..CONTENTS + 1])], 0);
-        let mut forced = forced_tokens.matmul(self.forced_mix.weight.val());
-        if let Some(bias) = &self.mix.bias {
-            let used = Tensor::cat(vec![reachable.clone(), Tensor::ones([1, 1], &device)], 0);
-            forced = forced + bias.val().unsqueeze::<2>() * used;
-        }
-        parts.push(forced);
-        parts.push(self.features.weight.val());
-        let offsets = (0..BOARDS).map(|k| (k * RAW_CONTENTS) as i32).collect();
-        FoldedNnue {
-            table: Tensor::cat(parts, 0),
-            offsets: Tensor::from_data(TensorData::new(offsets, [1, BOARDS]), &device),
-            local_policy: spread(self.local_policy.weight.val()),
-            send_policy: spread(self.send_policy.weight.val()),
-            net: self.clone(),
-        }
+        h
     }
 }
 
@@ -556,20 +544,128 @@ impl Model for Nnue {
     }
 
     fn predict(&self, ids: NnueInput) -> Prediction {
-        let [n, _] = ids.dims();
-        // Content ids of the nine boards: every tenth id of the first nine tokens.
-        let contents = ids
-            .clone()
-            .slice([0..n, 0..BOARDS * IDS_PER_BOARD])
-            .reshape([n, BOARDS, IDS_PER_BOARD])
-            .slice([0..n, 0..BOARDS, 0..1])
-            .reshape([n, BOARDS]);
-        self.heads(
-            relu(self.accumulate(ids)),
-            contents,
-            self.local_policy.weight.val(),
-            self.send_policy.weight.val(),
-        )
+        predict(self, ids)
+    }
+}
+
+/// The accumulator before its ReLU: the board tokens through their matrices, the forced token
+/// through its own, the feature rows and the bias.
+fn accumulate(e: &Ends, ids: NnueInput) -> Tensor<2> {
+    let [n, _] = ids.dims();
+    let [_, d_e] = e.content.weight.dims();
+    let [_, d_acc] = e.features.weight.dims();
+    let token_ids = ids.clone().slice([0..n, 0..TOKENS * IDS_PER_BOARD]);
+    // Every token is the sum of its content row and its nine cell rows.
+    let tokens = lookup(e.content, token_ids)
+        .reshape([n, TOKENS, IDS_PER_BOARD, d_e])
+        .sum_dim(2)
+        .reshape([n, TOKENS, d_e]);
+    let boards = tokens
+        .clone()
+        .slice([0..n, 0..BOARDS])
+        .reshape([n, BOARDS * d_e]);
+    let forced = tokens.slice([0..n, BOARDS..TOKENS]).reshape([n, d_e]);
+    let features = lookup(e.features, ids.slice([0..n, TOKENS * IDS_PER_BOARD..IDS]))
+        .sum_dim(1)
+        .reshape([n, d_acc]);
+    e.mix.forward(boards) + e.forced_mix.forward(forced) + features
+}
+
+/// The heads: the value from the hidden state `h` and the rectified accumulator `acc`, and the
+/// policy, which also reads the nine boards' contents (`[n, BOARDS]`) in the policy tables
+/// `local_policy` (`[_, CELLS]`) and `send_policy` (`[_, 1]`), the model's own or re-indexed
+/// copies.
+fn heads(
+    e: &Ends,
+    h: Tensor<2>,
+    acc: Tensor<2>,
+    contents: Tensor<2, Int>,
+    local_policy: Tensor<2>,
+    send_policy: Tensor<2>,
+) -> Prediction {
+    let n = contents.dims()[0];
+    let wdl = e.value.forward(h.clone()) + e.value_skip.forward(acc);
+    // Board-major `[n, 9, 9]` is `Move::index` order (`board * 9 + square`).
+    let local = rows(local_policy, contents.clone());
+    let send = rows(send_policy, contents).reshape([n, 1, CELLS]);
+    let policy = e.policy.forward(h).reshape([n, BOARDS, CELLS]) + local + send;
+    Prediction {
+        wdl,
+        policy: policy.reshape([n, MOVES]),
+    }
+}
+
+/// An NNUE model's prediction from [`nnue_ids`] input: the accumulator, the model's trunk,
+/// the heads.
+pub(crate) fn predict<N: NnueNet>(net: &N, ids: NnueInput) -> Prediction {
+    let [n, _] = ids.dims();
+    // Content ids of the nine boards: every tenth id of the first nine tokens.
+    let contents = ids
+        .clone()
+        .slice([0..n, 0..BOARDS * IDS_PER_BOARD])
+        .reshape([n, BOARDS, IDS_PER_BOARD])
+        .slice([0..n, 0..BOARDS, 0..1])
+        .reshape([n, BOARDS]);
+    let e = net.ends();
+    let acc = relu(accumulate(&e, ids));
+    let h = net.trunk(acc.clone());
+    heads(
+        &e,
+        h,
+        acc,
+        contents,
+        e.local_policy.weight.val(),
+        e.send_policy.weight.val(),
+    )
+}
+
+/// `net` for inference, with its first layer folded into one table of accumulator rows
+/// indexed by raw board code (see [`FoldedNnue`]). Computed on the model's device.
+pub fn fold<N: NnueNet + Clone>(net: &N) -> FoldedNnue<N> {
+    let e = net.ends();
+    let device = e.content.weight.device();
+    let [_, d_e] = e.content.weight.dims();
+    let ids = Tensor::<2, Int>::from_data(
+        TensorData::new(token_ids(), [CONTENTS + 1, IDS_PER_BOARD]),
+        &device,
+    );
+    // The token of every content (rows 0..CONTENTS) and of "no forced board" (the last).
+    let tokens = lookup(e.content, ids)
+        .sum_dim(1)
+        .reshape([CONTENTS + 1, d_e]);
+    // Spread over the raw codes; codes no game reaches get zero rows (and so zero products),
+    // never read.
+    let (to_compact, reachable) = raw_contents();
+    let to_compact =
+        Tensor::<1, Int>::from_data(TensorData::new(to_compact, [RAW_CONTENTS]), &device);
+    let reachable = Tensor::<2>::from_data(TensorData::new(reachable, [RAW_CONTENTS, 1]), &device);
+    let spread = |table: Tensor<2>| table.select(0, to_compact.clone()) * reachable.clone();
+    let raw_tokens = spread(tokens.clone().slice([0..CONTENTS]));
+    let mix = e.mix.weight.val();
+    let mut parts: Vec<Tensor<2>> = (0..BOARDS)
+        .map(|k| {
+            raw_tokens
+                .clone()
+                .matmul(mix.clone().slice([k * d_e..(k + 1) * d_e]))
+        })
+        .collect();
+    // Every position has exactly one forced token, so the layer's bias rides on its rows (only
+    // on the reachable ones and "no forced board", the others staying zero).
+    let forced_tokens = Tensor::cat(vec![raw_tokens, tokens.slice([CONTENTS..CONTENTS + 1])], 0);
+    let mut forced = forced_tokens.matmul(e.forced_mix.weight.val());
+    if let Some(bias) = &e.mix.bias {
+        let used = Tensor::cat(vec![reachable.clone(), Tensor::ones([1, 1], &device)], 0);
+        forced = forced + bias.val().unsqueeze::<2>() * used;
+    }
+    parts.push(forced);
+    parts.push(e.features.weight.val());
+    let offsets = (0..BOARDS).map(|k| (k * RAW_CONTENTS) as i32).collect();
+    FoldedNnue {
+        table: Tensor::cat(parts, 0),
+        offsets: Tensor::from_data(TensorData::new(offsets, [1, BOARDS]), &device),
+        local_policy: spread(e.local_policy.weight.val()),
+        send_policy: spread(e.send_policy.weight.val()),
+        net: net.clone(),
     }
 }
 
@@ -628,7 +724,7 @@ pub const FOLDED_IDS: usize = BOARDS + 1 + FEATURE_IDS;
 /// `9 x 19,683 x d_acc` floats (346 MiB at `d_acc` 512, against 195 MiB compact; the rows of
 /// unreachable codes stay zero). Built eagerly, by [`Nnue::fold`], on the model's device.
 #[derive(Debug)]
-pub struct FoldedNnue {
+pub struct FoldedNnue<N> {
     /// `[10 RAW_CONTENTS + 1 + FEATURE_ROWS, d_acc]`: board `k` with raw code `r` at row
     /// `k RAW_CONTENTS + r`, then the forced tokens with the bias (raw codes, then "no forced
     /// board"), then the feature rows.
@@ -639,7 +735,7 @@ pub struct FoldedNnue {
     local_policy: Tensor<2>,
     send_policy: Tensor<2>,
     /// The network the table was folded from, for everything after the accumulator.
-    net: Nnue,
+    net: N,
 }
 
 /// Writes the rows of the folded table that `state` reads into `out`: the same position as
@@ -683,7 +779,7 @@ pub fn folded_ids(state: &BitState, out: &mut [i32; FOLDED_IDS]) {
     features[2 + LINES.len()] = (FEATURE_TABLE + OPEN_MARKS_BASE + open_marks) as i32;
 }
 
-impl Predictor for FoldedNnue {
+impl<N: NnueNet> Predictor for FoldedNnue<N> {
     type Input = Tensor<2, Int>;
 
     fn encode(states: &[BitState], device: &Device) -> Tensor<2, Int> {
@@ -697,13 +793,18 @@ impl Predictor for FoldedNnue {
 
     fn predict(&self, ids: Tensor<2, Int>) -> Prediction {
         let [n, _] = ids.dims();
-        let d_acc = self.net.config.d_acc;
-        let acc = rows(self.table.clone(), ids.clone())
-            .sum_dim(1)
-            .reshape([n, d_acc]);
+        let [_, d_acc] = self.table.dims();
+        let acc = relu(
+            rows(self.table.clone(), ids.clone())
+                .sum_dim(1)
+                .reshape([n, d_acc]),
+        );
         let codes = ids.slice([0..n, 0..BOARDS]) - self.offsets.clone().expand([n, BOARDS]);
-        self.net.heads(
-            relu(acc),
+        let h = self.net.trunk(acc.clone());
+        heads(
+            &self.net.ends(),
+            h,
+            acc,
             codes,
             self.local_policy.clone(),
             self.send_policy.clone(),
@@ -711,17 +812,49 @@ impl Predictor for FoldedNnue {
     }
 }
 
+/// Asserts that `net` folded computes what `net` does, up to rounding, on positions from
+/// random games (forced and free moves, decided boards). The caller holds the device lock.
+#[cfg(test)]
+pub(crate) fn assert_folds<N>(net: &N, device: &Device)
+where
+    N: NnueNet + Model<Input = NnueInput> + Clone,
+{
+    use rand::{SeedableRng, rngs::SmallRng};
+
+    use super::model::predict_logits;
+
+    let mut rng = SmallRng::seed_from_u64(5);
+    let mut states = Vec::new();
+    for _ in 0..8 {
+        let mut s = BitState::initial();
+        loop {
+            states.push(s);
+            let mv = s.random_move(&mut rng);
+            if s.play(mv).is_some() {
+                break;
+            }
+        }
+    }
+    let expected = predict_logits(net, &states, device);
+    let folded = predict_logits(&fold(net), &states, device);
+    assert_eq!(expected.len(), folded.len());
+    for (i, (e, f)) in expected.iter().zip(&folded).enumerate() {
+        assert!(
+            (e - f).abs() <= 1e-4 * (1.0 + e.abs()),
+            "logit {i}: {e} vs {f}"
+        );
+    }
+}
+
 crate::nn::train::impl_train_steps!(Nnue);
 
 #[cfg(test)]
 mod tests {
-    use rand::{SeedableRng, rngs::SmallRng};
-
     use super::*;
     use crate::game::test_positions::{o_must_block, x_wins_in_one};
     use crate::game::{Move, Player, Square, Symmetry};
     use crate::nn::BackendKind;
-    use crate::nn::model::{predict_host, predict_logits};
+    use crate::nn::model::predict_host;
 
     #[test]
     fn compact_contents_count_and_classify() {
@@ -812,33 +945,10 @@ mod tests {
         assert_eq!(ids[2 * IDS_PER_BOARD + 1], (CELL_BASE + 2) as i32);
     }
 
-    /// The folded network computes what the network `config` builds does, up to rounding, on
-    /// positions from random games (forced and free moves, decided boards).
     fn folded_matches(config: NnueConfig) {
         let _device = crate::nn::device_lock();
         let device = BackendKind::preferred().device();
-        let model = config.init(&device);
-        let mut rng = SmallRng::seed_from_u64(5);
-        let mut states = Vec::new();
-        for _ in 0..8 {
-            let mut s = BitState::initial();
-            loop {
-                states.push(s);
-                let mv = s.random_move(&mut rng);
-                if s.play(mv).is_some() {
-                    break;
-                }
-            }
-        }
-        let expected = predict_logits(&model, &states, &device);
-        let folded = predict_logits(&model.fold(), &states, &device);
-        assert_eq!(expected.len(), folded.len());
-        for (i, (e, f)) in expected.iter().zip(&folded).enumerate() {
-            assert!(
-                (e - f).abs() <= 1e-4 * (1.0 + e.abs()),
-                "logit {i}: {e} vs {f}"
-            );
-        }
+        assert_folds(&config.init(&device), &device);
     }
 
     fn small() -> NnueConfig {

@@ -18,15 +18,32 @@ use super::model::{
     predict_logits,
     predict_logits_tensor,
 };
-use super::nnue::FoldedNnue;
+use super::nnue::{FoldedNnue, Nnue};
+use super::nnue_v2::NnueV2;
 use crate::agent::{Evaluation, Evaluations, UtttAgent};
 use crate::game::{BitState, GameState, Move};
+
+/// An NNUE model's folded form, whichever NNUE model it is.
+enum Folded {
+    Nnue(FoldedNnue<Nnue>),
+    NnueV2(FoldedNnue<NnueV2>),
+}
+
+/// Runs `$body` with `$f` bound to the folded network inside `$folded`.
+macro_rules! with_folded {
+    ($folded:expr, |$f:ident| $body:expr) => {
+        match $folded {
+            Folded::Nnue($f) => $body,
+            Folded::NnueV2($f) => $body,
+        }
+    };
+}
 
 pub struct NetAgent {
     model: AnyModel,
     /// An NNUE model's folded form, which every evaluation goes through when present (see
     /// [`NetAgent::unfolded`]).
-    folded: Option<FoldedNnue>,
+    folded: Option<Folded>,
     device: Device,
     backend: BackendKind,
     /// A forward pass queued by `begin_batch` and not yet read back: the logits tensor and how
@@ -39,7 +56,8 @@ impl NetAgent {
     /// folded for inference here.
     pub fn new(model: AnyModel, backend: BackendKind) -> Self {
         let folded = match &model {
-            AnyModel::Nnue(net) => Some(net.fold()),
+            AnyModel::Nnue(net) => Some(Folded::Nnue(net.fold())),
+            AnyModel::NnueV2(net) => Some(Folded::NnueV2(net.fold())),
             _ => None,
         };
         Self {
@@ -75,7 +93,7 @@ impl NetAgent {
     /// Network outputs for `states`, one forward pass.
     pub fn predict(&self, states: &[BitState]) -> HostPrediction {
         match &self.folded {
-            Some(folded) => predict_host(folded, states, &self.device),
+            Some(folded) => with_folded!(folded, |f| predict_host(f, states, &self.device)),
             None => self.model.predict_host(states, &self.device),
         }
     }
@@ -138,7 +156,7 @@ impl UtttAgent for NetAgent {
     /// One forward pass and one readback for the whole batch.
     fn evaluate_batch(&mut self, states: &[BitState], out: &mut Evaluations) {
         let logits = match &self.folded {
-            Some(folded) => predict_logits(folded, states, &self.device),
+            Some(folded) => with_folded!(folded, |f| predict_logits(f, states, &self.device)),
             None => self.model.predict_logits(states, &self.device),
         };
         Self::fill(states, &logits, out);
@@ -149,7 +167,9 @@ impl UtttAgent for NetAgent {
         assert!(self.in_flight.is_none(), "finish the previous batch first");
         if !states.is_empty() {
             let logits = match &self.folded {
-                Some(folded) => predict_logits_tensor(folded, states, &self.device),
+                Some(folded) => {
+                    with_folded!(folded, |f| predict_logits_tensor(f, states, &self.device))
+                }
                 None => self.model.predict_logits_tensor(states, &self.device),
             };
             self.in_flight = Some((logits, states.len()));
