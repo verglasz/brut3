@@ -9,7 +9,13 @@
 //!   `h <- ReLU(h + W h + b)`.
 //!
 //! Neither `W_down` has a bias: the stream is only ever read by affine maps next.
+//!
+//! With `rezero`, every layer after the projection scales its branch by a learned scalar
+//! that starts at 0 (Bachlechner et al., "ReZero is all you need"): `h + a Block(h)`, or
+//! `ReLU(h + a (W h + b))` for the residual layers, so that the network starts as the
+//! projection alone and each layer's contribution grows as training wants it.
 
+use burn::module::Param;
 use burn::nn::{Linear, LinearConfig};
 use burn::prelude::*;
 use burn::tensor::activation::relu;
@@ -44,6 +50,10 @@ pub struct NnueV2Config {
     pub layers: usize,
     /// Inner width of the ReGLU blocks after the first layer; `None` for residual layers.
     pub reglu: Option<usize>,
+    /// ReZero: each layer after the projection scales its branch by a learned scalar
+    /// starting at 0.
+    #[config(default = false)]
+    pub rezero: bool,
 }
 
 impl NnueV2Config {
@@ -66,6 +76,12 @@ impl NnueV2Config {
                 Vec::new(),
             ),
         };
+        let rezero = match self.rezero {
+            true => (1..self.layers)
+                .map(|_| Param::from_tensor(Tensor::zeros([1], device)))
+                .collect(),
+            false => Vec::new(),
+        };
         let e = EndLayers::new(self.d_embed, self.d_acc, d_h, device);
         NnueV2 {
             config: self.clone(),
@@ -78,6 +94,7 @@ impl NnueV2Config {
             first_down,
             hidden,
             glu,
+            rezero,
             value: e.value,
             value_skip: e.value_skip,
             policy: e.policy,
@@ -105,6 +122,9 @@ pub struct NnueV2 {
     hidden: Vec<Linear>,
     /// The ReGLU blocks after the first layer.
     glu: Vec<ReGlu>,
+    /// With `rezero`, the branch scale of each layer after the projection, the first layer's
+    /// first; empty without.
+    rezero: Vec<Param<Tensor<1>>>,
     value: Linear,
     value_skip: Linear,
     policy: Linear,
@@ -151,16 +171,24 @@ impl NnueNet for NnueV2 {
     }
 
     fn trunk(&self, acc: Tensor<2>) -> Tensor<2> {
+        // Layer `i`'s branch, scaled by its ReZero scalar when there is one.
+        let scaled = |i: usize, branch: Tensor<2>| match self.rezero.get(i) {
+            Some(a) => branch * a.val().unsqueeze::<2>(),
+            None => branch,
+        };
         let h0 = self.proj.forward(acc);
         let mut h = match &self.first_down {
-            Some(down) => h0.clone() + down.forward(relu(h0.clone()) * self.first.forward(h0)),
-            None => relu(h0.clone() + self.first.forward(relu(h0))),
+            Some(down) => {
+                let branch = down.forward(relu(h0.clone()) * self.first.forward(h0.clone()));
+                h0 + scaled(0, branch)
+            }
+            None => relu(h0.clone() + scaled(0, self.first.forward(relu(h0)))),
         };
-        for layer in &self.hidden {
-            h = relu(h.clone() + layer.forward(h));
+        for (i, layer) in self.hidden.iter().enumerate() {
+            h = relu(h.clone() + scaled(1 + i, layer.forward(h)));
         }
-        for block in &self.glu {
-            h = h.clone() + block.forward(h);
+        for (i, block) in self.glu.iter().enumerate() {
+            h = h.clone() + scaled(1 + i, block.forward(h));
         }
         h
     }
@@ -206,6 +234,21 @@ mod tests {
             }
             assert_folds(&model, &device);
         }
+        // ReZero starts every layer as the identity on the stream: the gated network's trunk
+        // is the projection alone, and folding still holds.
+        let rezero = small().with_reglu(Some(24)).with_rezero(true).init(&device);
+        assert_eq!(rezero.rezero.len(), 2);
+        let acc = Tensor::<2>::random(
+            [4, 32],
+            burn::tensor::Distribution::Uniform(0.0, 1.0),
+            &device,
+        );
+        let diff: f32 = (rezero.trunk(acc.clone()) - rezero.proj.forward(acc))
+            .abs()
+            .max()
+            .into_scalar();
+        assert!(diff < 1e-6, "trunk differs from the projection by {diff}");
+        assert_folds(&rezero, &device);
         let gated = small().with_reglu(Some(24)).init(&device);
         assert_eq!(
             gated.folded_macs(),

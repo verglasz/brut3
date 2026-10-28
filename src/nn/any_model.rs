@@ -52,7 +52,7 @@ impl ModelSpec {
     pub const NAMES: &str = "`linear`; `board-transformer`, `cell-transformer`, `board-v2` or \
          `cell-v2`, each followed by `[d_model] [layers] [heads]`; or `nnue` followed by \
          `[d_embed] [d_acc] [d_hidden] [layers] [reglu D_FF]`; or `nnue-v2` likewise, with at least 2 \
-         layers";
+         layers, and optionally `rezero`";
 
     /// Parses a model name with optional hyperparameters, e.g. `linear`,
     /// `board-transformer 64 2 4` (`d_model`, layers, heads).
@@ -114,9 +114,12 @@ fn num(words: &[&str], i: usize, what: &str, default: usize) -> Result<usize, St
     }
 }
 
-/// [`nnue`]'s words for an [`NnueV2Config`], which needs at least 2 layers.
+/// [`nnue`]'s words for an [`NnueV2Config`], which needs at least 2 layers, and optionally
+/// `rezero`.
 fn nnue_v2(words: &[&str]) -> Result<NnueV2Config, String> {
-    let c = nnue(words)?;
+    let rezero = words.contains(&"rezero");
+    let words: Vec<&str> = words.iter().copied().filter(|w| *w != "rezero").collect();
+    let c = nnue(&words)?;
     if c.layers < 2 {
         return Err("nnue-v2 needs at least 2 layers: the projection and a hidden layer".into());
     }
@@ -125,7 +128,8 @@ fn nnue_v2(words: &[&str]) -> Result<NnueV2Config, String> {
         .with_d_acc(c.d_acc)
         .with_d_hidden(c.d_hidden)
         .with_layers(c.layers)
-        .with_reglu(c.reglu))
+        .with_reglu(c.reglu)
+        .with_rezero(rezero))
 }
 
 /// `[d_embed] [d_acc] [d_hidden] [layers]`, each optional, then optionally `reglu D_FF` for
@@ -223,10 +227,13 @@ impl fmt::Display for ModelSpec {
                     "nnue-v2 (d_embed {}, d_acc {}, d_hidden {}, {} layers",
                     cfg.d_embed, cfg.d_acc, cfg.d_hidden, cfg.layers
                 )?;
-                match cfg.reglu {
-                    None => write!(f, ")"),
-                    Some(d_ff) => write!(f, ", ReGLU {d_ff})"),
+                if let Some(d_ff) = cfg.reglu {
+                    write!(f, ", ReGLU {d_ff}")?;
                 }
+                if cfg.rezero {
+                    write!(f, ", ReZero")?;
+                }
+                write!(f, ")")
             }
         }
     }
@@ -429,6 +436,12 @@ mod tests {
             other => panic!("parsed {other}"),
         }
         assert!(ModelSpec::parse(&["nnue-v2", "64", "512", "128", "1"]).is_err());
+        match ModelSpec::parse(&["nnue-v2", "64", "512", "128", "3", "rezero", "reglu", "96"])
+            .unwrap()
+        {
+            ModelSpec::NnueV2(cfg) => assert_eq!((cfg.reglu, cfg.rezero), (Some(96), true)),
+            other => panic!("parsed {other}"),
+        }
     }
 
     #[test]
