@@ -15,6 +15,7 @@ use super::games;
 use super::train::{Dataset, Sample, TrainOptions, TrainReport, generate_threaded, train};
 use crate::agent::AgentSpec;
 use crate::benchmark::{MatchResult, play_match_with};
+use crate::seed::derive_seed;
 use crate::selfplay::{MatchExploration, SelfPlayConfig, SelfPlayStats};
 
 /// Trains a model of kind `spec` on `data`: fresh weights, or continuing from the weights at
@@ -457,7 +458,7 @@ pub fn run_loop(
                 book: None,
             };
             let selfplay = SelfPlayConfig {
-                seed: cfg.selfplay.seed.wrapping_add(generation as u64),
+                seed: derive_seed(cfg.selfplay.seed, generation as u64),
                 ..cfg.selfplay.clone()
             };
             let (data, stats) =
@@ -484,7 +485,7 @@ pub fn run_loop(
         ));
         let train_opts = TrainOptions {
             learning_rate,
-            seed: cfg.train.seed.wrapping_add(generation as u64),
+            seed: derive_seed(cfg.train.seed, generation as u64),
             artifact_dir: cfg.dir.join(format!("artifacts-gen-{generation}")),
             ..cfg.train.clone()
         };

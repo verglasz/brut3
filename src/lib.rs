@@ -20,5 +20,6 @@ pub mod mcts;
 #[cfg(feature = "nn")]
 pub mod nn;
 pub mod repl;
+pub mod seed;
 pub mod selfplay;
 pub mod serve;

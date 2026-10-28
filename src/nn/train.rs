@@ -62,6 +62,7 @@ impl std::str::FromStr for Augment {
         }
     }
 }
+use crate::seed::derive_seed;
 use crate::selfplay::{SelfPlayConfig, SelfPlayStats, self_play};
 
 /// One position with its targets, all from the side to move's view: a move distribution, and
@@ -312,7 +313,8 @@ pub fn self_play_threads(threads: usize, games: usize) -> usize {
 
 /// Plays `games` games of search with `evaluator` as the leaf evaluator on
 /// [`self_play_threads`]`(threads, games)` search threads, each playing a contiguous share of
-/// the games with its own seed (`cfg.seed` plus the thread's index), and returns them as one
+/// the games with its own seed (`cfg.seed` mixed with the thread's index, see
+/// [`derive_seed`]), and returns them as one
 /// dataset (game ids distinct, in thread order) with the statistics summed.
 ///
 /// With several threads, a network evaluator (`nn ...`) runs on one [`super::EvalServer`]
@@ -345,7 +347,7 @@ pub fn generate_threaded(
             .map(|t| {
                 let games = games / threads + usize::from(t < games % threads);
                 let cfg = SelfPlayConfig {
-                    seed: cfg.seed.wrapping_add(t as u64),
+                    seed: derive_seed(cfg.seed, t as u64),
                     ..cfg.clone()
                 };
                 let (server, done, on_game) = (server.as_ref(), &done, &on_game);
