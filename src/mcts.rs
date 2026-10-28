@@ -112,15 +112,15 @@ impl SearchResult {
 const NO_NODE: u32 = u32::MAX;
 
 /// A node of the search: its place in the tree, what is known of its position and its
-/// statistics, in 32 bytes. Positions are not stored; selection carries one down from the root
+/// statistics, in 28 bytes. Positions are not stored; selection carries one down from the root
 /// by applying the edges' moves. A node is created when it is first selected (or at its
 /// parent's expansion when the game is over there), so a tree holds about one node per
 /// simulation rather than one per legal move of every expanded node.
 ///
 /// Its children are a list through `first_child` and their `next_sibling`, each knowing its
-/// `edge`, rather than a child index on every edge: most edges are never visited, so this keeps
+/// edge, rather than a child index on every edge: most edges are never visited, so this keeps
 /// the edges to a prior and a move. With about nine legal moves a position, a simulation costs
-/// about 32 + 9 x 3 bytes.
+/// about 28 + 9 x 3 bytes.
 struct Node {
     parent: u32,
     /// Once expanded, the node's moves: `edges[first_edge..first_edge + n_edges]`.
@@ -132,27 +132,34 @@ struct Node {
     visits: u32,
     /// The values backed up through the node, for its side to move.
     value_sum: f32,
-    /// Leaves claimed below the node and not resolved yet: at most one round's claims.
-    virtual_losses: u16,
-    n_edges: u8,
-    /// The parent's edge that leads here: `edges[parent.first_edge + edge]`.
-    edge: u8,
-    /// [`EXPANDED`], [`PENDING`], [`O_TO_MOVE`], and from bit [`OUTCOME_SHIFT`] the outcome:
-    /// how the position ends, its result if the game is over there or the result proven from
-    /// its children (see `try_prove`), as [`outcome_bits`] writes it.
-    flags: u8,
+    /// The small fields in one word, lowest bits first:
+    /// - the virtual losses: leaves claimed below the node and not resolved yet, at most one
+    ///   round's claims (13 bits, so at most [`MAX_VIRTUAL_LOSSES`]); lowest so that adding
+    ///   and removing one is a plain increment;
+    /// - `n_edges`, the number of moves once expanded (7 bits);
+    /// - `edge`, the parent's edge that leads here: `edges[parent.first_edge + edge]` (7 bits);
+    /// - whether it is expanded, whether its leaf is claimed in the current round, whether O is
+    ///   to move (a bit each);
+    /// - the outcome (2 bits, as [`outcome_bits`] writes it): its result if the game is over
+    ///   there, or the result proven from its children (see `try_prove`).
+    packed: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<Node>() == 32);
+const _: () = assert!(std::mem::size_of::<Node>() == 28);
 
-const EXPANDED: u8 = 1;
+/// Leaves a round may claim below one node: the virtual losses' 13 bits.
+const MAX_VIRTUAL_LOSSES: u32 = (1 << 13) - 1;
+const N_EDGES_SHIFT: u32 = 13;
+const EDGE_SHIFT: u32 = 20;
+const EXPANDED: u32 = 1 << 27;
 /// The node is a leaf claimed in the current round.
-const PENDING: u8 = 2;
-const O_TO_MOVE: u8 = 4;
-const OUTCOME_SHIFT: u8 = 3;
+const PENDING: u32 = 1 << 28;
+const O_TO_MOVE: u32 = 1 << 29;
+const OUTCOME_SHIFT: u32 = 30;
+const SEVEN_BITS: u32 = 0x7f;
 
 /// An outcome in two bits: none, X won, O won, drawn.
-const fn outcome_bits(outcome: Option<Outcome>) -> u8 {
+const fn outcome_bits(outcome: Option<Outcome>) -> u32 {
     match outcome {
         None => 0,
         Some(Outcome::Win(Player::X)) => 1,
@@ -166,7 +173,7 @@ impl Node {
     /// parent's list.
     fn new(
         parent: u32,
-        edge: u8,
+        edge: usize,
         next_sibling: u32,
         to_move: Player,
         outcome: Option<Outcome>,
@@ -179,31 +186,58 @@ impl Node {
             next_sibling,
             visits: 0,
             value_sum: 0.0,
-            virtual_losses: 0,
-            n_edges: 0,
-            edge,
-            flags: o | outcome_bits(outcome) << OUTCOME_SHIFT,
+            packed: (edge as u32) << EDGE_SHIFT | o | outcome_bits(outcome) << OUTCOME_SHIFT,
         }
     }
 
     fn edges(&self) -> std::ops::Range<usize> {
-        self.first_edge as usize..self.first_edge as usize + self.n_edges as usize
+        self.first_edge as usize..self.first_edge as usize + self.n_edges()
+    }
+
+    fn n_edges(&self) -> usize {
+        (self.packed >> N_EDGES_SHIFT & SEVEN_BITS) as usize
+    }
+
+    /// Marks the node expanded with `n` moves from `first_edge` on.
+    fn set_expanded(&mut self, first_edge: u32, n: usize) {
+        self.first_edge = first_edge;
+        self.packed =
+            self.packed & !(SEVEN_BITS << N_EDGES_SHIFT) | (n as u32) << N_EDGES_SHIFT | EXPANDED;
+    }
+
+    /// The parent's edge that leads here.
+    fn edge(&self) -> usize {
+        (self.packed >> EDGE_SHIFT & SEVEN_BITS) as usize
+    }
+
+    fn virtual_losses(&self) -> u32 {
+        self.packed & MAX_VIRTUAL_LOSSES
+    }
+
+    fn add_virtual_loss(&mut self) {
+        debug_assert!(self.virtual_losses() < MAX_VIRTUAL_LOSSES);
+        self.packed += 1;
+    }
+
+    fn remove_virtual_loss(&mut self) {
+        debug_assert!(self.virtual_losses() > 0);
+        self.packed -= 1;
     }
 
     fn expanded(&self) -> bool {
-        self.flags & EXPANDED != 0
+        self.packed & EXPANDED != 0
     }
 
     fn pending(&self) -> bool {
-        self.flags & PENDING != 0
+        self.packed & PENDING != 0
     }
 
     fn set_pending(&mut self, pending: bool) {
-        self.flags = self.flags & !PENDING | if pending { PENDING } else { 0 };
+        self.packed = self.packed & !PENDING | if pending { PENDING } else { 0 };
     }
 
     fn to_move(&self) -> Player {
-        if self.flags & O_TO_MOVE != 0 {
+        if self.packed & O_TO_MOVE != 0 {
             Player::O
         } else {
             Player::X
@@ -211,7 +245,7 @@ impl Node {
     }
 
     fn outcome(&self) -> Option<Outcome> {
-        match self.flags >> OUTCOME_SHIFT {
+        match self.packed >> OUTCOME_SHIFT {
             0 => None,
             1 => Some(Outcome::Win(Player::X)),
             2 => Some(Outcome::Win(Player::O)),
@@ -220,12 +254,12 @@ impl Node {
     }
 
     fn set_outcome(&mut self, outcome: Outcome) {
-        let low = self.flags & ((1 << OUTCOME_SHIFT) - 1);
-        self.flags = low | outcome_bits(Some(outcome)) << OUTCOME_SHIFT;
+        let low = self.packed & ((1 << OUTCOME_SHIFT) - 1);
+        self.packed = low | outcome_bits(Some(outcome)) << OUTCOME_SHIFT;
     }
 
     fn effective_visits(&self) -> u32 {
-        self.visits + u32::from(self.virtual_losses)
+        self.visits + self.virtual_losses()
     }
 
     fn q_for_parent(&self, virtual_loss: f32) -> f32 {
@@ -233,7 +267,7 @@ impl Node {
         if n == 0 {
             0.0
         } else {
-            -(self.value_sum + virtual_loss * f32::from(self.virtual_losses)) / n as f32
+            -(self.value_sum + virtual_loss * self.virtual_losses() as f32) / n as f32
         }
     }
 }
@@ -378,6 +412,10 @@ impl<S: GameState> SearchTree<S> {
             return 0;
         }
         let want = max.max(1).min((self.budget - self.completed) as usize);
+        assert!(
+            want <= MAX_VIRTUAL_LOSSES as usize,
+            "a round claims at most {MAX_VIRTUAL_LOSSES} leaves"
+        );
         for _ in 0..want {
             match self.select_leaf() {
                 Selection::Terminal(idx, value) => {
@@ -473,9 +511,9 @@ impl<S: GameState> SearchTree<S> {
     /// The visits and known results behind each edge of `idx`, in edge order: a child's visits
     /// and (possibly proven) outcome, nothing for an edge without one.
     fn edge_table(&self, idx: u32) -> Vec<(u32, Option<Outcome>)> {
-        let mut table = vec![(0, None); self.nodes[idx as usize].n_edges as usize];
+        let mut table = vec![(0, None); self.nodes[idx as usize].n_edges()];
         for (_, child) in self.children(idx) {
-            table[child.edge as usize] = (child.visits, child.outcome());
+            table[child.edge()] = (child.visits, child.outcome());
         }
         table
     }
@@ -551,7 +589,7 @@ impl<S: GameState> SearchTree<S> {
         let parent = &mut self.nodes[idx as usize];
         let sibling = std::mem::replace(&mut parent.first_child, child);
         self.nodes
-            .push(Node::new(idx, k as u8, sibling, to_move, outcome));
+            .push(Node::new(idx, k, sibling, to_move, outcome));
         child
     }
 
@@ -573,7 +611,7 @@ impl<S: GameState> SearchTree<S> {
         };
         let mut with_child = 0u128;
         for (i, child) in self.children(idx) {
-            let k = child.edge as usize;
+            let k = child.edge();
             with_child |= 1 << k;
             let q = child.q_for_parent(self.virtual_loss);
             better(
@@ -593,7 +631,7 @@ impl<S: GameState> SearchTree<S> {
     fn add_virtual_loss(&mut self, mut idx: u32) {
         while idx != NO_NODE {
             let node = &mut self.nodes[idx as usize];
-            node.virtual_losses += 1;
+            node.add_virtual_loss();
             idx = node.parent;
         }
     }
@@ -601,7 +639,7 @@ impl<S: GameState> SearchTree<S> {
     fn remove_virtual_loss(&mut self, mut idx: u32) {
         while idx != NO_NODE {
             let node = &mut self.nodes[idx as usize];
-            node.virtual_losses -= 1;
+            node.remove_virtual_loss();
             idx = node.parent;
         }
     }
@@ -654,9 +692,7 @@ impl<S: GameState> SearchTree<S> {
         }
 
         let node = &mut self.nodes[idx as usize];
-        node.first_edge = first_edge;
-        node.n_edges = n as u8;
-        node.flags |= EXPANDED;
+        node.set_expanded(first_edge, n);
         if idx == 0 {
             self.apply_root_noise();
         }
@@ -696,7 +732,7 @@ impl<S: GameState> SearchTree<S> {
                 None => {}
             }
         }
-        if proven.is_none() && decided == node.n_edges as usize {
+        if proven.is_none() && decided == node.n_edges() {
             proven = Some(if any_draw {
                 Outcome::Draw
             } else {
@@ -721,7 +757,7 @@ impl<S: GameState> SearchTree<S> {
             let Some(outcome) = node.outcome() else {
                 return;
             };
-            let (parent, k) = (node.parent, node.edge as usize);
+            let (parent, k) = (node.parent, node.edge());
             let lost_by_mover = outcome == Outcome::Win(node.to_move());
             if parent == NO_NODE {
                 return;
@@ -763,13 +799,13 @@ impl<S: GameState> SearchTree<S> {
     #[cfg(test)]
     pub(crate) fn assert_consistent(&self) {
         for (i, node) in self.nodes.iter().enumerate() {
-            assert_eq!(node.virtual_losses, 0, "node {i} has virtual losses");
+            assert_eq!(node.virtual_losses(), 0, "node {i} has virtual losses");
             assert!(!node.pending(), "node {i} still pending");
             if node.expanded() {
                 let mut edges_seen = 0u128;
                 for (_, child) in self.children(i as u32) {
-                    let k = child.edge as usize;
-                    assert!(k < node.n_edges as usize, "node {i} child beyond its edges");
+                    let k = child.edge();
+                    assert!(k < node.n_edges(), "node {i} child beyond its edges");
                     assert_eq!(
                         edges_seen >> k & 1,
                         0,
