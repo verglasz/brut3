@@ -443,13 +443,13 @@
     <span class="eyebrow">brut3 · nn::nnue_v2 · reworked trunk and heads</span>
     <h1 id="title-nnue-v2">nnue-v2 64·512·128·4 · reglu 128</h1>
     <p>The same tables and accumulator as the NNUE, then an unrectified projection that gates its first layer, ReGLU blocks, and heads in which the later layers decide how much the shortcut terms count. Drawn at hidden width 128 with ReGLU blocks of width 128; the model trained as <code>nnue-v2-64-512-96-4-reglu-96</code> has the same structure at width 96.</p>
-    <p class="note"><span class="planned">Status:</span> the trunk (projection, gated layer, ReGLU blocks, optional ReZero) is implemented as <code>nnue-v2 E A H L reglu D [rezero]</code>. The gated heads, the convex value mix and the gated policy tables, are the planned <code>mix</code> option and not built yet; the trained model has the NNUE's heads.</p>
+    <p class="note"><span class="planned">Status:</span> implemented as <code>nnue-v2 E A H L reglu D [rezero]</code>, the gated heads always included. The gates start with zero weights and biases of 1, so every gate starts at σ(1) ≈ 0.73 whatever the position; weights saved before the gates existed, like the trained <code>nnue-v2-64-512-96-4-reglu-96</code>, load with the gates at those values.</p>
     <div class="dims" id="dims-nnue-v2">
       <span>embedding <b>64</b></span>
       <span>accumulator <b>512</b></span>
       <span>hidden <b>128</b></span>
       <span>layers <b>4</b> (projection + gated + 2 ReGLU)</span>
-      <span>parameters with mix <b>1,673,111</b></span>
+      <span>parameters <b>1,673,111</b></span>
       <span>multiply-adds after folding <b>211,328</b></span>
     </div>
   </header>
@@ -463,7 +463,7 @@
   </div>
 
   <section>
-    <h2>One evaluation, with the planned heads</h2>
+    <h2>One evaluation</h2>
     <figure>
       <div class="scroll">
         <svg class="diagram" viewBox="0 0 1240 470" role="img" aria-label="The accumulator from the NNUE's tables goes through an unrectified projection to 128; a first layer gated by the projection's own ReLU and two ReGLU blocks update the stream; the value head mixes its own logits with the accumulator skip through a learned gate, and the policy head adds the global map of the stream to the board tables, each scaled by a gate the stream computes.">
@@ -473,7 +473,7 @@
           </defs>
 
           <rect class="zone" x="858" y="26" width="376" height="418" rx="6"/>
-          <text class="lbl a" x="1046" y="18" text-anchor="middle">the planned mix heads</text>
+          <text class="lbl a" x="1046" y="18" text-anchor="middle">the gated heads</text>
 
           <rect class="box acc" x="16" y="150" width="170" height="180" rx="4"/>
           <text class="t" x="28" y="172">First layer</text>
@@ -515,8 +515,8 @@
           <text class="lbl" x="625" y="233" text-anchor="middle">h</text>
 
           <rect class="box" x="870" y="40" width="354" height="130" rx="4"/>
-          <text class="t" x="884" y="62">Value head · 128 → 4</text>
-          <text class="s" x="884" y="84">logits v = V·h + b, and z: gate g = σ(z)</text>
+          <text class="t" x="884" y="62">Value head · 128 → 3</text>
+          <text class="s" x="884" y="84">logits v = V·h + b, gate g = σ(U₀·h + b₀)</text>
           <text class="n" x="884" y="110">wdl = (1 − g)·v + g·S·acc</text>
           <text class="s" x="884" y="134">a convex mix: the stream decides how much</text>
           <text class="s" x="884" y="150">the accumulator's linear view counts</text>
@@ -524,7 +524,7 @@
           <rect class="box" x="870" y="210" width="354" height="196" rx="4"/>
           <text class="t" x="884" y="232">Policy head</text>
           <text class="n" x="884" y="254">P·h + b (128 → 81)</text>
-          <text class="s" x="884" y="276">gates γ, γ′ = σ(U·h + b), 128 → 9 + 9</text>
+          <text class="s" x="884" y="276">gates γ, γ′ = σ(U·h + b), the other 9 + 9</text>
           <text class="n" x="884" y="302">+ γ_b · L[c_b]</text>
           <text class="s" x="884" y="320">each board's 9 cell logits, gated per board</text>
           <text class="n" x="884" y="346">+ γ′_s · T[c_s]</text>
@@ -548,13 +548,14 @@
       <li><span>Projection, 128:</span> <code>h₀ = W₁·acc + b₁</code>, no ReLU.</li>
       <li><span>Gated layer:</span> <code>h = h₀ + α₁·W_down·(ReLU(h₀) ⊙ (W_up·h₀ + b))</code>, <code>W_down</code> without bias. Without <code>reglu</code> it is <code>h = ReLU(h₀ + α₁·(W·ReLU(h₀) + b))</code> and the later layers residual.</li>
       <li><span>ReGLU blocks:</span> <code>h ← h + α_l·W_d·(ReLU(W_g·h + b) ⊙ (W_u·h + b))</code> for l = 2, 3, width 128, <code>W_d</code> without bias. Each α is 1 unless <code>rezero</code> makes it a learned scalar starting at 0.</li>
-      <li><span>Value (planned):</span> <code>[v, z] = V·h + b</code>, <code>g = σ(z)</code>, <code>wdl = (1 − g)·v + g·S·acc</code>.</li>
-      <li><span>Policy (planned):</span> <code>[γ, γ′] = σ(U·h + b)</code>, <code>p[b·9 + s] = (P·h + b_P)[b·9 + s] + γ_b·L[c_b][s] + γ′_s·T[c_s]</code>.</li>
+      <li><span>Gates:</span> <code>[g, γ, γ′] = σ(U·h + b_U)</code>, one layer 128 → 19: the value mix, then one gate per board for the local table and one per destination for the send table.</li>
+      <li><span>Value:</span> <code>v = V·h + b</code>, <code>wdl = (1 − g)·v + g·S·acc</code>.</li>
+      <li><span>Policy:</span> <code>p[b·9 + s] = (P·h + b_P)[b·9 + s] + γ_b·L[c_b][s] + γ′_s·T[c_s]</code>.</li>
     </ol>
   </section>
 
   <section>
-    <h2>Parameters, with the planned heads</h2>
+    <h2>Parameters</h2>
     <div class="scroll">
       <table>
         <thead>
@@ -565,17 +566,17 @@
           <tr><td>Projection</td><td><code>512 × 128 + 128</code></td><td class="num">65,664</td></tr>
           <tr><td>Gated layer (up, down)</td><td><code>128 × 128 + 128, 128 × 128</code></td><td class="num">32,896</td></tr>
           <tr><td>ReGLU × 2 (gate, up, down)</td><td><code>2 × (2 × (128 × 128 + 128) + 128 × 128)</code></td><td class="num">98,816</td></tr>
-          <tr><td>Value with gate</td><td><code>128 × 4 + 4</code></td><td class="num">516</td></tr>
+          <tr><td>Value</td><td><code>128 × 3 + 3</code></td><td class="num">387</td></tr>
           <tr><td>Value skip</td><td><code>512 × 3</code></td><td class="num">1,536</td></tr>
           <tr><td>Policy</td><td><code>128 × 81 + 81</code></td><td class="num">10,449</td></tr>
-          <tr><td>Policy gates</td><td><code>128 × 18 + 18</code></td><td class="num">2,322</td></tr>
+          <tr><td>Gates (value mix, local, send)</td><td><code>128 × 19 + 19</code></td><td class="num">2,451</td></tr>
           <tr><td>Local policy table</td><td><code>11,096 × 9</code></td><td class="num">99,864</td></tr>
           <tr><td>Send policy table</td><td><code>11,096 × 1</code></td><td class="num">11,096</td></tr>
           <tr class="total"><td>Total</td><td></td><td class="num">1,673,111</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="note" id="cost-nnue-v2">With <code>rezero</code>, three more scalars. Per evaluation after folding: projection 65,536, gated layer 32,768, ReGLU blocks 98,304, heads 14,720 (value 512, skip 1,536, policy 10,368, gates 2,304): 211,328 multiply-adds, 1.66× the medium NNUE's 126,976.</p>
+    <p class="note" id="cost-nnue-v2">With <code>rezero</code>, three more scalars. Per evaluation after folding: projection 65,536, gated layer 32,768, ReGLU blocks 98,304, heads 14,720 (value 384, skip 1,536, policy 10,368, gates 2,432): 211,328 multiply-adds, 1.66× the medium NNUE's 126,976.</p>
   </section>
   </div>
 </main>
@@ -645,14 +646,14 @@
         ["Projection", `${a} × ${h} + ${h}`, a * h + h],
         ["Gated layer (up, down)", `${h} × ${h} + ${h}, ${h} × ${h}`, 2 * h * h + h],
         [`ReGLU × ${later} (gate, up, down)`, `${later} × (2 × (${h} × ${d} + ${d}) + ${d} × ${h})`, later * (3 * h * d + 2 * d)],
-        ["Value with gate", `${h} × 4 + 4`, h * 4 + 4],
+        ["Value", `${h} × 3 + 3`, h * 3 + 3],
         ["Value skip", `${a} × 3`, a * 3],
         ["Policy", `${h} × 81 + 81`, h * MOVES + MOVES],
-        ["Policy gates", `${h} × 18 + 18`, h * 18 + 18],
+        ["Gates (value mix, local, send)", `${h} × 19 + 19`, h * 19 + 19],
         ["Local policy table", `${n(CONTENTS)} × 9`, CONTENTS * 9],
         ["Send policy table", `${n(CONTENTS)} × 1`, CONTENTS],
       ];
-      const parts = { proj: a * h, gated: 2 * h * h, blocks: later * 3 * h * d, heads: 4 * h + 3 * a + MOVES * h + 18 * h };
+      const parts = { proj: a * h, gated: 2 * h * h, blocks: later * 3 * h * d, heads: 3 * h + 3 * a + MOVES * h + 19 * h };
       const macs = parts.proj + parts.gated + parts.blocks + parts.heads;
       return { rows, macs, parts, title: `nnue-v2 ${e}·${a}·${h}·${l} · reglu ${d}`,
         dims: [["embedding", e], ["accumulator", a], ["hidden", h], ["layers", `${l} (projection + gated + ${later} ReGLU)`], ["ReGLU width", d]] };
@@ -667,7 +668,7 @@
         r.rows.map((x) => row(...x)).join("") + `<tr class="total"><td>Total</td><td></td><td class="num">${n(total)}</td></tr>`;
       document.getElementById(`dims-${model}`).innerHTML =
         r.dims.map(([k, x]) => `<span>${k} <b>${typeof x === "number" ? n(x) : x}</b></span>`).join("") +
-        `<span>parameters${model === "nnue" ? "" : " with mix"} <b>${n(total)}</b></span>` +
+        `<span>parameters <b>${n(total)}</b></span>` +
         `<span>multiply-adds after folding <b>${n(r.macs)}</b></span>`;
       if (model === "nnue-v2") {
         const p = r.parts;
