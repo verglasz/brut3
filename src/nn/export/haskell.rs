@@ -22,7 +22,6 @@ use crate::nn::nnue::{
     BOARDS,
     CELL_BASE,
     CELL_PAD,
-    CELLS,
     CONTENT_ROWS,
     CONTENTS,
     DECIDED_BASE,
@@ -42,6 +41,7 @@ use crate::nn::nnue::{
     WON_BY_ME,
     WON_BY_THEM,
     compact_id,
+    raw_code,
 };
 
 #[derive(Clone, Debug)]
@@ -663,20 +663,6 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
         }
     }
     lines
-}
-
-fn raw_code(mine: u16, theirs: u16) -> usize {
-    let mut code = 0;
-    let mut pow = 1;
-    for cell in 0..CELLS {
-        if mine >> cell & 1 != 0 {
-            code += pow;
-        } else if theirs >> cell & 1 != 0 {
-            code += 2 * pow;
-        }
-        pow *= 3;
-    }
-    code
 }
 
 pub(super) fn hs_list<T: std::fmt::Display>(items: impl Iterator<Item = T>) -> String {

@@ -125,19 +125,39 @@ pub fn compact_id(code: usize) -> Option<usize> {
     }
 }
 
-/// Compact content id of a board from its two mark masks (bit `i` = square `i`).
-pub fn content_id(mine: u16, theirs: u16) -> usize {
-    let mut code = 0usize;
-    let mut pow = 1usize;
-    for cell in 0..CELLS {
-        if mine >> cell & 1 != 0 {
-            code += pow;
-        } else if theirs >> cell & 1 != 0 {
-            code += 2 * pow;
+/// `TERNARY[mask]`: the base-3 number with digit 1 where the 9-bit `mask` has its bits; a
+/// board's raw code is `TERNARY[mine] + 2 * TERNARY[theirs]` (see [`raw_code`]).
+pub static TERNARY: [u16; 512] = {
+    let mut table = [0u16; 512];
+    let mut mask = 0;
+    while mask < 512 {
+        let (mut code, mut pow, mut cell) = (0u16, 1u16, 0);
+        while cell < CELLS {
+            if mask >> cell & 1 != 0 {
+                code += pow;
+            }
+            pow *= 3;
+            cell += 1;
         }
-        pow *= 3;
+        table[mask] = code;
+        mask += 1;
     }
-    let id = COMPACT[code];
+    table
+};
+
+/// The raw code of a board from its two mark masks (bit `i` = square `i`, the masks
+/// disjoint): the base-3 number whose digit `i` is 0 for an empty square, 1 for mine, 2 for
+/// theirs. Two table loads.
+#[inline]
+pub fn raw_code(mine: u16, theirs: u16) -> usize {
+    debug_assert_eq!(mine & theirs, 0, "a square marked by both players");
+    TERNARY[mine as usize] as usize + 2 * TERNARY[theirs as usize] as usize
+}
+
+/// Compact content id of a board from its two mark masks (bit `i` = square `i`).
+#[inline]
+pub fn content_id(mine: u16, theirs: u16) -> usize {
+    let id = COMPACT[raw_code(mine, theirs)];
     debug_assert!(id != u16::MAX, "unreachable board content");
     id as usize
 }
@@ -546,26 +566,6 @@ fn raw_contents() -> (Vec<i32>, Vec<f32>) {
         .unzip()
 }
 
-/// `TERNARY[mask]`: the base-3 number with digit 1 where the 9-bit `mask` has its bits, so
-/// that `TERNARY[mine] + 2 * TERNARY[theirs]` is a board's raw code, as [`content_id`] reads it.
-static TERNARY: [u16; 512] = {
-    let mut table = [0u16; 512];
-    let mut mask = 0;
-    while mask < 512 {
-        let (mut code, mut pow, mut cell) = (0u16, 1u16, 0);
-        while cell < CELLS {
-            if mask >> cell & 1 != 0 {
-                code += pow;
-            }
-            pow *= 3;
-            cell += 1;
-        }
-        table[mask] = code;
-        mask += 1;
-    }
-    table
-};
-
 /// Rows of the folded table: the nine board tables, the forced table, the feature rows.
 const FORCED_TABLE: usize = BOARDS * RAW_CONTENTS;
 const NO_FORCED_ROW: usize = FORCED_TABLE + RAW_CONTENTS;
@@ -611,7 +611,7 @@ pub fn folded_ids(state: &BitState, out: &mut [i32; FOLDED_IDS]) {
     let mut open_marks = 0;
     for b in 0..BOARDS {
         let (mine, theirs) = (state.board_marks(me, b), state.board_marks(them, b));
-        codes[b] = TERNARY[mine as usize] as usize + 2 * TERNARY[theirs as usize] as usize;
+        codes[b] = raw_code(mine, theirs);
         out[b] = (b * RAW_CONTENTS + codes[b]) as i32;
         // As `status` reads the compact content: open, mine, theirs, full.
         status[b] = if won_by_me >> b & 1 != 0 {
