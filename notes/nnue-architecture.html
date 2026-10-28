@@ -128,6 +128,8 @@
   .steps code { font-family: var(--font-mono); font-size: 0.9em; overflow-wrap: anywhere; }
   .note { font-size: 14px; color: var(--muted); }
   .panel { display: flex; flex-direction: column; gap: 28px; }
+  /* The page's own display rule would otherwise beat the browser's default for [hidden]. */
+  [hidden] { display: none !important; }
   .tabs { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--line); }
   .tabs button {
     font: 500 14px/1 var(--font-body);
