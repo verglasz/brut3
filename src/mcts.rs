@@ -112,27 +112,38 @@ impl SearchResult {
 const NO_NODE: u32 = u32::MAX;
 
 /// A node of the search: its place in the tree, what is known of its position and its
-/// statistics, packed into 20 bytes. Positions are not stored; selection carries one down from
-/// the root by applying the edges' moves. A node is created when it is first selected, so a
-/// tree holds about one node per simulation rather than one per legal move of every expanded
-/// node.
+/// statistics, in 32 bytes. Positions are not stored; selection carries one down from the root
+/// by applying the edges' moves. A node is created when it is first selected (or at its
+/// parent's expansion when the game is over there), so a tree holds about one node per
+/// simulation rather than one per legal move of every expanded node.
+///
+/// Its children are a list through `first_child` and their `next_sibling`, each knowing its
+/// `edge`, rather than a child index on every edge: most edges are never visited, so this keeps
+/// the edges to a prior and a move. With about nine legal moves a position, a simulation costs
+/// about 32 + 9 x 3 bytes.
 struct Node {
     parent: u32,
     /// Once expanded, the node's moves: `edges[first_edge..first_edge + n_edges]`.
     first_edge: u32,
+    /// The most recently created child, `NO_NODE` for none.
+    first_child: u32,
+    /// The parent's next child, `NO_NODE` for the last.
+    next_sibling: u32,
     visits: u32,
     /// The values backed up through the node, for its side to move.
     value_sum: f32,
     /// Leaves claimed below the node and not resolved yet: at most one round's claims.
     virtual_losses: u16,
     n_edges: u8,
+    /// The parent's edge that leads here: `edges[parent.first_edge + edge]`.
+    edge: u8,
     /// [`EXPANDED`], [`PENDING`], [`O_TO_MOVE`], and from bit [`OUTCOME_SHIFT`] the outcome:
     /// how the position ends, its result if the game is over there or the result proven from
     /// its children (see `try_prove`), as [`outcome_bits`] writes it.
     flags: u8,
 }
 
-const _: () = assert!(std::mem::size_of::<Node>() == 20);
+const _: () = assert!(std::mem::size_of::<Node>() == 32);
 
 const EXPANDED: u8 = 1;
 /// The node is a leaf claimed in the current round.
@@ -151,15 +162,26 @@ const fn outcome_bits(outcome: Option<Outcome>) -> u8 {
 }
 
 impl Node {
-    fn new(parent: u32, to_move: Player, outcome: Option<Outcome>) -> Self {
+    /// A child of `parent` through its edge number `edge`, before `next_sibling` in the
+    /// parent's list.
+    fn new(
+        parent: u32,
+        edge: u8,
+        next_sibling: u32,
+        to_move: Player,
+        outcome: Option<Outcome>,
+    ) -> Self {
         let o = if to_move == Player::O { O_TO_MOVE } else { 0 };
         Self {
             parent,
             first_edge: NO_NODE,
+            first_child: NO_NODE,
+            next_sibling,
             visits: 0,
             value_sum: 0.0,
             virtual_losses: 0,
             n_edges: 0,
+            edge,
             flags: o | outcome_bits(outcome) << OUTCOME_SHIFT,
         }
     }
@@ -216,38 +238,35 @@ impl Node {
     }
 }
 
-/// A legal move out of an expanded node: 8 bytes for [`BitState`](crate::game::BitState)'s
-/// one-byte moves.
+/// A legal move out of an expanded node: 3 bytes for [`BitState`](crate::game::BitState)'s
+/// one-byte moves. Its child, if any, is found in the node's list of children; a move that
+/// ends the game gets its child at expansion, with the result, so that a win in one proves its
+/// parent without a visit.
 #[derive(Clone, Copy)]
 struct Edge<M> {
-    /// The child node, `NO_NODE` until it is first selected.
-    child: u32,
     prior: Bf16,
     /// In the game state's own move type, converted to [`Move`] only in results.
     mv: M,
-    /// The result of the position the move leads to when the game is over there, known at
-    /// expansion so that a win in one proves its parent without a visit.
-    terminal: Option<Outcome>,
 }
 
-const _: () = assert!(std::mem::size_of::<Edge<crate::game::BitMove>>() == 8);
+const _: () = assert!(std::mem::size_of::<Edge<crate::game::BitMove>>() == 3);
 
 /// A prior as bfloat16: the top half of an `f32`'s bits, rounded to nearest. Its 8 bits of
 /// precision (relative error at most 2^-9) are plenty for PUCT, and it halves the prior's
-/// share of an edge.
+/// share of an edge. Stored as bytes, so that an edge needs no alignment.
 #[derive(Clone, Copy)]
-struct Bf16(u16);
+struct Bf16([u8; 2]);
 
 impl Bf16 {
     fn new(x: f32) -> Self {
         let bits = x.to_bits();
         // Round to nearest, ties to even.
         let round = 0x7fff + (bits >> 16 & 1);
-        Self((bits.wrapping_add(round) >> 16) as u16)
+        Self(((bits.wrapping_add(round) >> 16) as u16).to_ne_bytes())
     }
 
     fn get(self) -> f32 {
-        f32::from_bits(u32::from(self.0) << 16)
+        f32::from_bits(u32::from(u16::from_ne_bytes(self.0)) << 16)
     }
 }
 
@@ -296,7 +315,7 @@ pub struct SearchTree<S: GameState> {
 impl<S: GameState> SearchTree<S> {
     /// A search from `root` of `simulations` leaf evaluations.
     pub fn new(root: S, simulations: u32, c_puct: f32, virtual_loss: f32) -> Self {
-        let node = Node::new(NO_NODE, root.to_move(), root.outcome());
+        let node = Node::new(NO_NODE, 0, NO_NODE, root.to_move(), root.outcome());
         Self {
             root,
             nodes: vec![node],
@@ -426,8 +445,8 @@ impl<S: GameState> SearchTree<S> {
         }
         self.next_check = self.completed + self.early_stop;
         let (mut first, mut second) = (0, 0);
-        for e in self.nodes[0].edges() {
-            let n = self.edge_visits(&self.edges[e]);
+        for (_, child) in self.children(0) {
+            let n = child.visits;
             if n > first {
                 second = first;
                 first = n;
@@ -438,20 +457,27 @@ impl<S: GameState> SearchTree<S> {
         self.settled = first - second > self.budget.saturating_sub(self.completed);
     }
 
-    /// The known result behind an edge: the child's (possibly proven) outcome if it exists,
-    /// else the terminal result recorded at expansion.
-    fn edge_outcome(&self, edge: &Edge<S::Move>) -> Option<Outcome> {
-        match edge.child {
-            NO_NODE => edge.terminal,
-            child => self.nodes[child as usize].outcome(),
-        }
+    /// The children of `idx` as `(index, node)`, most recently created first.
+    fn children(&self, idx: u32) -> impl Iterator<Item = (u32, &Node)> + '_ {
+        let mut next = self.nodes[idx as usize].first_child;
+        std::iter::from_fn(move || {
+            (next != NO_NODE).then(|| {
+                let i = next;
+                let child = &self.nodes[i as usize];
+                next = child.next_sibling;
+                (i, child)
+            })
+        })
     }
 
-    fn edge_visits(&self, edge: &Edge<S::Move>) -> u32 {
-        match edge.child {
-            NO_NODE => 0,
-            child => self.nodes[child as usize].visits,
+    /// The visits and known results behind each edge of `idx`, in edge order: a child's visits
+    /// and (possibly proven) outcome, nothing for an edge without one.
+    fn edge_table(&self, idx: u32) -> Vec<(u32, Option<Outcome>)> {
+        let mut table = vec![(0, None); self.nodes[idx as usize].n_edges as usize];
+        for (_, child) in self.children(idx) {
+            table[child.edge as usize] = (child.visits, child.outcome());
         }
+        table
     }
 
     /// Root statistics so far. A decided root reports the exact value; when it is proven
@@ -475,13 +501,12 @@ impl<S: GameState> SearchTree<S> {
         };
         let visits = self.edges[root.edges()]
             .iter()
-            .map(|edge| {
+            .zip(self.edge_table(0))
+            .map(|(edge, (visits, outcome))| {
                 let n = match root_outcome {
-                    Some(_) if keeps_result(self.edge_outcome(edge)) => {
-                        self.edge_visits(edge).max(1)
-                    }
+                    Some(_) if keeps_result(outcome) => visits.max(1),
                     Some(_) => 0,
-                    None => self.edge_visits(edge),
+                    None => visits,
                 };
                 (edge.mv.into(), n)
             })
@@ -510,47 +535,59 @@ impl<S: GameState> SearchTree<S> {
                     Selection::Leaf(idx, state)
                 };
             }
-            let e = self.select_edge(idx);
-            let edge = self.edges[e];
-            state.apply(edge.mv);
-            idx = match edge.child {
-                NO_NODE => {
-                    let child = self.nodes.len() as u32;
-                    self.nodes
-                        .push(Node::new(idx, state.to_move(), edge.terminal));
-                    self.edges[e].child = child;
-                    child
-                }
-                child => child,
+            let (k, child) = self.select_edge(idx);
+            let first_edge = self.nodes[idx as usize].first_edge as usize;
+            state.apply(self.edges[first_edge + k].mv);
+            idx = match child {
+                Some(child) => child,
+                None => self.add_child(idx, k, state.to_move(), None),
             };
         }
     }
 
-    /// The edge of `idx` with the best PUCT score; ties go to the first.
-    fn select_edge(&self, idx: u32) -> usize {
-        let edges = self.nodes[idx as usize].edges();
-        let sqrt_n = (self.nodes[idx as usize].effective_visits() as f32).sqrt();
-        let mut best = edges.start;
-        let mut best_score = f32::NEG_INFINITY;
-        for e in edges {
-            let edge = &self.edges[e];
-            let (q, n) = match edge.child {
-                NO_NODE => (0.0, 0),
-                child => {
-                    let child = &self.nodes[child as usize];
-                    (
-                        child.q_for_parent(self.virtual_loss),
-                        child.effective_visits(),
-                    )
-                }
-            };
-            let score = q + self.c_puct * edge.prior.get() * sqrt_n / (1.0 + n as f32);
-            if score > best_score {
-                best_score = score;
-                best = e;
+    /// Creates the child of `idx` through its edge number `k`, first in its list of children.
+    fn add_child(&mut self, idx: u32, k: usize, to_move: Player, outcome: Option<Outcome>) -> u32 {
+        let child = self.nodes.len() as u32;
+        let parent = &mut self.nodes[idx as usize];
+        let sibling = std::mem::replace(&mut parent.first_child, child);
+        self.nodes
+            .push(Node::new(idx, k as u8, sibling, to_move, outcome));
+        child
+    }
+
+    /// The edge of `idx` with the best PUCT score, ties going to the first, as its number
+    /// among the node's edges with its child if it has one. The children are scored as they
+    /// come in the list; every edge without one has no visits and no value, so the best of
+    /// those is the one with the highest prior.
+    fn select_edge(&self, idx: u32) -> (usize, Option<u32>) {
+        let node = &self.nodes[idx as usize];
+        let edges = &self.edges[node.edges()];
+        let sqrt_n = (node.effective_visits() as f32).sqrt();
+        let score =
+            |q: f32, prior: Bf16, n: u32| q + self.c_puct * prior.get() * sqrt_n / (1.0 + n as f32);
+        let mut best = (f32::NEG_INFINITY, usize::MAX, None);
+        let mut better = |s: f32, k: usize, child: Option<u32>| {
+            if s > best.0 || (s == best.0 && k < best.1) {
+                best = (s, k, child);
+            }
+        };
+        let mut with_child = 0u128;
+        for (i, child) in self.children(idx) {
+            let k = child.edge as usize;
+            with_child |= 1 << k;
+            let q = child.q_for_parent(self.virtual_loss);
+            better(
+                score(q, edges[k].prior, child.effective_visits()),
+                k,
+                Some(i),
+            );
+        }
+        for (k, edge) in edges.iter().enumerate() {
+            if with_child >> k & 1 == 0 {
+                better(score(0.0, edge.prior, 0), k, None);
             }
         }
-        best
+        (best.1, best.2)
     }
 
     fn add_virtual_loss(&mut self, mut idx: u32) {
@@ -601,17 +638,19 @@ impl<S: GameState> SearchTree<S> {
         let n = moves.len();
 
         let first_edge = self.edges.len() as u32;
-        for mv in moves {
+        for (k, mv) in moves.iter().enumerate() {
             let prior = match priors {
                 Some(p) if !uniform => p[mv.index()].max(0.0) / total,
                 _ => 1.0 / n as f32,
             };
             self.edges.push(Edge {
-                child: NO_NODE,
                 prior: Bf16::new(prior),
                 mv,
-                terminal: state.settled_after(mv),
             });
+            // A move that ends the game gets its child now, with the result.
+            if let Some(outcome) = state.settled_after(mv) {
+                self.add_child(idx, k, state.to_move().other(), Some(outcome));
+            }
         }
 
         let node = &mut self.nodes[idx as usize];
@@ -639,21 +678,25 @@ impl<S: GameState> SearchTree<S> {
             return false;
         }
         let me = node.to_move();
-        let mut all_decided = true;
+        // Every edge is decided when every edge has a child with a result.
+        let mut decided = 0;
         let mut any_draw = false;
         let mut proven = None;
-        for e in node.edges() {
-            match self.edge_outcome(&self.edges[e]) {
+        for (_, child) in self.children(idx) {
+            match child.outcome() {
                 Some(Outcome::Win(p)) if p == me => {
                     proven = Some(Outcome::Win(me));
                     break;
                 }
-                Some(Outcome::Win(_)) => {}
-                Some(Outcome::Draw) => any_draw = true,
-                None => all_decided = false,
+                Some(Outcome::Win(_)) => decided += 1,
+                Some(Outcome::Draw) => {
+                    decided += 1;
+                    any_draw = true;
+                }
+                None => {}
             }
         }
-        if proven.is_none() && all_decided {
+        if proven.is_none() && decided == node.n_edges as usize {
             proven = Some(if any_draw {
                 Outcome::Draw
             } else {
@@ -678,16 +721,14 @@ impl<S: GameState> SearchTree<S> {
             let Some(outcome) = node.outcome() else {
                 return;
             };
-            let parent = node.parent;
+            let (parent, k) = (node.parent, node.edge as usize);
             let lost_by_mover = outcome == Outcome::Win(node.to_move());
             if parent == NO_NODE {
                 return;
             }
             if lost_by_mover {
-                let edges = self.nodes[parent as usize].edges();
-                if let Some(e) = edges.into_iter().find(|&e| self.edges[e].child == idx) {
-                    self.edges[e].prior = Bf16::new(0.0);
-                }
+                let e = self.nodes[parent as usize].first_edge as usize + k;
+                self.edges[e].prior = Bf16::new(0.0);
             }
             if !self.try_prove(parent) {
                 return;
@@ -712,7 +753,8 @@ impl<S: GameState> SearchTree<S> {
     pub(crate) fn root_children(&self) -> Vec<(Move, f32, u32)> {
         self.edges[self.nodes[0].edges()]
             .iter()
-            .map(|edge| (edge.mv.into(), edge.prior.get(), self.edge_visits(edge)))
+            .zip(self.edge_table(0))
+            .map(|(edge, (visits, _))| (edge.mv.into(), edge.prior.get(), visits))
             .collect()
     }
 
@@ -724,10 +766,18 @@ impl<S: GameState> SearchTree<S> {
             assert_eq!(node.virtual_losses, 0, "node {i} has virtual losses");
             assert!(!node.pending(), "node {i} still pending");
             if node.expanded() {
-                let child_visits: u32 = self.edges[node.edges()]
-                    .iter()
-                    .map(|edge| self.edge_visits(edge))
-                    .sum();
+                let mut edges_seen = 0u128;
+                for (_, child) in self.children(i as u32) {
+                    let k = child.edge as usize;
+                    assert!(k < node.n_edges as usize, "node {i} child beyond its edges");
+                    assert_eq!(
+                        edges_seen >> k & 1,
+                        0,
+                        "node {i} has two children on edge {k}"
+                    );
+                    edges_seen |= 1 << k;
+                }
+                let child_visits: u32 = self.children(i as u32).map(|(_, c)| c.visits).sum();
                 if node.outcome().is_some() {
                     // Proven nodes are backed up exactly without visiting their children.
                     assert!(node.visits >= child_visits + 1, "node {i} visit mismatch");
