@@ -292,8 +292,113 @@ pub fn generate_parallel(
     cfg: &SelfPlayConfig,
     on_game: impl FnMut(usize),
 ) -> Result<(Dataset, SelfPlayStats), String> {
-    let mut evaluator = evaluator.build()?;
-    let (records, stats) = self_play(&mut evaluator, games, cfg, on_game);
+    Ok(generate_parallel_with(
+        &mut evaluator.build()?,
+        games,
+        cfg,
+        on_game,
+    ))
+}
+
+/// The search threads [`generate_threaded`] uses for `games` games when asked for `threads`:
+/// 0 means one per core, and never more threads than games.
+pub fn self_play_threads(threads: usize, games: usize) -> usize {
+    match threads {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        n => n,
+    }
+    .clamp(1, games.max(1))
+}
+
+/// Plays `games` games of search with `evaluator` as the leaf evaluator on
+/// [`self_play_threads`]`(threads, games)` search threads, each playing a contiguous share of
+/// the games with its own seed (`cfg.seed` plus the thread's index), and returns them as one
+/// dataset (game ids distinct, in thread order) with the statistics summed.
+///
+/// With several threads, a network evaluator (`nn ...`) runs on one [`super::EvalServer`]
+/// that batches every thread's leaves together, so the device's per-batch costs are paid once
+/// for all threads; other evaluators (random playouts, ...), and any evaluator on a single
+/// thread, get an agent per thread, as [`generate_parallel`] builds it. `on_game` is called
+/// from the search threads with the number of games finished so far.
+pub fn generate_threaded(
+    evaluator: &AgentSpec,
+    games: usize,
+    threads: usize,
+    cfg: &SelfPlayConfig,
+    on_game: impl Fn(usize) + Sync,
+) -> Result<(Dataset, SelfPlayStats), String> {
+    let start = std::time::Instant::now();
+    let threads = self_play_threads(threads, games);
+    let server = match evaluator {
+        AgentSpec::Nn { .. } if threads > 1 => {
+            let spec = evaluator.clone();
+            Some(super::EvalServer::spawn(
+                move || spec.build(),
+                super::MAX_BATCH,
+            )?)
+        }
+        _ => None,
+    };
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let runs: Vec<Result<(Dataset, SelfPlayStats), String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let games = games / threads + usize::from(t < games % threads);
+                let cfg = SelfPlayConfig {
+                    seed: cfg.seed.wrapping_add(t as u64),
+                    ..cfg.clone()
+                };
+                let (server, done, on_game) = (server.as_ref(), &done, &on_game);
+                scope.spawn(move || {
+                    let finished = |_| {
+                        on_game(1 + done.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+                    };
+                    match server {
+                        Some(server) => Ok(generate_parallel_with(
+                            &mut server.client(),
+                            games,
+                            &cfg,
+                            finished,
+                        )),
+                        None => generate_parallel(evaluator, games, &cfg, finished),
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("self-play thread panicked"))
+            .collect()
+    });
+    let mut data = Dataset::default();
+    let mut stats = SelfPlayStats::default();
+    for run in runs {
+        let (part, part_stats) = run?;
+        let offset = data.games();
+        data.samples
+            .extend(part.samples.into_iter().map(|s| Sample {
+                game: s.game + offset,
+                ..s
+            }));
+        stats.games += part_stats.games;
+        stats.positions += part_stats.positions;
+        stats.simulations += part_stats.simulations;
+        stats.evaluator_calls += part_stats.evaluator_calls;
+        stats.leaves += part_stats.leaves;
+    }
+    stats.seconds = start.elapsed().as_secs_f32();
+    Ok((data, stats))
+}
+
+/// [`generate_parallel`] with an evaluator already built, such as a
+/// [`super::RemoteEvaluator`] shared with other threads.
+pub fn generate_parallel_with<A: UtttAgent<State = BitState>>(
+    evaluator: &mut A,
+    games: usize,
+    cfg: &SelfPlayConfig,
+    on_game: impl FnMut(usize),
+) -> (Dataset, SelfPlayStats) {
+    let (records, stats) = self_play(evaluator, games, cfg, on_game);
     let mut data = Dataset::default();
     for (game, record) in records.into_iter().enumerate() {
         for (state, policy, value) in record.positions {
@@ -306,7 +411,7 @@ pub fn generate_parallel(
             ));
         }
     }
-    Ok((data, stats))
+    (data, stats)
 }
 
 /// Every sample of a [`Dataset`] under all eight board symmetries, as a burn dataset eight

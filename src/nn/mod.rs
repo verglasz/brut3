@@ -23,6 +23,7 @@ pub mod linear;
 pub mod model;
 pub mod nnue;
 pub mod pipeline;
+pub mod server;
 pub mod train;
 pub mod utttai;
 
@@ -46,6 +47,7 @@ pub use linear::{LinearNet, LinearNetConfig};
 pub use model::{HostPrediction, MOVES, Model, Prediction, Verdict, expected_value};
 pub use nnue::{Nnue, NnueConfig};
 pub use pipeline::{GenerationReport, LoopConfig, ReplayBuffer, run_loop, train_model};
+pub use server::{EvalServer, MAX_BATCH, RemoteEvaluator};
 pub use train::{
     Augment,
     Dataset,
@@ -54,6 +56,9 @@ pub use train::{
     TrainReport,
     generate,
     generate_parallel,
+    generate_parallel_with,
+    generate_threaded,
+    self_play_threads,
     train,
 };
 

@@ -252,8 +252,13 @@ struct LoopArgs {
     max_games: usize,
     #[arg(long, default_value_t = 200)]
     simulations: u32,
-    #[arg(long, default_value_t = 256)]
+    /// Self-play games in flight per thread.
+    #[arg(long, default_value_t = 1024)]
     concurrent: usize,
+    /// Self-play search threads (0 = one per core); the network runs on one thread of its own
+    /// that batches them all.
+    #[arg(long, default_value_t = 1)]
+    threads: usize,
     #[arg(long, default_value_t = 8)]
     tree_batch: usize,
     #[arg(long, default_value_t = 16)]
@@ -343,8 +348,8 @@ struct SelfplayArgs {
     /// Simulations per move.
     #[arg(long, default_value_t = 200)]
     simulations: u32,
-    /// Games in flight (the evaluator batch is concurrent / 2 x tree-batch).
-    #[arg(long, default_value_t = 256)]
+    /// Games in flight per thread (the evaluator batch is concurrent / 2 x tree-batch).
+    #[arg(long, default_value_t = 1024)]
     concurrent: usize,
     #[arg(long, default_value_t = 8)]
     tree_batch: usize,
@@ -356,8 +361,8 @@ struct SelfplayArgs {
     dirichlet_alpha: f32,
     #[arg(long, default_value_t = 0)]
     seed: u64,
-    /// Independent self-play runs in parallel, each playing its share of the games with its
-    /// own evaluator and seed (0 = one per core).
+    /// Search threads, each playing its share of the games with its own seed (0 = one per
+    /// core). A network evaluator runs on one thread of its own that batches them all.
     #[arg(long, default_value_t = 1)]
     threads: usize,
     /// Games file to write.
@@ -391,7 +396,7 @@ struct TrainArgs {
     simulations: u32,
     /// Self-play: games in flight, in two groups that alternate between tree work and
     /// evaluation (the evaluator batch is concurrent / 2 x tree-batch).
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 1024)]
     concurrent: usize,
     /// Self-play: leaves claimed per tree per round.
     #[arg(long, default_value_t = 8)]
@@ -913,6 +918,7 @@ fn run_loop(args: &LoopArgs) -> Result<(), String> {
             seed: args.seed,
             ..Default::default()
         },
+        threads: args.threads,
         games_growth: args.games_growth,
         max_games: if args.max_games == 0 {
             usize::MAX
@@ -966,7 +972,7 @@ fn selfplay(args: &SelfplayArgs) -> Result<(), String> {
     use std::io::Write;
     use std::time::Instant;
 
-    use brut3::nn::{games, generate_parallel};
+    use brut3::nn::{games, generate_threaded, self_play_threads};
     use brut3::selfplay::SelfPlayConfig;
 
     let words: Vec<&str> = args.evaluator.split_whitespace().collect();
@@ -980,65 +986,22 @@ fn selfplay(args: &SelfplayArgs) -> Result<(), String> {
         seed: args.seed,
         ..Default::default()
     };
-    let threads = match args.threads {
-        0 => std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
-        n => n,
-    }
-    .clamp(1, args.games.max(1));
     println!(
-        "self-play: {} games, {} simulations/move, {} concurrent x {} leaves, evaluator {evaluator}, {threads} thread(s)",
-        args.games, cfg.simulations, cfg.concurrent, cfg.tree_batch
+        "self-play: {} games, {} simulations/move, {} concurrent x {} leaves, evaluator {evaluator}, {} thread(s)",
+        args.games,
+        cfg.simulations,
+        cfg.concurrent,
+        cfg.tree_batch,
+        self_play_threads(args.threads, args.games)
     );
     let start = Instant::now();
-    let done = std::sync::atomic::AtomicUsize::new(0);
     let report = |n: usize| {
         if n.is_multiple_of(100) || n == args.games {
             print!("\r  {n}/{} games", args.games);
             let _ = io::stdout().flush();
         }
     };
-    // Each thread plays a contiguous share of the games with its own seed; the datasets are
-    // concatenated with distinct game ids and the statistics summed.
-    let runs: Vec<Result<_, String>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|t| {
-                let games = args.games / threads + usize::from(t < args.games % threads);
-                let cfg = SelfPlayConfig {
-                    seed: cfg.seed.wrapping_add(t as u64),
-                    ..cfg.clone()
-                };
-                let (evaluator, done, report) = (&evaluator, &done, &report);
-                scope.spawn(move || {
-                    generate_parallel(evaluator, games, &cfg, |_| {
-                        report(1 + done.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-                    })
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("self-play thread panicked"))
-            .collect()
-    });
-    let mut data = brut3::nn::Dataset::default();
-    let mut stats = brut3::selfplay::SelfPlayStats::default();
-    for run in runs {
-        let (part, part_stats) = run?;
-        let offset = data.games();
-        data.samples
-            .extend(part.samples.into_iter().map(|s| brut3::nn::Sample {
-                game: s.game + offset,
-                ..s
-            }));
-        stats.games += part_stats.games;
-        stats.positions += part_stats.positions;
-        stats.simulations += part_stats.simulations;
-        stats.evaluator_calls += part_stats.evaluator_calls;
-        stats.leaves += part_stats.leaves;
-    }
-    stats.seconds = start.elapsed().as_secs_f32();
+    let (data, stats) = generate_threaded(&evaluator, args.games, args.threads, &cfg, report)?;
     games::save(&args.out, &data)?;
     let [wins, draws, losses] = data.verdict_counts();
     println!(
@@ -1214,7 +1177,7 @@ fn train(args: &TrainArgs) -> Result<(), String> {
             data
         }
         Some(evaluator) => {
-            use brut3::nn::generate_parallel;
+            use brut3::nn::generate_threaded;
             use brut3::selfplay::SelfPlayConfig;
             let words: Vec<&str> = evaluator.split_whitespace().collect();
             let evaluator_spec = AgentSpec::parse(&words)?;
@@ -1231,7 +1194,7 @@ fn train(args: &TrainArgs) -> Result<(), String> {
                 "self-play: {} games, {} simulations/move, {} concurrent x {} leaves, evaluator {evaluator_spec}",
                 args.games, cfg.simulations, cfg.concurrent, cfg.tree_batch
             );
-            let (data, stats) = generate_parallel(&evaluator_spec, args.games, &cfg, progress)?;
+            let (data, stats) = generate_threaded(&evaluator_spec, args.games, 1, &cfg, progress)?;
             println!(
                 "\n  {:.0} simulations/s, mean evaluator batch {:.1} over {} calls",
                 stats.simulations_per_second(),

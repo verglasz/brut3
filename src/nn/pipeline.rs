@@ -12,7 +12,7 @@ use serde_json::json;
 use super::any_model::{AnyModel, ModelSpec};
 use super::backend::BackendKind;
 use super::games;
-use super::train::{Dataset, Sample, TrainOptions, TrainReport, generate_parallel, train};
+use super::train::{Dataset, Sample, TrainOptions, TrainReport, generate_threaded, train};
 use crate::agent::AgentSpec;
 use crate::benchmark::{MatchResult, play_match_with};
 use crate::selfplay::{MatchExploration, SelfPlayConfig, SelfPlayStats};
@@ -140,6 +140,8 @@ pub struct LoopConfig {
     pub games_growth: f64,
     pub max_games: usize,
     pub selfplay: SelfPlayConfig,
+    /// Self-play search threads per generation (see [`generate_threaded`]; 0 = one per core).
+    pub threads: usize,
     /// Games kept in the replay buffer when `buffer_generations` is zero.
     pub buffer_games: usize,
     /// When nonzero, the buffer keeps the games of the last this many generations instead
@@ -458,7 +460,8 @@ pub fn run_loop(
                 seed: cfg.selfplay.seed.wrapping_add(generation as u64),
                 ..cfg.selfplay.clone()
             };
-            let (data, stats) = generate_parallel(&evaluator, games, &selfplay, |_| {})?;
+            let (data, stats) =
+                generate_threaded(&evaluator, games, cfg.threads, &selfplay, |_| {})?;
             let games_file = games_path(&cfg.dir, generation);
             games::save(&games_file, &data)?;
             log(format!(
@@ -703,6 +706,7 @@ mod tests {
             games_growth: 2.0,
             max_games: 500,
             selfplay: SelfPlayConfig::default(),
+            threads: 1,
             buffer_games: 1,
             buffer_generations: 0,
             train: TrainOptions {
@@ -773,6 +777,7 @@ mod tests {
                 concurrent: 3,
                 ..Default::default()
             },
+            threads: 1,
             buffer_games: 8,
             buffer_generations: 0,
             train: TrainOptions {
