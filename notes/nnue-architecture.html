@@ -1,0 +1,392 @@
+<title>brut3 NNUE 64·512·128·4</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  /* Layout: one reading column of prose; the two diagrams and the parameter table run wider, each scrolling on its own at phone width. */
+  :root {
+    --bg: #f5f7f6;
+    --panel: #ffffff;
+    --fg: #18211d;
+    --muted: #5a6862;
+    --line: #c8d1cc;
+    --accent: #0d7566;
+    --font-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+    --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #111614; --panel: #19201d; --fg: #e1e8e4; --muted: #98a69f; --line: #34403a; --accent: #4cc0ac;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #111614; --panel: #19201d; --fg: #e1e8e4; --muted: #98a69f; --line: #34403a; --accent: #4cc0ac;
+    color-scheme: dark;
+  }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.6 var(--font-body);
+  }
+  main {
+    max-width: 1220px;
+    margin: 0 auto;
+    padding-block: 32px 56px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+  }
+  header { display: flex; flex-direction: column; gap: 10px; max-width: 70ch; }
+  .eyebrow {
+    font: 500 12px/1 var(--font-mono);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  h1, h2 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    text-wrap: balance;
+    margin: 0;
+    line-height: 1.15;
+  }
+  h1 { font-size: clamp(28px, 4.2vw, 40px); }
+  h2 { font-size: 22px; }
+  p { margin: 0; max-width: 70ch; }
+  .dims {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    font: 13px/1.4 var(--font-mono);
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .dims b { color: var(--fg); font-weight: 500; }
+  section { display: flex; flex-direction: column; gap: 12px; }
+  figure { margin: 0; display: flex; flex-direction: column; gap: 10px; }
+  .scroll {
+    overflow-x: auto;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+  }
+  svg.diagram {
+    display: block;
+    width: 100%;
+    min-width: 960px;
+    height: auto;
+    color: var(--fg);
+    font-family: var(--font-body);
+  }
+  figcaption { font-size: 14px; color: var(--muted); max-width: 80ch; }
+  /* SVG classes (styled from the page so the drawing follows the theme) */
+  .box { fill: var(--panel); stroke: var(--fg); stroke-width: 1.2; }
+  .box.quiet { stroke: var(--line); }
+  .box.acc { stroke: var(--accent); stroke-width: 2; }
+  .t { fill: var(--fg); font-size: 13px; font-weight: 600; }
+  .s { fill: var(--muted); font-size: 12px; }
+  .n { fill: var(--fg); font-size: 12px; font-family: var(--font-mono); }
+  .big { fill: var(--accent); font-size: 22px; font-weight: 600; font-family: var(--font-display); }
+  .lbl { fill: var(--muted); font-size: 11px; font-family: var(--font-mono); }
+  .lbl.a { fill: var(--accent); }
+  .lane { fill: var(--muted); font-size: 11px; font-family: var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; }
+  .wire { stroke: var(--fg); stroke-width: 1.3; fill: none; }
+  .wire.dash { stroke-dasharray: 4 4; stroke: var(--muted); }
+  .wire.a { stroke: var(--accent); stroke-dasharray: 6 4; stroke-width: 1.6; }
+  .zone { fill: none; stroke: var(--accent); stroke-dasharray: 6 5; stroke-width: 1.2; }
+  .head { fill: var(--fg); }
+  .head.m { fill: var(--muted); }
+  .head.a { fill: var(--accent); }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    min-width: 560px;
+    font-size: 14px;
+    font-variant-numeric: tabular-nums;
+  }
+  th, td { text-align: left; padding: 8px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font: 500 12px/1.3 var(--font-mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+  td.num, th.num { text-align: right; font-family: var(--font-mono); }
+  td code, p code { font-family: var(--font-mono); font-size: 0.92em; }
+  tr.total td { font-weight: 600; border-bottom: none; }
+  .steps {
+    margin: 0;
+    padding-left: 1.4em;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-width: 90ch;
+    font-size: 14px;
+  }
+  .steps li { padding-left: 4px; }
+  .steps li span { font-weight: 600; }
+  .steps code { font-family: var(--font-mono); font-size: 0.9em; overflow-wrap: anywhere; }
+  .note { font-size: 14px; color: var(--muted); }
+</style>
+
+<main>
+  <header>
+    <span class="eyebrow">brut3 · nn::nnue · medium net</span>
+    <h1>NNUE 64·512·128·4</h1>
+    <p>The table-driven network behind <code>models/nnue-64-512-128-4_mediumnet-full</code>, the model the Haskell engine is exported from. It reads a position from the side to move's view and returns win/draw/loss logits and one logit per move.</p>
+    <div class="dims">
+      <span>embedding <b>64</b></span>
+      <span>accumulator <b>512</b></span>
+      <span>hidden <b>128</b></span>
+      <span>layers <b>4</b> (1 dense + 3 residual)</span>
+      <span>parameters <b>1,588,484</b></span>
+      <span>multiply-adds after folding <b>126,976</b></span>
+    </div>
+  </header>
+
+  <section>
+    <h2>One evaluation, as trained</h2>
+    <figure>
+      <div class="scroll">
+        <svg class="diagram" viewBox="0 0 1240 490" role="img" aria-label="Board, forced-board and feature ids are looked up in two tables; board tokens go through nine board matrices, the forced token through its own, and eleven feature rows are added directly; the sum after ReLU is the 512-wide accumulator, which feeds a dense layer and three residual layers, then a value head with a skip from the accumulator and a policy head that also reads the boards' contents.">
+          <defs>
+            <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0 0 L10 5 L0 10 z"/></marker>
+            <marker id="arm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head m" d="M0 0 L10 5 L0 10 z"/></marker>
+          </defs>
+
+          <!-- region the inference fold replaces -->
+          <rect class="zone" x="248" y="26" width="426" height="404" rx="6"/>
+          <text class="lbl a" x="461" y="18" text-anchor="middle">folded into one table for inference (below)</text>
+
+          <!-- column 1: inputs -->
+          <rect class="box" x="16" y="40" width="200" height="80" rx="4"/>
+          <text class="t" x="28" y="60">Boards × 9</text>
+          <text class="s" x="28" y="78">content id (11,096 kinds)</text>
+          <text class="s" x="28" y="94">+ 9 cell ids, or padding</text>
+          <text class="s" x="28" y="110">when the board is decided</text>
+
+          <rect class="box" x="16" y="150" width="200" height="60" rx="4"/>
+          <text class="t" x="28" y="170">Forced board</text>
+          <text class="s" x="28" y="188">its content and cells,</text>
+          <text class="s" x="28" y="203">or the “none” token</text>
+
+          <rect class="box" x="16" y="300" width="200" height="118" rx="4"/>
+          <text class="t" x="28" y="320">Features × 11</text>
+          <text class="s" x="28" y="340">forced board · 10</text>
+          <text class="s" x="28" y="357">8 lines × 64 states</text>
+          <text class="s" x="28" y="374">decided boards · 0–9</text>
+          <text class="s" x="28" y="391">marks on open boards · 0–72</text>
+
+          <!-- column 2: tables -->
+          <rect class="box" x="262" y="40" width="176" height="170" rx="4"/>
+          <text class="t" x="274" y="60">Content table</text>
+          <text class="n" x="274" y="80">11,125 × 64</text>
+          <text class="s" x="274" y="100">11,096 contents,</text>
+          <text class="s" x="274" y="116">“none”, 27 cell rows</text>
+          <text class="s" x="274" y="132">(cell × empty/mine/</text>
+          <text class="s" x="274" y="148">theirs), padding</text>
+          <text class="s" x="274" y="172">a token is the sum</text>
+          <text class="s" x="274" y="188">of its 10 rows</text>
+
+          <rect class="box" x="262" y="300" width="176" height="118" rx="4"/>
+          <text class="t" x="274" y="320">Feature table</text>
+          <text class="n" x="274" y="340">605 × 512</text>
+          <text class="s" x="274" y="360">already accumulator-</text>
+          <text class="s" x="274" y="376">wide: rows are added</text>
+          <text class="s" x="274" y="392">as they are</text>
+
+          <line class="wire" x1="216" y1="80" x2="260" y2="80" marker-end="url(#ar)"/>
+          <text class="lbl" x="238" y="73" text-anchor="middle">10 ids</text>
+          <line class="wire" x1="216" y1="180" x2="260" y2="180" marker-end="url(#ar)"/>
+          <text class="lbl" x="238" y="173" text-anchor="middle">10 ids</text>
+          <line class="wire" x1="216" y1="359" x2="260" y2="359" marker-end="url(#ar)"/>
+          <text class="lbl" x="238" y="352" text-anchor="middle">11 ids</text>
+
+          <!-- column 3: first-layer products -->
+          <rect class="box" x="484" y="40" width="176" height="80" rx="4"/>
+          <text class="t" x="496" y="60">mix W₀ … W₈</text>
+          <text class="n" x="496" y="80">576 → 512</text>
+          <text class="s" x="496" y="98">one matrix per board,</text>
+          <text class="s" x="496" y="113">+ bias (512)</text>
+
+          <rect class="box" x="484" y="150" width="176" height="60" rx="4"/>
+          <text class="t" x="496" y="170">forced_mix</text>
+          <text class="n" x="496" y="190">64 → 512</text>
+
+          <line class="wire" x1="438" y1="80" x2="482" y2="80" marker-end="url(#ar)"/>
+          <text class="lbl" x="460" y="73" text-anchor="middle">9 × 64</text>
+          <line class="wire" x1="438" y1="180" x2="482" y2="180" marker-end="url(#ar)"/>
+          <text class="lbl" x="460" y="173" text-anchor="middle">64</text>
+
+          <!-- column 4: accumulator -->
+          <rect class="box acc" x="704" y="40" width="120" height="378" rx="4"/>
+          <text class="t" x="764" y="172" text-anchor="middle">Σ</text>
+          <text class="s" x="764" y="190" text-anchor="middle">with mix's bias</text>
+          <text class="t" x="764" y="218" text-anchor="middle">then ReLU</text>
+          <text class="big" x="764" y="252" text-anchor="middle">acc</text>
+          <text class="n" x="764" y="272" text-anchor="middle">512</text>
+
+          <line class="wire" x1="660" y1="80" x2="702" y2="80" marker-end="url(#ar)"/>
+          <text class="lbl" x="681" y="73" text-anchor="middle">512</text>
+          <line class="wire" x1="660" y1="180" x2="702" y2="180" marker-end="url(#ar)"/>
+          <text class="lbl" x="681" y="173" text-anchor="middle">512</text>
+          <line class="wire" x1="438" y1="359" x2="702" y2="359" marker-end="url(#ar)"/>
+          <text class="lbl" x="570" y="352" text-anchor="middle">Σ 11 rows · 512</text>
+
+          <!-- column 5: MLP -->
+          <rect class="box" x="852" y="106" width="160" height="96" rx="4"/>
+          <text class="t" x="864" y="126">Dense</text>
+          <text class="n" x="864" y="146">W·acc + b</text>
+          <text class="s" x="864" y="164">W 128 × 512, b 128</text>
+          <text class="s" x="864" y="188">ReLU → h (128)</text>
+
+          <rect class="box" x="852" y="230" width="160" height="100" rx="4"/>
+          <text class="t" x="864" y="250">Residual × 3</text>
+          <text class="s" x="864" y="270">h ← ReLU(h + Wh + b)</text>
+          <text class="s" x="864" y="288">W 128 × 128, b 128</text>
+          <text class="s" x="864" y="306">each layer its own</text>
+
+          <line class="wire" x1="824" y1="150" x2="850" y2="150" marker-end="url(#ar)"/>
+          <text class="lbl" x="837" y="143" text-anchor="middle">acc</text>
+          <line class="wire" x1="932" y1="202" x2="932" y2="228" marker-end="url(#ar)"/>
+          <text class="lbl" x="940" y="219">h</text>
+
+          <!-- column 6: heads -->
+          <rect class="box" x="1040" y="40" width="188" height="110" rx="4"/>
+          <text class="t" x="1052" y="60">Value head</text>
+          <text class="n" x="1052" y="80">V·h + b (128 → 3)</text>
+          <text class="s" x="1052" y="98">+ S·acc (512 → 3)</text>
+          <text class="s" x="1052" y="116">win / draw / loss logits</text>
+
+          <rect class="box" x="1040" y="230" width="188" height="188" rx="4"/>
+          <text class="t" x="1052" y="250">Policy head</text>
+          <text class="n" x="1052" y="270">P·h + b (128 → 81)</text>
+          <text class="s" x="1052" y="292">+ local[c]: each board's</text>
+          <text class="s" x="1052" y="308">9 cell logits</text>
+          <text class="s" x="1052" y="330">+ send[c] of board j,</text>
+          <text class="s" x="1052" y="346">added to square j</text>
+          <text class="s" x="1052" y="362">of every board</text>
+          <text class="s" x="1052" y="402">→ 81 move logits</text>
+
+          <line class="wire" x1="824" y1="60" x2="1038" y2="60" marker-end="url(#ar)"/>
+          <text class="lbl" x="932" y="53" text-anchor="middle">acc (512), skipping the MLP</text>
+          <polyline class="wire" points="1012,255 1026,255 1026,120 1038,120" marker-end="url(#ar)"/>
+          <line class="wire" x1="1012" y1="300" x2="1038" y2="300" marker-end="url(#ar)"/>
+          <text class="lbl" x="1025" y="293" text-anchor="middle">h</text>
+          <text class="lbl" x="1031" y="190">h</text>
+
+          <!-- the boards' contents also feed the policy tables -->
+          <polyline class="wire dash" points="16,100 6,100 6,466 1134,466 1134,420" marker-end="url(#arm)"/>
+          <text class="lbl" x="560" y="458" text-anchor="middle">content ids c₀ … c₈, read by the policy's local and send tables</text>
+        </svg>
+      </div>
+      <figcaption>Every input is an id into a learned table. A board's token is its content row plus nine cell rows (padding once the board is decided, so dead cells never matter); the nine tokens go through one matrix per board, the forced board's token through its own, and the eleven feature rows are added at full width. The sum, with mix's bias, goes through a ReLU to give acc (512); the dense layer and its ReLU give h (128), which the residual layers update. The value head reads h and, directly, acc; the policy adds a global map of h, each board's own cell logits and a per-board “send” logit to the 81 moves. Legal masking and the softmax happen on the host.</figcaption>
+    </figure>
+    <ol class="steps">
+      <li><span>Board tokens, 64 each:</span> <code>t_k = E[c_k] + Σ_i E[cell_k,i]</code> for the nine boards, and <code>t_f</code> the same for the forced board (or the “none” token).</li>
+      <li><span>Accumulator, 512:</span> <code>acc = ReLU(Σ_k W_k·t_k + b_mix + F·t_f + Σ_j R[f_j])</code>, with <code>W_k</code> the nine 512 × 64 blocks of mix, <code>F</code> = forced_mix (no bias) and <code>R[f_j]</code> the eleven feature rows.</li>
+      <li><span>First hidden layer, 128:</span> <code>h = ReLU(W₁·acc + b₁)</code>, <code>W₁</code> 128 × 512.</li>
+      <li><span>Three residual layers:</span> <code>h ← ReLU(h + W_l·h + b_l)</code>, each <code>W_l</code> 128 × 128. With the <code>reglu D</code> option instead <code>h ← h + W_down·(ReLU(W_gate·h + b) ⊙ (W_up·h + b)) + b</code>, gate and up D wide.</li>
+      <li><span>Value, 3 logits:</span> <code>wdl = V·h + b_V + S·acc</code>, <code>S</code> 3 × 512 without bias.</li>
+      <li><span>Policy, 81 logits:</span> <code>p[b·9 + s] = (P·h + b_P)[b·9 + s] + L[c_b][s] + T[c_s]</code>, playing square <code>s</code> of board <code>b</code> also sending the opponent to board <code>s</code>.</li>
+    </ol>
+    <p class="note">Of the biases, only mix's is redundant: every position also sums exactly one forced-token row and one forced-board feature row, so a constant shift could live in either.</p>
+  </section>
+
+  <section>
+    <h2>What folding changes for inference</h2>
+    <figure>
+      <div class="scroll">
+        <svg class="diagram" viewBox="0 0 1200 290" role="img" aria-label="As trained, an evaluation encodes 111 ids, sums 100 content rows into tokens and multiplies them through 576 by 512 and 64 by 512 matrices before adding the feature rows. Folded, the products are precomputed once into a 197,436 by 512 table, so an evaluation encodes 21 row indices from the bitboard and sums those rows; both continue into the same MLP and heads.">
+          <defs>
+            <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0 0 L10 5 L0 10 z"/></marker>
+            <marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head a" d="M0 0 L10 5 L0 10 z"/></marker>
+          </defs>
+
+          <text class="lane" x="16" y="28">As trained</text>
+          <rect class="box" x="16" y="40" width="180" height="64" rx="4"/>
+          <text class="t" x="28" y="62">nnue_ids</text>
+          <text class="s" x="28" y="82">111 ids · 73 ns</text>
+
+          <rect class="box" x="236" y="40" width="200" height="64" rx="4"/>
+          <text class="t" x="248" y="62">Content lookups</text>
+          <text class="s" x="248" y="82">100 rows × 64, Σ per token</text>
+
+          <rect class="box" x="476" y="40" width="210" height="64" rx="4"/>
+          <text class="t" x="488" y="62">First-layer products</text>
+          <text class="n" x="488" y="82">576×512 + 64×512</text>
+
+          <rect class="box" x="726" y="40" width="160" height="64" rx="4"/>
+          <text class="t" x="738" y="62">+ 11 feature rows</text>
+          <text class="s" x="738" y="82">+ bias, ReLU → acc</text>
+
+          <line class="wire" x1="196" y1="72" x2="234" y2="72" marker-end="url(#ar2)"/>
+          <line class="wire" x1="436" y1="72" x2="474" y2="72" marker-end="url(#ar2)"/>
+          <line class="wire" x1="686" y1="72" x2="724" y2="72" marker-end="url(#ar2)"/>
+          <line class="wire" x1="886" y1="72" x2="924" y2="72" marker-end="url(#ar2)"/>
+
+          <text class="lane" x="16" y="178">Folded · NetAgent inference</text>
+          <rect class="box acc" x="16" y="190" width="180" height="64" rx="4"/>
+          <text class="t" x="28" y="212">folded_ids</text>
+          <text class="s" x="28" y="232">21 rows · 15.6 ns</text>
+
+          <rect class="box acc" x="236" y="190" width="450" height="64" rx="4"/>
+          <text class="t" x="248" y="212">Folded table · 197,436 × 512 · 386 MiB</text>
+          <text class="s" x="248" y="232">board k, raw code r → row k·19,683 + r</text>
+          <text class="s" x="248" y="247">forced rows carry the bias; then the 605 feature rows</text>
+
+          <rect class="box acc" x="726" y="190" width="160" height="64" rx="4"/>
+          <text class="t" x="738" y="212">Σ 21 rows</text>
+          <text class="s" x="738" y="232">ReLU → acc</text>
+
+          <line class="wire" x1="196" y1="222" x2="234" y2="222" marker-end="url(#ar2)"/>
+          <line class="wire" x1="686" y1="222" x2="724" y2="222" marker-end="url(#ar2)"/>
+          <line class="wire" x1="886" y1="222" x2="924" y2="222" marker-end="url(#ar2)"/>
+
+          <rect class="box" x="926" y="40" width="258" height="214" rx="4"/>
+          <text class="t" x="940" y="64">Same MLP and heads</text>
+          <text class="s" x="940" y="86">dense 512 → 128,</text>
+          <text class="s" x="940" y="102">residual 128 → 128 × 3,</text>
+          <text class="s" x="940" y="118">value and policy heads</text>
+          <text class="n" x="940" y="146">126,976 multiply-adds</text>
+          <text class="s" x="940" y="166">per position either way</text>
+          <text class="s" x="940" y="196">folding removes the</text>
+          <text class="n" x="940" y="214">327,680</text>
+          <text class="s" x="940" y="232">first-layer multiply-adds</text>
+
+          <line class="wire a" x1="581" y1="104" x2="581" y2="188" marker-end="url(#ara)"/>
+          <text class="lbl a" x="592" y="140">computed once at load:</text>
+          <text class="lbl a" x="592" y="156">W_k · token(c) for 9 boards</text>
+          <text class="lbl a" x="592" y="172">× 19,683 codes</text>
+        </svg>
+      </div>
+      <figcaption>A board's token depends only on its content, so its product with each board matrix can be computed for every content once, when <code>NetAgent</code> loads the model. The table is indexed by raw base-3 board code, read straight from the bitboard's masks, which spares a lookup per board at the cost of rows for codes no game reaches. Training still runs the network as drawn above.</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2>Parameters</h2>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr><th>Component</th><th>Shape</th><th class="num">Parameters</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Content table</td><td><code>11,125 × 64</code></td><td class="num">712,000</td></tr>
+          <tr><td>mix (board matrices)</td><td><code>576 × 512 + 512</code></td><td class="num">295,424</td></tr>
+          <tr><td>forced_mix</td><td><code>64 × 512</code></td><td class="num">32,768</td></tr>
+          <tr><td>Feature table</td><td><code>605 × 512</code></td><td class="num">309,760</td></tr>
+          <tr><td>Dense</td><td><code>512 × 128 + 128</code></td><td class="num">65,664</td></tr>
+          <tr><td>Residual × 3</td><td><code>3 × (128 × 128 + 128)</code></td><td class="num">49,536</td></tr>
+          <tr><td>Value</td><td><code>128 × 3 + 3</code></td><td class="num">387</td></tr>
+          <tr><td>Value skip</td><td><code>512 × 3</code></td><td class="num">1,536</td></tr>
+          <tr><td>Policy</td><td><code>128 × 81 + 81</code></td><td class="num">10,449</td></tr>
+          <tr><td>Local policy</td><td><code>11,096 × 9</code></td><td class="num">99,864</td></tr>
+          <tr><td>Send policy</td><td><code>11,096 × 1</code></td><td class="num">11,096</td></tr>
+          <tr class="total"><td>Total</td><td></td><td class="num">1,588,484</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">The Haskell export ships the same 1,588,484 weights as int16 (3,176,968 bytes). Most of them sit in tables that an evaluation only reads a few rows of: the content, feature and policy tables.</p>
+  </section>
+</main>
