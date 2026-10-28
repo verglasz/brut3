@@ -96,31 +96,26 @@ const SQUARES: [[u8; 10]; 512] = {
     table
 };
 
-/// [`BitState`]'s move: board and square as the indices `0..9` the masks use, so that playing
-/// one needs no arithmetic. Converts to and from the explicit [`Move`] by table.
+/// [`BitState`]'s move: board and square as the indices `0..9` the masks use, in the high and
+/// low nibble of one byte, so that playing one needs only a shift or a mask and a search
+/// tree's edge stays small. Converts to and from the explicit [`Move`] by table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct BitMove {
-    board: u8,
-    square: u8,
-}
+pub struct BitMove(u8);
 
 impl BitMove {
     #[inline]
     const fn new(board: usize, square: usize) -> Self {
-        Self {
-            board: board as u8,
-            square: square as u8,
-        }
+        Self((board << 4 | square) as u8)
     }
 
     #[inline]
     const fn board(self) -> usize {
-        self.board as usize
+        (self.0 >> 4) as usize
     }
 
     #[inline]
     const fn square(self) -> usize {
-        self.square as usize
+        (self.0 & 15) as usize
     }
 
     /// [`Move::index`] of the move.
@@ -671,7 +666,8 @@ mod tests {
         }
         assert!(!WIN[0b000_000_011]);
         assert!(WIN[0b100_010_001]);
-        assert_eq!(std::mem::size_of::<BitState>(), 48);
+        // 42 bytes of masks, the last move and the side to move.
+        assert_eq!(std::mem::size_of::<BitState>(), 46);
     }
 
     #[test]
