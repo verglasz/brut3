@@ -92,25 +92,45 @@ struct Active {
     plies: usize,
 }
 
-fn new_tree(cfg: &SelfPlayConfig, state: BitState, rng: &mut SmallRng) -> SearchTree<BitState> {
-    let tree = SearchTree::new(state, cfg.simulations, cfg.c_puct, cfg.virtual_loss);
-    match cfg.root_noise {
-        Some((alpha, fraction)) => tree.with_root_noise(RootNoise {
+/// Starts `tree` over for a search from `state`, keeping its buffers.
+fn reset_tree(
+    tree: &mut SearchTree<BitState>,
+    cfg: &SelfPlayConfig,
+    state: BitState,
+    rng: &mut SmallRng,
+) {
+    tree.reset(state, cfg.simulations, cfg.c_puct, cfg.virtual_loss);
+    add_root_noise(tree, cfg, rng);
+}
+
+fn add_root_noise(tree: &mut SearchTree<BitState>, cfg: &SelfPlayConfig, rng: &mut SmallRng) {
+    if let Some((alpha, fraction)) = cfg.root_noise {
+        tree.set_root_noise(RootNoise {
             alpha,
             fraction,
             seed: rng.random(),
-        }),
-        None => tree,
+        });
     }
 }
 
 fn start_game(cfg: &SelfPlayConfig, rng: &mut SmallRng) -> Active {
+    let state = BitState::initial();
+    let mut tree = SearchTree::new(state, cfg.simulations, cfg.c_puct, cfg.virtual_loss);
+    add_root_noise(&mut tree, cfg, rng);
     Active {
-        state: BitState::initial(),
+        state,
         positions: Vec::new(),
-        tree: new_tree(cfg, BitState::initial(), rng),
+        tree,
         plies: 0,
     }
+}
+
+/// Starts a new game in a finished game's place, keeping its tree's buffers.
+fn restart_game(game: &mut Active, cfg: &SelfPlayConfig, rng: &mut SmallRng) {
+    game.state = BitState::initial();
+    game.positions.clear();
+    game.plies = 0;
+    reset_tree(&mut game.tree, cfg, game.state, rng);
 }
 
 /// Half of the games in flight. The two groups take turns, so that while the evaluator works
@@ -214,7 +234,7 @@ fn advance(
                 });
                 on_game(stats.games);
                 if *started < games {
-                    group.active[i] = start_game(cfg, rng);
+                    restart_game(&mut group.active[i], cfg, rng);
                     *started += 1;
                 } else {
                     group.active.swap_remove(i);
@@ -222,7 +242,7 @@ fn advance(
             }
             None => {
                 let state = game.state;
-                game.tree = new_tree(cfg, state, rng);
+                reset_tree(&mut game.tree, cfg, state, rng);
             }
         }
     }
@@ -474,20 +494,30 @@ struct MatchGame {
 }
 
 impl MatchGame {
-    /// Game number `g` of a match, before any move: `a` takes X in even-numbered games, and
-    /// each side's randomness is seeded with its seed plus `g`.
-    fn new(g: usize, searches: (&MctsConfig, &MctsConfig)) -> Self {
+    /// An empty slot: a finished game, with a tree for the games to come.
+    fn empty() -> Self {
         Self {
             state: BitState::initial(),
             tree: SearchTree::new(BitState::initial(), 0, 1.0, 0.0),
-            a_plays: if g % 2 == 0 { Player::X } else { Player::O },
-            rngs: [
-                SmallRng::seed_from_u64(searches.0.seed.wrapping_add(g as u64)),
-                SmallRng::seed_from_u64(searches.1.seed.wrapping_add(g as u64)),
-            ],
+            a_plays: Player::X,
+            rngs: [SmallRng::seed_from_u64(0), SmallRng::seed_from_u64(0)],
             plies: 0,
-            finished: false,
+            finished: true,
         }
+    }
+
+    /// Starts game number `g` of a match in this slot, before any move, keeping the tree's
+    /// buffers: `a` takes X in even-numbered games, and each side's randomness is seeded with
+    /// its seed plus `g`.
+    fn restart(&mut self, g: usize, searches: (&MctsConfig, &MctsConfig)) {
+        self.state = BitState::initial();
+        self.a_plays = if g % 2 == 0 { Player::X } else { Player::O };
+        self.rngs = [
+            SmallRng::seed_from_u64(searches.0.seed.wrapping_add(g as u64)),
+            SmallRng::seed_from_u64(searches.1.seed.wrapping_add(g as u64)),
+        ];
+        self.plies = 0;
+        self.finished = false;
     }
 
     fn a_to_move(&self) -> bool {
@@ -591,29 +621,32 @@ impl SideBatch {
     }
 }
 
-/// The search for `game`'s next move by the side whose search settings are `search`: it may
-/// stop early once the move is decided, unless the move is sampled.
-fn search_tree(
+/// Starts `game`'s tree over for the next move's search by the side whose search settings
+/// are `search`: it may stop early once the move is decided, unless the move is sampled.
+fn prepare_search(
     game: &mut MatchGame,
     a_next: bool,
     search: &MctsConfig,
     exploration: &MatchExploration,
-) -> SearchTree<BitState> {
+) {
     let sampled = game.plies < exploration.temperature_moves || search.temperature != 0.0;
-    let tree = SearchTree::new(
+    let noise_seed = exploration
+        .root_noise
+        .map(|_| game.rng(a_next).random::<u64>());
+    game.tree.reset(
         game.state,
         search.simulations,
         search.c_puct,
         search.virtual_loss,
-    )
-    .with_early_stop(if sampled { 0 } else { search.early_stop });
-    match exploration.root_noise {
-        Some((alpha, fraction)) => tree.with_root_noise(RootNoise {
+    );
+    game.tree
+        .set_early_stop(if sampled { 0 } else { search.early_stop });
+    if let (Some((alpha, fraction)), Some(seed)) = (exploration.root_noise, noise_seed) {
+        game.tree.set_root_noise(RootNoise {
             alpha,
             fraction,
-            seed: game.rng(a_next).random(),
-        }),
-        None => tree,
+            seed,
+        });
     }
 }
 
@@ -650,7 +683,7 @@ fn advance_match(
         if !game.finished {
             let a_next = game.a_to_move();
             let next = if a_next { searches.0 } else { searches.1 };
-            game.tree = search_tree(game, a_next, next, exploration);
+            prepare_search(game, a_next, next, exploration);
         }
     }
 }
@@ -697,35 +730,39 @@ pub fn lockstep_match_games<A: UtttAgent<State = BitState>, B: UtttAgent<State =
     let mut tally = MatchTally::default();
     let books = (a.book, b.book);
     let searches = (&a.search, &b.search);
-    // The next game that needs a search, starting games (and playing their book moves) until
-    // one does; `None` once the numbers run out.
-    let mut start = |tally: &mut MatchTally, on_game: &mut dyn FnMut(&MatchTally)| loop {
-        let g = next_game()?;
-        let mut game = MatchGame::new(g, searches);
-        // Book moves first; the first position outside both books gets the search.
-        game.play_book_moves(books, tally, &mut |t: &MatchTally| on_game(t));
-        if !game.finished {
-            let a_next = game.a_to_move();
-            let next = if a_next { searches.0 } else { searches.1 };
-            game.tree = search_tree(&mut game, a_next, next, exploration);
-            return Some(game);
-        }
-    };
+    // Starts the next game that needs a search in `slot`, starting games (and playing their
+    // book moves) until one does; false, with the slot untouched, once the numbers run out.
+    let mut start =
+        |slot: &mut MatchGame, tally: &mut MatchTally, on_game: &mut dyn FnMut(&MatchTally)| loop {
+            let Some(g) = next_game() else {
+                return false;
+            };
+            slot.restart(g, searches);
+            // Book moves first; the first position outside both books gets the search.
+            slot.play_book_moves(books, tally, &mut |t: &MatchTally| on_game(t));
+            if !slot.finished {
+                let a_next = slot.a_to_move();
+                let next = if a_next { searches.0 } else { searches.1 };
+                prepare_search(slot, a_next, next, exploration);
+                return true;
+            }
+        };
     let mut active: Vec<MatchGame> = Vec::with_capacity(concurrent);
     while active.len() < concurrent {
-        match start(&mut tally, &mut on_game) {
-            Some(game) => active.push(game),
-            None => break,
+        let mut slot = MatchGame::empty();
+        if !start(&mut slot, &mut tally, &mut on_game) {
+            break;
         }
+        active.push(slot);
     }
-    // Finished games give their slots to new ones. A slot is free between rounds: a game ends
-    // on its own side's move, so the other side's batch in flight does not hold it.
+    // Finished games give their slots, and their trees' buffers, to new ones. A slot is free
+    // between rounds: a game ends on its own side's move, so the other side's batch in flight
+    // does not hold it.
     let mut refill =
         |active: &mut [MatchGame], tally: &mut MatchTally, on_game: &mut dyn FnMut(&MatchTally)| {
             for slot in active.iter_mut().filter(|g| g.finished) {
-                match start(tally, on_game) {
-                    Some(game) => *slot = game,
-                    None => return,
+                if !start(slot, tally, on_game) {
+                    return;
                 }
             }
         };

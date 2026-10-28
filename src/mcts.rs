@@ -344,6 +344,9 @@ pub struct SearchTree<S: GameState> {
     next_check: u32,
     /// The most visited root move can no longer be overtaken: the search is over.
     settled: bool,
+    /// Whether [`SearchTree::reset`] has sized the buffers yet (it does so once, after the
+    /// first search).
+    sized: bool,
 }
 
 impl<S: GameState> SearchTree<S> {
@@ -364,15 +367,55 @@ impl<S: GameState> SearchTree<S> {
             early_stop: 0,
             next_check: 0,
             settled: false,
+            sized: false,
         }
+    }
+
+    /// Starts this tree over as [`SearchTree::new`] would, keeping its buffers for the new
+    /// search, so that a game's searches stop allocating once its trees have their size. The
+    /// first reset after a search sizes each buffer to about 1.2 times what that search used
+    /// (see [`sized_for_next`]); later ones only empty them. Early stopping, root priors and root
+    /// noise are off again until set.
+    pub fn reset(&mut self, root: S, simulations: u32, c_puct: f32, virtual_loss: f32) {
+        assert!(self.claimed.is_empty(), "resolve the last round first");
+        if self.sized || self.completed == 0 {
+            self.nodes.clear();
+            self.edges.clear();
+        } else {
+            sized_for_next(&mut self.nodes);
+            sized_for_next(&mut self.edges);
+            self.sized = true;
+        }
+        self.nodes.push(Node::new(
+            NO_NODE,
+            0,
+            NO_NODE,
+            root.to_move(),
+            root.outcome(),
+        ));
+        self.root = root;
+        self.c_puct = c_puct;
+        self.virtual_loss = virtual_loss;
+        self.completed = 0;
+        self.budget = simulations;
+        self.noise = None;
+        self.root_priors = None;
+        self.early_stop = 0;
+        self.next_check = 0;
+        self.settled = false;
     }
 
     /// Stops the search once the most visited root move leads the next by more than the
     /// simulations left, checked every `interval` simulations (`0`: never).
     pub fn with_early_stop(mut self, interval: u32) -> Self {
+        self.set_early_stop(interval);
+        self
+    }
+
+    /// [`SearchTree::with_early_stop`] in place, before the search starts.
+    pub fn set_early_stop(&mut self, interval: u32) {
         self.early_stop = interval;
         self.next_check = interval;
-        self
     }
 
     /// Expands the root with `priors` (a row indexed by `Move::index`, normalised over the
@@ -384,9 +427,14 @@ impl<S: GameState> SearchTree<S> {
 
     /// Mixes Dirichlet noise into the root priors when the root gets expanded.
     pub fn with_root_noise(mut self, noise: RootNoise) -> Self {
+        self.set_root_noise(noise);
+        self
+    }
+
+    /// [`SearchTree::with_root_noise`] in place, before the search starts.
+    pub fn set_root_noise(&mut self, noise: RootNoise) {
         let rng = SmallRng::seed_from_u64(noise.seed);
         self.noise = Some((noise, rng));
-        self
     }
 
     pub fn root(&self) -> &S {
@@ -825,6 +873,19 @@ impl<S: GameState> SearchTree<S> {
     }
 }
 
+/// Empties `v` for a search like the one it held, sized to about 1.2 times that one's length:
+/// the next search rarely needs to grow it, and a buffer that doubled past its need does not
+/// keep the slack.
+fn sized_for_next<T>(v: &mut Vec<T>) {
+    let target = v.len() + v.len() / 5;
+    v.clear();
+    if v.capacity() > target {
+        v.shrink_to(target);
+    } else {
+        v.reserve_exact(target);
+    }
+}
+
 /// A sample from a symmetric Dirichlet distribution with concentration `alpha`, as
 /// normalised gamma variates (Marsaglia and Tsang, with the `alpha < 1` boost).
 pub fn dirichlet(rng: &mut impl Rng, alpha: f32, n: usize) -> Vec<f32> {
@@ -984,6 +1045,32 @@ mod tests {
             simulations,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_reset_tree_searches_like_a_new_one() {
+        let run = |tree: &mut SearchTree<BitState>| {
+            let mut agent = RandomAgent::<BitState>::new(5);
+            let (mut states, mut evals) = (Vec::new(), Evaluations::default());
+            while !tree.is_done() {
+                states.clear();
+                evals.clear();
+                tree.claim(4, &mut states);
+                agent.evaluate_batch(&states, &mut evals);
+                tree.resolve(&evals, 0);
+            }
+            tree.result()
+        };
+        let mut used = SearchTree::new(BitState::initial(), 300, 1.4, 1.0);
+        run(&mut used);
+        let nodes = used.nodes.len();
+        used.reset(BitState::initial(), 200, 1.4, 1.0);
+        // The first reset after a search sizes the buffers for one like it.
+        assert!(used.nodes.capacity() >= nodes && used.nodes.capacity() <= nodes * 6 / 5 + 1);
+        let mut fresh = SearchTree::new(BitState::initial(), 200, 1.4, 1.0);
+        let (a, b) = (run(&mut used), run(&mut fresh));
+        assert_eq!((a.root_value, a.visits), (b.root_value, b.visits));
+        used.assert_consistent();
     }
 
     #[test]
