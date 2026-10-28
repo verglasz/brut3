@@ -136,7 +136,7 @@ pub fn write_all(
     };
     if let Some(weights) = weights {
         let rounded = weights.dequantised();
-        let names = codegen::Names::new(&weights.config);
+        let names = codegen::Names::new(weights);
         emit("Spec", spec_module(weights, &opts.prefix))?;
         let positions = reference_positions(opts.seed, opts.positions);
         // The reference holds what the shipped (int16-rounded) network computes.
@@ -173,7 +173,7 @@ pub fn write_all(
         (None, None) => None,
         (weights, extra) => {
             let mut spec = match weights {
-                Some(w) => codegen::vec_spec(&codegen::Names::new(&w.config), &opts.prefix),
+                Some(w) => codegen::vec_spec(&codegen::Names::new(w), &opts.prefix),
                 None => VecSpec::new(&format!("{}.FixedVec", opts.prefix)),
             };
             if let Some(extra) = extra {
@@ -402,7 +402,7 @@ pub fn open_codes_checksum() -> u64 {
 
 /// `Spec.hs`: the model's widths and every id convention, as `Int` constants.
 pub fn spec_module(weights: &Weights, prefix: &str) -> String {
-    let c = &weights.config;
+    let c = weights;
     let mut s = String::new();
     banner(&mut s, &format!("{prefix}.Spec"), "");
     bundle_imports(&mut s, &[]);
@@ -416,7 +416,7 @@ pub fn spec_module(weights: &Weights, prefix: &str) -> String {
                 ("dEmbed", c.d_embed),
                 ("dAcc", c.d_acc),
                 ("dHidden", c.d_hidden),
-                ("nLayers", c.layers),
+                ("nLayers", c.trunk.len()),
             ],
         ),
         (
@@ -505,18 +505,9 @@ pub fn spec_module(weights: &Weights, prefix: &str) -> String {
     );
     let _ = writeln!(s, "parameters, foldedMacs :: Int");
     let _ = writeln!(s, "parameters = {}", weights.parameters());
-    let _ = writeln!(s, "foldedMacs = {}", folded_macs(weights));
+    let _ = writeln!(s, "foldedMacs = {}", weights.folded_macs());
     bundle_body_end(&mut s);
     s
-}
-
-fn folded_macs(weights: &Weights) -> usize {
-    let c = &weights.config;
-    c.d_acc * c.d_hidden
-        + (c.layers - 1) * c.d_hidden * c.d_hidden
-        + c.d_hidden * 3
-        + c.d_acc * 3
-        + c.d_hidden * MOVES
 }
 
 /// Named positions for the reference vectors: the initial position, then a mix of early,

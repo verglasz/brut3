@@ -123,30 +123,30 @@ impl NnueV2Config {
 pub struct NnueV2 {
     #[module(skip)]
     config: NnueV2Config,
-    content: burn::nn::Embedding,
-    mix: Linear,
-    forced_mix: Linear,
-    features: burn::nn::Embedding,
+    pub content: burn::nn::Embedding,
+    pub mix: Linear,
+    pub forced_mix: Linear,
+    pub features: burn::nn::Embedding,
     /// `acc -> h0`, without a ReLU.
-    proj: Linear,
+    pub proj: Linear,
     /// The first layer's matrix: `W_up` of the gated layer, or `W` of the residual one.
-    first: Linear,
+    pub first: Linear,
     /// The gated first layer's `W_down`; `None` for the residual one.
-    first_down: Option<Linear>,
+    pub first_down: Option<Linear>,
     /// The residual layers after the first.
-    hidden: Vec<Linear>,
+    pub hidden: Vec<Linear>,
     /// The ReGLU blocks after the first layer.
-    glu: Vec<ReGlu>,
+    pub glu: Vec<ReGlu>,
     /// With `rezero`, the branch scale of each layer after the projection, the first layer's
     /// first; empty without.
-    rezero: Vec<Param<Tensor<1>>>,
-    value: Linear,
-    value_skip: Linear,
-    policy: Linear,
-    local_policy: burn::nn::Embedding,
-    send_policy: burn::nn::Embedding,
+    pub rezero: Vec<Param<Tensor<1>>>,
+    pub value: Linear,
+    pub value_skip: Linear,
+    pub policy: Linear,
+    pub local_policy: burn::nn::Embedding,
+    pub send_policy: burn::nn::Embedding,
     /// `h -> GATES`, through a sigmoid in the heads.
-    gates: Linear,
+    pub gates: Linear,
 }
 
 impl NnueV2 {
@@ -316,7 +316,15 @@ mod tests {
         let device = BackendKind::preferred().device();
         let model = small().init(&device);
         let weight: f32 = model.gates.weight.val().abs().max().into_scalar();
-        let bias: f32 = model.gates.bias.as_ref().unwrap().val().abs().max().into_scalar();
+        let bias: f32 = model
+            .gates
+            .bias
+            .as_ref()
+            .unwrap()
+            .val()
+            .abs()
+            .max()
+            .into_scalar();
         assert_eq!((weight, bias), (0.0, 0.0));
         // Doubled, the gated heads compute what the ungated ones did.
         let (n, d_acc) = (4, 32);

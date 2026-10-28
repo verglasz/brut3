@@ -4,7 +4,7 @@
 //! back into `Float`. Every array of [`Weights::arrays`] is shipped on its own: row-major,
 //! little-endian `Int16`, base64-encoded with the standard alphabet and padding.
 
-use super::weights::{Array, Dense, Matrix, Weights};
+use super::weights::{Array, Weights};
 
 /// Largest quantised magnitude.
 const Q_MAX: f32 = i16::MAX as f32;
@@ -45,62 +45,27 @@ impl Weights {
     /// Rebuilds the weights with `f` applied to every array (the same arrays as
     /// [`Weights::arrays`]).
     pub fn map_arrays(&self, mut f: impl FnMut(&Array<'_>) -> Vec<f32>) -> Self {
-        let mut arrays = self.arrays().into_iter();
-        let mut next = |expect: &str| {
-            let a = arrays.next().expect("array");
-            assert_eq!(a.name, expect, "array order");
-            (a.rows, a.cols, f(&a))
-        };
-        // A table shipped in parts: the parts' rows stacked back together.
-        let mut stacked = |names: &[&str]| {
-            let parts: Vec<_> = names.iter().map(|&name| next(name)).collect();
-            let rows = parts.iter().map(|&(rows, _, _)| rows).sum();
-            Matrix::new(
-                rows,
-                parts[0].1,
-                parts.into_iter().flat_map(|p| p.2).collect(),
-            )
-        };
-        let content = stacked(&["content_open", "content_rest"]);
-        let mut matrix = |name: &str| stacked(&[name]);
-        let mix: Vec<Matrix> = (0..self.mix.len())
-            .map(|k| matrix(&format!("mix{k}")))
-            .collect();
-        let mix_bias = matrix("mix_bias").data;
-        let forced = matrix("forced");
-        let features = matrix("features");
-        let hidden = (0..self.hidden.len())
-            .map(|i| Dense {
-                weight: matrix(&format!("hidden{i}")),
-                bias: matrix(&format!("hidden{i}_bias")).data,
-            })
-            .collect();
-        let value = Dense {
-            weight: matrix("value"),
-            bias: matrix("value_bias").data,
-        };
-        let skip = matrix("skip");
-        let policy = Dense {
-            weight: matrix("policy"),
-            bias: matrix("policy_bias").data,
-        };
-        let local = stacked(&["local_open", "local_rest"]);
-        let send = stacked(&["send_open", "send_rest"]).data;
-        assert!(arrays.next().is_none(), "every array mapped");
-        Self {
-            config: self.config.clone(),
-            content,
-            mix,
-            mix_bias,
-            forced,
-            features,
-            hidden,
-            value,
-            skip,
-            policy,
-            local,
-            send,
+        let mut stream = Vec::with_capacity(self.parameters());
+        for a in self.arrays() {
+            let mapped = f(&a);
+            assert_eq!(
+                mapped.len(),
+                a.data.len(),
+                "{} mapped to a different size",
+                a.name
+            );
+            stream.extend(mapped);
         }
+        // The arrays are the buffers cut into consecutive pieces, in the same order.
+        let mut out = self.clone();
+        let mut rest = stream.as_slice();
+        for buffer in out.buffers_mut() {
+            let (head, tail) = rest.split_at(buffer.len());
+            buffer.copy_from_slice(head);
+            rest = tail;
+        }
+        assert!(rest.is_empty(), "every array mapped");
+        out
     }
 
     /// The weights after an int16 round trip: what the Haskell evaluator computes with.
@@ -203,7 +168,45 @@ mod tests {
             let q = i16::from_le_bytes([first.bytes[2 * i], first.bytes[2 * i + 1]]);
             assert!((q as f32 * first.scale - w).abs() <= first.scale / 2.0 + 1e-9);
         }
-        assert_eq!(weights.dequantised().config, weights.config);
+        assert_eq!(weights.dequantised().spec, weights.spec);
+    }
+
+    /// `map_arrays` writes every array back where `arrays` read it, for every layer kind and
+    /// the head gates.
+    #[test]
+    fn mapped_arrays_land_in_their_own_buffers() {
+        let _device = crate::nn::device_lock();
+        let device = crate::nn::BackendKind::preferred().device();
+        let v2 = crate::nn::NnueV2Config::new()
+            .with_d_embed(4)
+            .with_d_acc(8)
+            .with_d_hidden(4)
+            .with_layers(3);
+        let nnue = crate::nn::NnueConfig::new()
+            .with_d_embed(4)
+            .with_d_acc(8)
+            .with_d_hidden(4)
+            .with_layers(3)
+            .with_reglu(Some(6));
+        for weights in [
+            Weights::from_v2(&v2.clone().init(&device)),
+            Weights::from_v2(&v2.with_reglu(Some(6)).init(&device)),
+            Weights::from_model(&nnue.init(&device)),
+        ] {
+            let mut index = 0.0;
+            let tagged = weights.map_arrays(|a| {
+                index += 1.0;
+                vec![index; a.data.len()]
+            });
+            for (i, a) in tagged.arrays().iter().enumerate() {
+                assert!(
+                    a.data.iter().all(|&x| x == (i + 1) as f32),
+                    "{}: {}",
+                    weights.spec,
+                    a.name
+                );
+            }
+        }
     }
 
     #[test]

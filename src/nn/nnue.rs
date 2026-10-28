@@ -360,7 +360,7 @@ impl NnueConfig {
 /// The layers every NNUE model has around its hidden ones, freshly initialised: the first
 /// layer's tables and matrices, and the heads. The models keep them as fields of their own,
 /// under these names, so that saved weights keep their names, and lend them out as [`Ends`].
-pub(crate) struct EndLayers {
+pub struct EndLayers {
     pub content: Embedding,
     pub mix: Linear,
     pub forced_mix: Linear,
@@ -439,14 +439,14 @@ pub trait NnueNet: Module {
 /// projections, the heads), so a constant added to it would fold into their biases.
 #[derive(Module, Debug)]
 pub struct ReGlu {
-    gate: Linear,
-    up: Linear,
-    down: Linear,
+    pub gate: Linear,
+    pub up: Linear,
+    pub down: Linear,
 }
 
 impl ReGlu {
     /// A block on a `d_hidden` stream with `d_ff`-wide gate and up projections.
-    pub(crate) fn new(d_hidden: usize, d_ff: usize, device: &Device) -> Self {
+    pub fn new(d_hidden: usize, d_ff: usize, device: &Device) -> Self {
         Self {
             gate: LinearConfig::new(d_hidden, d_ff).init(device),
             up: LinearConfig::new(d_hidden, d_ff).init(device),
@@ -457,7 +457,7 @@ impl ReGlu {
     }
 
     /// The block's branch, to add to `h`.
-    pub(crate) fn forward(&self, h: Tensor<2>) -> Tensor<2> {
+    pub fn forward(&self, h: Tensor<2>) -> Tensor<2> {
         self.down
             .forward(relu(self.gate.forward(h.clone())) * self.up.forward(h))
     }
@@ -468,24 +468,24 @@ pub struct Nnue {
     #[module(skip)]
     config: NnueConfig,
     /// `[CONTENT_ROWS, d_embed]`: contents, the no-forced row, cell rows, padding.
-    pub(crate) content: Embedding,
+    pub content: Embedding,
     /// `[9 * d_embed, d_acc]`: the nine board-specific matrices side by side.
-    pub(crate) mix: Linear,
+    pub mix: Linear,
     /// `[d_embed, d_acc]`: the forced board's content.
-    pub(crate) forced_mix: Linear,
+    pub forced_mix: Linear,
     /// `[FEATURE_ROWS, d_acc]`.
-    pub(crate) features: Embedding,
+    pub features: Embedding,
     /// The first hidden layer, then the residual layers when `reglu` is `None`.
-    pub(crate) hidden: Vec<Linear>,
+    pub hidden: Vec<Linear>,
     /// The layers after the first when `reglu` is set.
-    pub(crate) glu: Vec<ReGlu>,
-    pub(crate) value: Linear,
-    pub(crate) value_skip: Linear,
-    pub(crate) policy: Linear,
+    pub glu: Vec<ReGlu>,
+    pub value: Linear,
+    pub value_skip: Linear,
+    pub policy: Linear,
     /// `[CONTENTS, 9]`: a board's own cell logits.
-    pub(crate) local_policy: Embedding,
+    pub local_policy: Embedding,
     /// `[CONTENTS, 1]`: the logit of sending the opponent to a board with this content.
-    pub(crate) send_policy: Embedding,
+    pub send_policy: Embedding,
 }
 
 impl Nnue {
@@ -585,7 +585,7 @@ fn accumulate(e: &Ends, ids: NnueInput) -> Tensor<2> {
 /// policy, which also reads the nine boards' contents (`[n, BOARDS]`) in the policy tables
 /// `local_policy` (`[_, CELLS]`) and `send_policy` (`[_, 1]`), the model's own or re-indexed
 /// copies. With gates, `h` weighs the skip and the tables (see [`GATES`]).
-pub(crate) fn heads(
+pub fn heads(
     e: &Ends,
     h: Tensor<2>,
     acc: Tensor<2>,
@@ -605,7 +605,10 @@ pub(crate) fn heads(
         Some(gates) => {
             let g = sigmoid(gates.forward(h));
             let mix = g.clone().slice([0..n, 0..1]);
-            let local_gate = g.clone().slice([0..n, 1..1 + BOARDS]).reshape([n, BOARDS, 1]);
+            let local_gate = g
+                .clone()
+                .slice([0..n, 1..1 + BOARDS])
+                .reshape([n, BOARDS, 1]);
             let send_gate = g.slice([0..n, 1 + BOARDS..GATES]).reshape([n, 1, CELLS]);
             (
                 value.clone() + (skip - value) * mix,
@@ -621,7 +624,7 @@ pub(crate) fn heads(
 
 /// An NNUE model's prediction from [`nnue_ids`] input: the accumulator, the model's trunk,
 /// the heads.
-pub(crate) fn predict<N: NnueNet>(net: &N, ids: NnueInput) -> Prediction {
+pub fn predict<N: NnueNet>(net: &N, ids: NnueInput) -> Prediction {
     let [n, _] = ids.dims();
     // Content ids of the nine boards: every tenth id of the first nine tokens.
     let contents = ids

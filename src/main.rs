@@ -51,11 +51,11 @@ enum Command {
     /// List the backends compiled into this binary.
     #[cfg(feature = "nn")]
     Backends,
-    /// Export an nnue model and/or an opening book as generated Haskell sources for the
+    /// Export an nnue or nnue-v2 model and/or an opening book as generated Haskell sources for the
     /// base-only engine.
     #[cfg(feature = "nn")]
     Export {
-        /// Model stem (`<stem>.bpk` + `<stem>.json`), an nnue model.
+        /// Model stem (`<stem>.bpk` + `<stem>.json`), an nnue or nnue-v2 model.
         #[arg(long, required_unless_present_any = ["book", "vec_extra", "vec_flags"])]
         model: Option<std::path::PathBuf>,
         /// Opening book file (from `book`) to export as Gen/Book.hs.
@@ -1341,16 +1341,8 @@ fn export(
                 Some(name) => name.parse::<BackendKind>()?,
                 None => BackendKind::preferred(),
             };
-            let weights = match AnyModel::load(model, &backend.device())? {
-                AnyModel::Nnue(m) => Weights::from_model(&m),
-                other => {
-                    return Err(format!(
-                        "{} is a {} model, not nnue",
-                        model.display(),
-                        other.spec()
-                    ));
-                }
-            };
+            let weights = Weights::from_any(&AnyModel::load(model, &backend.device())?)
+                .map_err(|e| format!("{} is {e}", model.display()))?;
             eprintln!(
                 "{}: {} parameters",
                 weights.config_display(),

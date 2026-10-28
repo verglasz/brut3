@@ -48,7 +48,7 @@ pub struct VecSpec {
     /// Column containers `(m, n)` of a layer with `m` outputs and `n` inputs: `ColsN_M` and
     /// `columnsM_N`, adding `RowsM_N`.
     pub cols: Vec<(usize, usize)>,
-    /// Sparse layers `(m, n, k)`: `sparseDenseM_N` (and `sparseResidualM`), computed by
+    /// Sparse layers `(m, n, k)`: `sparseDenseM_N`, `sparseLinearM_N` (and `sparseResidualM`), computed by
     /// columns over the nonzero inputs, `k` columns per pass; adds the columns and axpys.
     pub sparse: Vec<(usize, usize, usize)>,
     /// `type NAME = VecN`.
@@ -1547,19 +1547,29 @@ impl<'a> Gen<'a> {
                 .collect(),
             None => vec![format!("gather{n}_{m} x cols NoPairs{m}")],
         };
-        let mut kinds = vec![(
-            format!("sparseDense{m}_{n}"),
-            "relu (bias + sum over the nonzero x_j of x_j * column j), as dense",
-            "bias".to_string(),
-        )];
+        let mut kinds = vec![
+            (
+                format!("sparseDense{m}_{n}"),
+                "relu (bias + sum over the nonzero x_j of x_j * column j), as dense",
+                "bias".to_string(),
+                true,
+            ),
+            (
+                format!("sparseLinear{m}_{n}"),
+                "bias + sum over the nonzero x_j of x_j * column j, as linear",
+                "bias".to_string(),
+                false,
+            ),
+        ];
         if m == n {
             kinds.push((
                 format!("sparseResidual{m}"),
                 "relu (x + bias + sum over the nonzero x_j of x_j * column j), as residual",
                 format!("(add{m} x bias)"),
+                true,
             ));
         }
-        for (fun, what, start) in kinds {
+        for (fun, what, start, rectified) in kinds {
             self.push(format!("{{- {fun} cols bias x"));
             self.push(format!(
                 "   RETURNS: {what}{m}_{n} up to rounding, adding {k} columns per pass -}}"
@@ -1587,9 +1597,11 @@ impl<'a> Gen<'a> {
             for gather in &gathers {
                 self.push(format!("{pad}      {gather}"));
             }
-            self.push(format!(
-                "{pad} in relu{m} (addColumns{k}_{m} {start} pairs)"
-            ));
+            let sum = format!("addColumns{k}_{m} {start} pairs");
+            self.push(match rectified {
+                true => format!("{pad} in relu{m} ({sum})"),
+                false => format!("{pad} in {sum}"),
+            });
             self.push("");
         }
     }

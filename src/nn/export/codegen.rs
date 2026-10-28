@@ -15,6 +15,7 @@ use std::fmt::Write as _;
 use super::haskell::{bundle_body_begin, bundle_body_end, bundle_imports};
 use super::vecgen::SPARSE_K;
 use super::vecgen::VecSpec;
+use super::weights::{Layer, Weights};
 use crate::game::LINES;
 use crate::nn::model::MOVES;
 use crate::nn::nnue::{
@@ -22,18 +23,17 @@ use crate::nn::nnue::{
     CELL_BASE,
     CELL_PAD,
     CELLS,
-    CONTENT_ROWS,
     CONTENTS,
     DECIDED_BASE,
     FEATURE_IDS,
     FEATURE_ROWS,
     FORCED_BASE,
     FULL,
+    GATES,
     IDS_PER_BOARD,
     LINE_BASE,
     LINE_STATES,
     NO_FORCED,
-    NnueConfig,
     OPEN_CONTENTS,
     OPEN_MARKS_BASE,
     TOKENS,
@@ -61,30 +61,83 @@ const FORCED_FEATURES: usize = LINE_BASE - FORCED_BASE;
 const DECIDED_FEATURES: usize = OPEN_MARKS_BASE - DECIDED_BASE;
 const MARKS_FEATURES: usize = FEATURE_ROWS - OPEN_MARKS_BASE;
 
-/// The widths a configuration's code is generated with.
+/// The kind of a hidden layer (see [`Layer`]), with a ReGLU block's inner width.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Kind {
+    Dense,
+    Linear,
+    Residual,
+    ReluResidual,
+    SelfGated,
+    ReGlu(usize),
+}
+
+impl Kind {
+    fn of(layer: &Layer) -> Self {
+        match layer {
+            Layer::Dense(_) => Kind::Dense,
+            Layer::Linear(_) => Kind::Linear,
+            Layer::Residual(_) => Kind::Residual,
+            Layer::ReluResidual(_) => Kind::ReluResidual,
+            Layer::SelfGated { .. } => Kind::SelfGated,
+            Layer::ReGlu { gate, .. } => Kind::ReGlu(gate.weight.rows),
+        }
+    }
+
+    /// Whether the layer is computed by columns over its nonzero inputs in sparseHiddenOf:
+    /// the layers from the accumulator, and the residual ones, whose inputs are rectified.
+    fn sparse(self) -> bool {
+        matches!(self, Kind::Dense | Kind::Linear | Kind::Residual)
+    }
+}
+
+/// The widths and layers a model's code is generated with.
 pub struct Names {
     pub e: usize,
     pub a: usize,
     pub h: usize,
-    pub layers: usize,
+    /// The hidden layers, the first from the accumulator.
+    pub trunk: Vec<Kind>,
+    /// Whether the heads are gated.
+    pub gated: bool,
 }
 
 impl Names {
-    pub fn new(c: &NnueConfig) -> Self {
+    pub fn new(w: &Weights) -> Self {
         assert!(
-            c.d_acc % CHUNK == 0,
+            w.d_acc % CHUNK == 0,
             "d_acc must be a multiple of {CHUNK} for the chunked export"
         );
-        assert!(
-            c.d_hidden <= CHUNK || c.d_hidden % CHUNK == 0,
-            "d_hidden must be at most {CHUNK} or a multiple of it"
-        );
-        Self {
-            e: c.d_embed,
-            a: c.d_acc,
-            h: c.d_hidden,
-            layers: c.layers,
+        let trunk: Vec<Kind> = w.trunk.iter().map(Kind::of).collect();
+        let mut widths = vec![("d_hidden", w.d_hidden)];
+        widths.extend(w.d_ff().map(|d| ("the ReGLU width", d)));
+        for (what, n) in widths {
+            assert!(
+                n <= CHUNK || n % NEST == 0,
+                "{what} must be at most {CHUNK} or a multiple of {NEST}"
+            );
         }
+        Self {
+            e: w.d_embed,
+            a: w.d_acc,
+            h: w.d_hidden,
+            trunk,
+            gated: w.gates.is_some(),
+        }
+    }
+
+    /// The ReGLU blocks' inner widths.
+    fn ff_widths(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = self
+            .trunk
+            .iter()
+            .filter_map(|k| match k {
+                Kind::ReGlu(d) => Some(*d),
+                _ => None,
+            })
+            .collect();
+        out.dedup();
+        out
     }
 
     fn vec(w: usize) -> String {
@@ -101,13 +154,20 @@ impl Names {
     }
 
     /// `(m, n)` dense shapes: the fold pieces, the hidden layers, the value head, the skip
-    /// and the per-board policy.
+    /// and the per-board policy (and policy gates).
     fn dense(&self) -> Vec<(usize, usize)> {
-        let mut shapes = vec![(CHUNK, self.e), (self.h, self.a)];
-        if self.layers > 1 {
-            shapes.push((self.h, self.h));
+        let h = self.h;
+        let mut shapes = vec![(CHUNK, self.e), (h, self.a)];
+        if self.trunk[1..].iter().any(|k| !matches!(k, Kind::ReGlu(_))) {
+            shapes.push((h, h));
         }
-        shapes.extend([(3, self.h), (3, self.a), (CELLS, self.h)]);
+        for d in self.ff_widths() {
+            shapes.extend([(d, h), (h, d)]);
+        }
+        shapes.extend([(3, h), (3, self.a), (CELLS, h)]);
+        // Shapes can coincide (a ReGLU width equal to the hidden one, a 9-wide layer).
+        let mut seen = std::collections::BTreeSet::new();
+        shapes.retain(|&shape| seen.insert(shape));
         shapes
     }
 
@@ -127,16 +187,19 @@ pub fn vec_spec(names: &Names, prefix: &str) -> VecSpec {
     let mut spec = VecSpec::new(&format!("{prefix}.FixedVec"));
     spec.floats
         .extend([3, CELLS, CHUNK, names.e, names.a, names.h]);
+    spec.floats.extend(names.ff_widths());
     spec.nest.insert(names.a, (names.a / NEST, NEST));
-    if names.h > CHUNK {
-        spec.nest.insert(names.h, (names.h / NEST, NEST));
+    for n in std::iter::once(names.h).chain(names.ff_widths()) {
+        if n > CHUNK {
+            spec.nest.insert(n, (n / NEST, NEST));
+        }
     }
     spec.rows = names.selected();
     spec.dense = names.dense();
     spec.sums = vec![(ACC_INPUTS, names.a)];
     // The hidden layers by columns over their nonzero inputs (sparseHiddenOf).
     spec.sparse = vec![(names.h, names.a, SPARSE_K)];
-    if names.layers > 1 {
+    if names.trunk.contains(&Kind::Residual) {
         spec.sparse.push((names.h, names.h, SPARSE_K));
     }
     spec.concats = vec![(names.pieces(), CHUNK)];
@@ -188,8 +251,9 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
         &mut s,
         "VecE, VecA, VecH, FoldPiece, OpenClosed (ocOpen, ocFull, ocWonByUs, ocWonByThem), \
          Net (every field starts with net), net, genZeroChunk, genZero3, \
-         foldRow, lineFeature, accumulateRows, hiddenOf, HiddenColumns (constructor \
-         HiddenColumns), hiddenColumns, sparseHiddenOf, wdlOf, policyLogits",
+         foldRow, lineFeature, accumulateRows, genZeroH, hiddenOf, HiddenColumns (constructor \
+         HiddenColumns), hiddenColumns, sparseHiddenOf, genSigmoid or genOnes9, wdlOf, \
+         PolicyGates (pgLocal, pgSend), policyGates, policyLogits",
     );
     let _ = writeln!(
         s,
@@ -284,23 +348,66 @@ data OpenClosed a = OpenClosed
         Names::rows(MARKS_FEATURES, a),
         "feature rows by marks on open boards".into(),
     ));
-    for i in 0..names.layers {
-        let shape = if i == 0 {
-            Names::rows(h, a)
-        } else {
-            Names::rows(h, h)
+    for (i, kind) in names.trunk.iter().enumerate() {
+        let field =
+            |name: &str, ty: String, what: String| (format!("netHidden{i}{name}"), ty, what);
+        let plain = |what: &str| {
+            let shape = if i == 0 {
+                Names::rows(h, a)
+            } else {
+                Names::rows(h, h)
+            };
+            [
+                field("", shape, format!("hidden layer {i}, {what}")),
+                field("Bias", "VecH".into(), format!("hidden layer {i}'s bias")),
+            ]
         };
-        let what = if i == 0 {
-            "hidden layer 0, from the accumulator".to_string()
-        } else {
-            format!("hidden layer {i}, residual")
-        };
-        fields.push((format!("netHidden{i}"), shape, what));
-        fields.push((
-            format!("netHidden{i}Bias"),
-            "VecH".into(),
-            format!("hidden layer {i}'s bias"),
-        ));
+        match *kind {
+            Kind::Dense => fields.extend(plain("relu (W acc + b)")),
+            Kind::Linear => fields.extend(plain("W acc + b, no relu")),
+            Kind::Residual => fields.extend(plain("residual: relu (x + W x + b)")),
+            Kind::ReluResidual => fields.extend(plain("relu (x + W (relu x) + b)")),
+            Kind::SelfGated => fields.extend([
+                field(
+                    "Up",
+                    Names::rows(h, h),
+                    format!("hidden layer {i}, x + Down (relu x * (Up x + b)): Up"),
+                ),
+                field(
+                    "UpBias",
+                    "VecH".into(),
+                    format!("hidden layer {i}'s Up bias"),
+                ),
+                field(
+                    "Down",
+                    Names::rows(h, h),
+                    format!("hidden layer {i}'s Down, no bias"),
+                ),
+            ]),
+            Kind::ReGlu(d) => fields.extend([
+                field(
+                    "Gate",
+                    Names::rows(d, h),
+                    format!("hidden layer {i}, x + Down (relu (Gate x + b) * (Up x + b)): Gate"),
+                ),
+                field(
+                    "GateBias",
+                    Names::vec(d),
+                    format!("hidden layer {i}'s Gate bias"),
+                ),
+                field("Up", Names::rows(d, h), format!("hidden layer {i}'s Up")),
+                field(
+                    "UpBias",
+                    Names::vec(d),
+                    format!("hidden layer {i}'s Up bias"),
+                ),
+                field(
+                    "Down",
+                    Names::rows(h, d),
+                    format!("hidden layer {i}'s Down, no bias"),
+                ),
+            ]),
+        }
     }
     fields.extend([
         (
@@ -343,6 +450,41 @@ data OpenClosed a = OpenClosed
             "each content's send logit".into(),
         ),
     ]);
+    if names.gated {
+        fields.extend([
+            (
+                "netValueGate".into(),
+                "VecH".into(),
+                "the value's mix gate: sigmoid (g . h + b) of the skip, the rest the value's own"
+                    .into(),
+            ),
+            (
+                "netValueGateBias".into(),
+                "Float".into(),
+                "the value's mix gate's bias".into(),
+            ),
+            (
+                "netLocalGates".into(),
+                Names::rows(CELLS, h),
+                "per board b, the gate of its own cell logits".into(),
+            ),
+            (
+                "netLocalGatesBias".into(),
+                Names::vec(CELLS),
+                "the local gates' bias".into(),
+            ),
+            (
+                "netSendGates".into(),
+                Names::rows(CELLS, h),
+                "per board s, the gate of the logit of sending to it".into(),
+            ),
+            (
+                "netSendGatesBias".into(),
+                Names::vec(CELLS),
+                "the send gates' bias".into(),
+            ),
+        ]);
+    }
     for (i, (name, ty, comment)) in fields.iter().enumerate() {
         let sep = if i == 0 { "{" } else { "," };
         let _ = writeln!(s, "  {sep} {name} :: !{ty} -- ^ {comment}");
@@ -356,7 +498,7 @@ data OpenClosed a = OpenClosed
             .position(|n| n == name)
             .unwrap_or_else(|| panic!("{name} array"))
     };
-    let (features_index, policy_index) = (position("features"), position("policy"));
+    let policy_index = position("policy");
     let _ = writeln!(
         s,
         "-- | The network, decoded from the weight arrays on first use."
@@ -377,13 +519,9 @@ data OpenClosed a = OpenClosed
     );
     let _ = writeln!(
         s,
-        "      pieces r = map fromListRows{CHUNK}_{e} (chunksOf {CHUNK} r)"
-    );
-    let _ = writeln!(
-        s,
-        "      table name open rest = case rest of\n\
+        "      table name open decided = case decided of\n\
          \x20       [full, me, them] -> OpenClosed open full me them\n\
-         \x20       _ -> error (\"net: array \" ++ name ++ \"_rest is not 3 rows\")"
+         \x20       _ -> error (\"net: array \" ++ name ++ \"_decided is not 3 rows\")"
     );
     let _ = writeln!(s, "      expected = {}", hs_strings(manifest_names));
     let _ = writeln!(s, "   in case arrays of");
@@ -393,31 +531,10 @@ data OpenClosed a = OpenClosed
         "        [{}] | map arrayName arrays == expected ->",
         vars_.join(", ")
     );
-    // The feature rows are split by range once; the policy rows are grouped per board.
+    // The policy rows are grouped per board.
     let _ = writeln!(
         s,
-        "          let features = rows {FEATURE_ROWS} {a} fromListRest{a} a{features_index}"
-    );
-    let _ = writeln!(
-        s,
-        "              (fForced, afterForced) = splitAt {FORCED_FEATURES} features"
-    );
-    let _ = writeln!(
-        s,
-        "              (fLines, afterLines) = splitAt {} afterForced",
-        LINES.len() * LINE_STATES
-    );
-    let _ = writeln!(
-        s,
-        "              (fDecided, fMarks) = splitAt {DECIDED_FEATURES} afterLines"
-    );
-    let _ = writeln!(
-        s,
-        "              lineTables = map fromListRows{LINE_STATES}_{a} (chunksOf {LINE_STATES} fLines)"
-    );
-    let _ = writeln!(
-        s,
-        "              policyTables = map fromListRows{CELLS}_{h} (chunksOf {CELLS} (rows {MOVES} {h} fromListRest{h} a{policy_index}))"
+        "          let policyTables = map fromListRows{CELLS}_{h} (chunksOf {CELLS} (rows {MOVES} {h} fromListRest{h} a{policy_index}))"
     );
     let _ = writeln!(
         s,
@@ -430,61 +547,94 @@ data OpenClosed a = OpenClosed
         step += 1;
         i
     };
-    // The content table: the open rows, then one short array with the decided kinds, no-forced,
-    // the cell rows and the pad, taken apart by pattern.
-    let (open_index, rest_index) = (next(), next());
-    let _ = writeln!(
-        s,
-        "              (contentTable, noForcedRow, cellRows, padRow) = case rows {} {e} fromListRest{e} a{rest_index} of\n\
-         \x20               full : me : them : noF : rest | (cells, [pad]) <- splitAt {} rest ->\n\
-         \x20                 (OpenClosed (rows {OPEN_CONTENTS} {e} fromListRest{e} a{open_index}) full me them, noF, cells, pad)\n\
-         \x20               _ -> error \"net: array content_rest is not {} rows\"",
-        CONTENT_ROWS - OPEN_CONTENTS,
-        CELL_PAD - CELL_BASE,
-        CONTENT_ROWS - OPEN_CONTENTS
-    );
+    if names.gated {
+        let gates = position("gates");
+        let _ = writeln!(
+            s,
+            "              (valueGate, localGates, sendGates) = case rows {GATES} {h} fromListRest{h} a{gates} of\n\
+             \x20               v : rest | (l, r) <- splitAt {CELLS} rest -> (v, l, r)\n\
+             \x20               _ -> error \"net: array gates is not {GATES} rows\"\n\
+             \x20             (valueGateBias, localGatesBias, sendGatesBias) = case floats 1 {GATES} a{} of\n\
+             \x20               v : rest | (l, r) <- splitAt {CELLS} rest -> (v, l, r)\n\
+             \x20               _ -> error \"net: array gates_bias is not {GATES} values\"",
+            gates + 1
+        );
+    }
     let _ = writeln!(s, "           in Net");
-    let mut inits = vec![
-        "netContent = contentTable".to_string(),
-        "netNoForced = noForcedRow".to_string(),
-        "netCells = cellRows".to_string(),
-        "netPad = padRow".to_string(),
-    ];
-    let mix_list: Vec<String> = (0..BOARDS)
-        .map(|_| format!("pieces (rows {a} {e} fromListRest{e} a{})", next()))
-        .collect();
-    inits.push(format!("netMix = [{}]", mix_list.join(", ")));
+    // Every array decodes straight into its field: array `i`, `m` rows of width `n`, as a
+    // RowsM_N or a list.
+    let matrix = |m: usize, n: usize, i: usize| {
+        format!("fromListRows{m}_{n} (rows {m} {n} fromListRest{n} a{i})")
+    };
+    let list = |m: usize, n: usize, i: usize| format!("rows {m} {n} fromListRest{n} a{i}");
+    let vector = |n: usize, i: usize| format!("fromList{n} (floats 1 {n} a{i})");
+    let mut inits = Vec::new();
+    let (open, decided) = (next(), next());
     inits.push(format!(
-        "netMixBias = fromList{a} (floats 1 {a} a{})",
-        next()
+        "netContent = table \"content\" ({}) ({})",
+        list(OPEN_CONTENTS, e, open),
+        list(CONTENTS - OPEN_CONTENTS, e, decided)
     ));
+    inits.push(format!("netNoForced = {}", vector(e, next())));
     inits.push(format!(
-        "netForced = pieces (rows {a} {e} fromListRest{e} a{})",
-        next()
+        "netCells = {}",
+        list(CELL_PAD - CELL_BASE, e, next())
     ));
-    assert_eq!(next(), features_index, "features array position");
+    inits.push(format!("netPad = {}", vector(e, next())));
+    // The first layer's slices in pieces of CHUNK rows.
+    let pieces = |next: &mut dyn FnMut() -> usize| {
+        let p: Vec<String> = (0..k).map(|_| matrix(CHUNK, e, next())).collect();
+        format!("[{}]", p.join(", "))
+    };
+    let mix: Vec<String> = (0..BOARDS).map(|_| pieces(&mut next)).collect();
     inits.push(format!(
-        "netForcedFeature = fromListRows{FORCED_FEATURES}_{a} fForced"
+        "netMix =\n                    [ {}\n                    ]",
+        mix.join("\n                    , ")
+    ));
+    inits.push(format!("netMixBias = {}", vector(a, next())));
+    inits.push(format!("netForced = {}", pieces(&mut next)));
+    inits.push(format!(
+        "netForcedFeature = {}",
+        matrix(FORCED_FEATURES, a, next())
     ));
     for l in 0..LINES.len() {
-        inits.push(format!("netLineFeature{l} = lineTables !! {l}"));
+        inits.push(format!(
+            "netLineFeature{l} = {}",
+            matrix(LINE_STATES, a, next())
+        ));
     }
     inits.push(format!(
-        "netDecidedFeature = fromListRows{DECIDED_FEATURES}_{a} fDecided"
+        "netDecidedFeature = {}",
+        matrix(DECIDED_FEATURES, a, next())
     ));
     inits.push(format!(
-        "netMarksFeature = fromListRows{MARKS_FEATURES}_{a} fMarks"
+        "netMarksFeature = {}",
+        matrix(MARKS_FEATURES, a, next())
     ));
-    for i in 0..names.layers {
+    for (i, kind) in names.trunk.iter().enumerate() {
         let d_in = if i == 0 { a } else { h };
-        inits.push(format!(
-            "netHidden{i} = fromListRows{h}_{d_in} (rows {h} {d_in} fromListRest{d_in} a{})",
-            next()
-        ));
-        inits.push(format!(
-            "netHidden{i}Bias = fromList{h} (floats 1 {h} a{})",
-            next()
-        ));
+        let mut parts = Vec::new();
+        match *kind {
+            Kind::SelfGated => parts.extend([("Up", h, h, true), ("Down", h, h, false)]),
+            Kind::ReGlu(d) => parts.extend([
+                ("Gate", d, h, true),
+                ("Up", d, h, true),
+                ("Down", h, d, false),
+            ]),
+            _ => parts.push(("", h, d_in, true)),
+        }
+        for (name, m, n, bias) in parts {
+            inits.push(format!(
+                "netHidden{i}{name} = fromListRows{m}_{n} (rows {m} {n} fromListRest{n} a{})",
+                next()
+            ));
+            if bias {
+                inits.push(format!(
+                    "netHidden{i}{name}Bias = fromList{m} (floats 1 {m} a{})",
+                    next()
+                ));
+            }
+        }
     }
     inits.push(format!(
         "netValue = fromListRows3_{h} (rows 3 {h} fromListRest{h} a{})",
@@ -514,6 +664,20 @@ data OpenClosed a = OpenClosed
         CONTENTS - OPEN_CONTENTS,
         next()
     ));
+    if names.gated {
+        // One row (and bias) for the value, then nine per board for each policy table.
+        let (rows_index, bias_index) = (next(), next());
+        inits.extend([
+            "netValueGate = valueGate".to_string(),
+            "netValueGateBias = valueGateBias".to_string(),
+            format!("netLocalGates = fromListRows{CELLS}_{h} localGates"),
+            format!("netLocalGatesBias = fromList{CELLS} localGatesBias"),
+            format!("netSendGates = fromListRows{CELLS}_{h} sendGates"),
+            format!("netSendGatesBias = fromList{CELLS} sendGatesBias"),
+        ]);
+        assert_eq!(rows_index, position("gates"), "gates array position");
+        assert_eq!(bias_index, rows_index + 1, "gates bias array position");
+    }
     assert_eq!(step, manifest_names.len(), "one decode per array");
     for (i, init) in inits.iter().enumerate() {
         let sep = if i == 0 { "{" } else { "," };
@@ -618,64 +782,163 @@ data OpenClosed a = OpenClosed
         "  _ -> error \"accumulateRows: not {TOKENS} rows and {} line codes\"\n",
         LINES.len()
     );
+    let _ = writeln!(
+        s,
+        "-- | Zeros of the hidden width: the bias of the gated layers' down projections."
+    );
+    let _ = writeln!(s, "genZeroH :: VecH");
+    let _ = writeln!(s, "genZeroH = replicate{h} 0\n");
+    // Layer i's output from `x`, the previous one's (the accumulator for layer 0), or with
+    // `cols` by columns over the nonzero inputs.
+    let layer = |i: usize, kind: Kind, x: &str, cols: Option<&str>| -> String {
+        let w = |name: &str| format!("(netHidden{i}{name} n)");
+        match (kind, cols) {
+            (Kind::Dense, None) => format!("dense{h}_{a} {} {} {x}", w(""), w("Bias")),
+            (Kind::Linear, None) => format!("linear{h}_{a} {} {} {x}", w(""), w("Bias")),
+            (Kind::Residual, None) => format!("residual{h}_{h} {} {} {x}", w(""), w("Bias")),
+            (Kind::Dense, Some(c)) => format!("sparseDense{h}_{a} {c} {} {x}", w("Bias")),
+            (Kind::Linear, Some(c)) => format!("sparseLinear{h}_{a} {c} {} {x}", w("Bias")),
+            (Kind::Residual, Some(c)) => format!("sparseResidual{h} {c} {} {x}", w("Bias")),
+            (Kind::ReluResidual, _) => format!(
+                "relu{h} (add{h} {x} (linear{h}_{h} {} {} (relu{h} {x})))",
+                w(""),
+                w("Bias")
+            ),
+            (Kind::SelfGated, _) => format!(
+                "add{h} {x} (linear{h}_{h} {} genZeroH (combine{h} (*) (relu{h} {x}) (linear{h}_{h} {} {} {x})))",
+                w("Down"),
+                w("Up"),
+                w("UpBias")
+            ),
+            (Kind::ReGlu(d), _) => format!(
+                "add{h} {x} (linear{h}_{d} {} genZeroH (combine{d} (*) (dense{d}_{h} {} {} {x}) (linear{d}_{h} {} {} {x})))",
+                w("Down"),
+                w("Gate"),
+                w("GateBias"),
+                w("Up"),
+                w("UpBias")
+            ),
+        }
+    };
+    // The layers as a let chain, h0 from the accumulator.
+    let chain = |cols: &[Option<String>]| -> String {
+        let hs = vars("h", names.trunk.len());
+        let mut out = String::from("  let\n");
+        for (i, kind) in names.trunk.iter().enumerate() {
+            let x = if i == 0 { "acc" } else { hs[i - 1].as_str() };
+            let _ = writeln!(
+                out,
+                "    {} = {}",
+                hs[i],
+                layer(i, *kind, x, cols[i].as_deref())
+            );
+        }
+        let _ = write!(out, "  in {}", hs[hs.len() - 1]);
+        out
+    };
     let _ = writeln!(s, "-- | The last hidden layer.");
     let _ = writeln!(s, "hiddenOf :: Net -> VecA -> VecH");
-    let mut expr = format!("dense{h}_{a} (netHidden0 n) (netHidden0Bias n) acc");
-    for i in 1..names.layers {
-        expr = format!("residual{h}_{h} (netHidden{i} n) (netHidden{i}Bias n) ({expr})");
-    }
-    let _ = writeln!(s, "hiddenOf n acc = {expr}\n");
-    // The same layers by columns, over the nonzero inputs only.
-    let col_types: Vec<String> = (0..names.layers)
-        .map(|i| format!("!Cols{}_{h}", if i == 0 { a } else { h }))
+    let _ = writeln!(
+        s,
+        "hiddenOf n acc =\n{}\n",
+        chain(&vec![None; names.trunk.len()])
+    );
+    // The same layers, the sparse ones by columns over their nonzero inputs.
+    let sparse: Vec<usize> = (0..names.trunk.len())
+        .filter(|&i| names.trunk[i].sparse())
+        .collect();
+    let d_in = |i: usize| if i == 0 { a } else { h };
+    let col_types: Vec<String> = sparse
+        .iter()
+        .map(|&i| format!("!Cols{}_{h}", d_in(i)))
         .collect();
     let _ = writeln!(
         s,
-        "-- | The hidden layers' columns, for sparseHiddenOf: build them once (hiddenColumns) and\n\
-         -- keep them with the other precomputed data.\n\
+        "-- | The columns of the layers sparseHiddenOf computes by columns: build them once\n\
+         -- (hiddenColumns) and keep them with the other precomputed data.\n\
          data HiddenColumns = HiddenColumns {}\n",
         col_types.join(" ")
     );
-    let built: Vec<String> = (0..names.layers)
-        .map(|i| {
-            let d_in = if i == 0 { a } else { h };
-            format!("(columns{h}_{d_in} (netHidden{i} n))")
-        })
+    let built: Vec<String> = sparse
+        .iter()
+        .map(|&i| format!("(columns{h}_{} (netHidden{i} n))", d_in(i)))
         .collect();
     let _ = writeln!(
         s,
-        "-- | The hidden layers' columns, transposed from their rows.\n\
+        "-- | The columns of those layers, transposed from their rows.\n\
          hiddenColumns :: Net -> HiddenColumns\n\
          hiddenColumns n = HiddenColumns {}\n",
         built.join(" ")
     );
-    let cs = vars("c", names.layers);
-    let mut sparse_expr = format!("sparseDense{h}_{a} {} (netHidden0Bias n) acc", cs[0]);
-    for i in 1..names.layers {
-        sparse_expr = format!(
-            "sparseResidual{h} {} (netHidden{i}Bias n) ({sparse_expr})",
-            cs[i]
+    let cs = vars("c", sparse.len());
+    let mut cols = vec![None; names.trunk.len()];
+    for (c, &i) in cs.iter().zip(&sparse) {
+        cols[i] = Some(c.clone());
+    }
+    let _ = writeln!(
+        s,
+        "-- | hiddenOf with the layers from the accumulator (and the residual ones) by columns over\n\
+         -- their nonzero inputs (equal to it up to rounding).\n\
+         sparseHiddenOf :: Net -> HiddenColumns -> VecA -> VecH\n\
+         sparseHiddenOf n (HiddenColumns {}) acc =\n{}\n",
+        cs.join(" "),
+        chain(&cols)
+    );
+    let value = format!("linear3_{h} (netValue n) (netValueBias n) h");
+    let skip = format!("linear3_{a} (netSkip n) genZero3 acc");
+    if names.gated {
+        let _ = writeln!(s, "-- | The logistic function.");
+        let _ = writeln!(s, "genSigmoid :: Float -> Float");
+        let _ = writeln!(s, "genSigmoid x = 1 / (1 + exp (negate x))\n");
+        let _ = writeln!(
+            s,
+            "-- | Win, draw and loss logits: the value's own and the skip's, mixed by a gate of h."
+        );
+        let _ = writeln!(s, "wdlOf :: Net -> VecA -> VecH -> Vec3");
+        let _ = writeln!(
+            s,
+            "wdlOf n acc h =\n\
+             \x20 let v = {value}\n\
+             \x20     s = {skip}\n\
+             \x20     g = genSigmoid (dot{h} (netValueGate n) h + netValueGateBias n)\n\
+             \x20  in add3 v (scale3 g (sub3 s v))\n"
+        );
+    } else {
+        let _ = writeln!(s, "-- | Win, draw and loss logits.");
+        let _ = writeln!(s, "wdlOf :: Net -> VecA -> VecH -> Vec3");
+        let _ = writeln!(s, "wdlOf n acc h = add3 ({value}) ({skip})\n");
+    }
+    let _ = writeln!(
+        s,
+        "-- | The weights of the policy tables in a position: board b's own cell logits (netLocal n\n\
+         -- at its content) count index9 b (pgLocal g) times, the send logit of board s (netSend n\n\
+         -- at its content, on square s of every board) index9 s (pgSend g) times.\n\
+         data PolicyGates = PolicyGates {{pgLocal :: !Vec{CELLS}, pgSend :: !Vec{CELLS}}}\n"
+    );
+    let _ = writeln!(s, "-- | The policy gates of a last hidden layer.");
+    let _ = writeln!(s, "policyGates :: Net -> VecH -> PolicyGates");
+    if names.gated {
+        let _ = writeln!(
+            s,
+            "policyGates n h =\n\
+             \x20 PolicyGates\n\
+             \x20   (map{CELLS} genSigmoid (linear{CELLS}_{h} (netLocalGates n) (netLocalGatesBias n) h))\n\
+             \x20   (map{CELLS} genSigmoid (linear{CELLS}_{h} (netSendGates n) (netSendGatesBias n) h))\n"
+        );
+    } else {
+        let _ = writeln!(
+            s,
+            "policyGates _ _ = PolicyGates genOnes{CELLS} genOnes{CELLS}\n\n\
+             -- | Ones: this network's tables are not gated.\n\
+             genOnes{CELLS} :: Vec{CELLS}\n\
+             genOnes{CELLS} = replicate{CELLS} 1\n"
         );
     }
     let _ = writeln!(
         s,
-        "-- | hiddenOf by columns over the nonzero inputs (equal to it up to rounding).\n\
-         sparseHiddenOf :: Net -> HiddenColumns -> VecA -> VecH\n\
-         sparseHiddenOf n (HiddenColumns {}) acc =\n\
-         \x20 {sparse_expr}\n",
-        cs.join(" ")
-    );
-    let _ = writeln!(s, "-- | Win, draw and loss logits.");
-    let _ = writeln!(s, "wdlOf :: Net -> VecA -> VecH -> Vec3");
-    let _ = writeln!(
-        s,
-        "wdlOf n acc h = add3 (linear3_{h} (netValue n) (netValueBias n) h) (linear3_{a} (netSkip n) genZero3 acc)\n"
-    );
-    let _ = writeln!(
-        s,
         "-- | The global part of the nine move logits of board b; the full logits add the\n\
          -- board's own cell logits (netLocal n at content b) and, at square j, the send logit\n\
-         -- (netSend n at content j)."
+         -- (netSend n at content j), each scaled by its gate (policyGates)."
     );
     let _ = writeln!(s, "policyLogits :: Net -> VecH -> Int -> Vec{CELLS}");
     let _ = writeln!(s, "policyLogits n h b = case b of");
@@ -769,13 +1032,15 @@ evalIds n ids =
       hid = hiddenOf n acc
    in (acc, hid, wdlOf n acc hid)
 
--- | A move's full logit: the global head plus the board's own cell logit and the send logit.
+-- | A move's full logit: the global head plus the board's own cell logit and the send logit,
+-- each through its gate.
 moveLogit :: Net -> [Int] -> VecH -> Int -> Float
 moveLogit n ids hid m =
   let board = m `div` 9
       square = m `mod` 9
       content b = ids !! (b * idsPerBoard)
-   in index9 square (policyLogits n hid board) + index9 square (byId (netLocal n) (content board)) + byId (netSend n) (content square)
+      PolicyGates localGates sendGates = policyGates n hid
+   in index9 square (policyLogits n hid board) + index9 board localGates * index9 square (byId (netLocal n) (content board)) + index9 square sendGates * byId (netSend n) (content square)
 
 -- | Softmax, shifted by the maximum for stability.
 softmax :: [Float] -> [Float]
@@ -809,8 +1074,8 @@ selfTest = do
   putStrLn (if ok then "self-test passed" else "self-test FAILED")
   return ok
 
--- | Times the per-evaluation work after the fold (accumulator, hidden layers, value head and
--- one board's policy logits) over the reference positions, with the dense hidden layers
+-- | Times the per-evaluation work after the fold (accumulator, hidden layers, value head,
+-- policy gates and one board's policy logits) over the reference positions, with the dense hidden layers
 -- (hiddenOf) and with the sparse ones (sparseHiddenOf), printing microseconds per evaluation.
 bench :: Int -> IO ()
 bench iters = do
@@ -824,7 +1089,7 @@ bench iters = do
             acc = accumulateIds n rows ids
             hid = hiddenFn acc
             wdl = wdlOf n acc hid
-            pol = sum9 (policyLogits n hid (i `mod` 9))
+            pol = sum9 (policyLogits n hid (i `mod` 9)) + index9 0 (pgLocal (policyGates n hid))
          in total + index3 0 wdl + pol
       loop :: (VecA -> VecH) -> Int -> Float -> Float
       loop hiddenFn i total

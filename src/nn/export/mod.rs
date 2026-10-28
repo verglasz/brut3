@@ -1,4 +1,5 @@
-//! Exporting a trained [`Nnue`](super::Nnue) for the base-only Haskell engine.
+//! Exporting a trained [`Nnue`](super::Nnue) or [`NnueV2`](super::NnueV2) for the base-only
+//! Haskell engine.
 //!
 //! The pieces, in the order they are useful to the port:
 //! - [`weights`]: the trained tensors on the host, already in the layout the Haskell code
