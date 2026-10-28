@@ -5,16 +5,17 @@
 //! positions: 4096 at 1024 games in flight, 8192 at 2048.
 //!
 //! `cargo run --release --all-features --example server_bench -- MODEL [THREADS] [SIZE]
-//! [DEPTH] [SECONDS] [BACKEND]`, DEPTH being the server's batches in flight (1 or 2).
+//! [DEPTH] [SECONDS] [BACKEND] [unfolded]`, DEPTH being the server's batches in flight (1 or
+//! 2); `unfolded` evaluates an NNUE without its folded table.
 
 #[cfg(feature = "nn")]
 fn main() -> Result<(), String> {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
-    use brut3::agent::{AgentSpec, Evaluations, UtttAgent};
+    use brut3::agent::{Evaluations, UtttAgent};
     use brut3::game::{BitState, GameState};
-    use brut3::nn::{EvalServer, MAX_BATCH};
+    use brut3::nn::{BackendKind, EvalServer, MAX_BATCH, NetAgent};
     use rand::{SeedableRng, rngs::SmallRng};
 
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -25,10 +26,11 @@ fn main() -> Result<(), String> {
     };
     let model = args
         .first()
-        .ok_or("usage: server_bench MODEL [THREADS] [SIZE] [DEPTH] [SECONDS] [BACKEND]")?
+        .ok_or("usage: server_bench MODEL [THREADS] [SIZE] [DEPTH] [SECONDS] [BACKEND] [unfolded]")?
         .clone();
     let (threads, size, depth, seconds) = (arg(1, 4)?, arg(2, 4096)?, arg(3, 2)?, arg(4, 10)?);
-    let backend = args.get(5).map_or("cuda", String::as_str).to_string();
+    let backend: BackendKind = args.get(5).map_or("cuda", String::as_str).parse()?;
+    let unfolded = args.get(6).is_some_and(|a| a == "unfolded");
 
     // Positions from random games, from which every request takes a slice.
     let mut rng = SmallRng::seed_from_u64(1);
@@ -44,8 +46,11 @@ fn main() -> Result<(), String> {
         }
     }
 
-    let spec = AgentSpec::parse(&["nn", &model, &backend])?;
-    let server = EvalServer::spawn_with(move || spec.build(), MAX_BATCH, depth)?;
+    let build = move || {
+        let agent = NetAgent::load(std::path::Path::new(&model), backend)?;
+        Ok(if unfolded { agent.unfolded() } else { agent })
+    };
+    let server = EvalServer::spawn_with(build, MAX_BATCH, depth)?;
     let (stop, evaluated) = (AtomicBool::new(false), AtomicU64::new(0));
     let warm_up = Duration::from_secs(3);
     let (start, end) = std::thread::scope(|scope| {
@@ -72,7 +77,8 @@ fn main() -> Result<(), String> {
     });
     let secs = (end.0 - start.0).as_secs_f64();
     println!(
-        "{threads} clients x {size} positions, depth {depth}: {:.0} positions/s over {secs:.1}s",
+        "{threads} clients x {size} positions, depth {depth}{}: {:.0} positions/s over {secs:.1}s",
+        if unfolded { ", unfolded" } else { "" },
         (end.1 - start.1) as f64 / secs
     );
     Ok(())
