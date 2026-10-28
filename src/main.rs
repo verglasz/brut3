@@ -318,6 +318,10 @@ struct LoopArgs {
     lr_min: f64,
     #[arg(long, default_value_t = 1e-4)]
     weight_decay: f32,
+    /// Training steps between two samples of the gradient-norm and update-size metrics (0
+    /// for none): sampling every step makes a step about six times slower.
+    #[arg(long, default_value_t = brut3::nn::train_stats::DEFAULT_EVERY)]
+    stats_every: usize,
     /// Symmetry augmentation: `all` (eight copies, for small datasets), `random` (one random
     /// symmetry per sample per epoch, for large ones) or `none`.
     #[arg(long, default_value = "all")]
@@ -462,6 +466,10 @@ struct TrainArgs {
     /// AdamW weight decay; raise it (e.g. 1e-2) when a large model overfits a small dataset.
     #[arg(long, default_value_t = 1e-4)]
     weight_decay: f32,
+    /// Training steps between two samples of the gradient-norm and update-size metrics (0
+    /// for none): sampling every step makes a step about six times slower.
+    #[arg(long, default_value_t = brut3::nn::train_stats::DEFAULT_EVERY)]
+    stats_every: usize,
     /// Fraction of the positions held out for validation.
     #[arg(long, default_value_t = 0.1)]
     validation_fraction: f32,
@@ -1221,6 +1229,7 @@ fn run_loop(args: &LoopArgs) -> Result<(), String> {
             batch_size: args.batch_size,
             learning_rate: args.lr,
             weight_decay: args.weight_decay,
+            stats_every: args.stats_every,
             augment: args.augment.parse()?,
             outcome_weight: args.outcome_weight,
             search_value_weight: args.search_value_weight,
@@ -1509,6 +1518,7 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         learning_rate: args.lr,
         lr_min: args.lr_min,
         weight_decay: args.weight_decay,
+        stats_every: args.stats_every,
         validation_fraction: args.validation_fraction,
         workers: args.workers,
         seed: args.seed,

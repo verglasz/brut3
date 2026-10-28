@@ -3,16 +3,17 @@
 //! relative to their size. All are logged as training metrics next to the loss.
 //!
 //! The parts are the [`GROUPS`], by the model's top-level field names (the NNUE names: the
-//! first layer's tables, the heads, and everything in between). The statistics are computed on
-//! the device as part of each step and read back on burn's metric thread, so the training
-//! thread does not wait for them. A step's update is only known once the optimizer has run,
-//! after the step's output was made, so each step reports the update of the step before it.
+//! first layer's tables, the heads, and everything in between). The statistics are sampled
+//! every [`DEFAULT_EVERY`] steps (see [`set_every`]), computed on the device as part of the
+//! step and read back on burn's metric thread. A step's update is only known once the
+//! optimizer has run, after the step's output was made, so a sampled step reports the update
+//! of the step before it.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use burn::module::{ModuleVisitor, Param, ParamId};
+use burn::module::{ModuleVisitor, Param};
 use burn::optim::GradientsParams;
 use burn::prelude::*;
 use burn::tensor::{ExecutionError, TensorReadError};
@@ -45,10 +46,9 @@ fn group(field: &str) -> usize {
     }
 }
 
-/// One float parameter: its group, its id and its values flattened, without autodiff.
+/// One float parameter: its group and its values flattened, without autodiff.
 struct Flat {
     group: usize,
-    id: ParamId,
     values: Tensor<1>,
     /// Its gradient, flattened, when asked for.
     grad: Option<Tensor<1>>,
@@ -74,7 +74,6 @@ impl ModuleVisitor for Collect<'_> {
         let flat = |t: Tensor<D>| t.flatten::<1>(0, D - 1);
         self.out.push(Flat {
             group: self.path.first().map_or(1, |f| group(f)),
-            id: param.id,
             values: flat(param.val().without_autodiff()),
             grad: self.grads.and_then(|g| g.get::<D>(param.id)).map(flat),
         });
@@ -91,59 +90,93 @@ fn collect<M: Module>(module: &M, grads: Option<&GradientsParams>) -> Vec<Flat> 
     visitor.out
 }
 
-/// `[GROUPS]`: the sum of squares of `x` over each group's parameters.
-fn group_squares<'a>(
-    items: impl Iterator<Item = (usize, &'a Tensor<1>)>,
-    device: &Device,
-) -> Tensor<1> {
-    let mut sums: [Option<Tensor<1>>; GROUPS.len()] = Default::default();
-    for (g, x) in items {
-        let s = (x.clone() * x.clone()).sum();
-        sums[g] = Some(match sums[g].take() {
-            Some(acc) => acc + s,
-            None => s,
-        });
+/// Training steps between two samples of the statistics, 0 for none (see [`set_every`]).
+static EVERY: AtomicUsize = AtomicUsize::new(DEFAULT_EVERY);
+
+/// The default of [`set_every`]: the statistics cost about five times a step's own work
+/// (measured on the medium NNUE at batch 2048: 45 ms against 7.5 ms per step), so they are
+/// sampled rather than taken every step.
+pub const DEFAULT_EVERY: usize = 64;
+
+/// Samples the statistics every `every` training steps (the first step of a run and every
+/// `every`-th after it), or never with 0. Steps in between log the last sampled value without
+/// counting it toward the epoch's mean.
+pub fn set_every(every: usize) {
+    EVERY.store(every, Ordering::Relaxed);
+}
+
+fn sampled(step: usize) -> bool {
+    match EVERY.load(Ordering::Relaxed) {
+        0 => false,
+        every => step % every == 0,
     }
+}
+
+thread_local! {
+    /// Optimizer steps taken on this thread (training steps and optimizer steps alternate on
+    /// the training thread).
+    static STEPS: Cell<usize> = const { Cell::new(0) };
+    /// The squared update of each group by the last optimizer step, when the next step is
+    /// sampled.
+    static LAST_UPDATE: RefCell<Option<Tensor<1>>> = const { RefCell::new(None) };
+}
+
+/// Each group's tensors concatenated into one, so that a group costs one concatenation, one
+/// product and one sum rather than those per parameter.
+fn by_group(items: impl IntoIterator<Item = (usize, Tensor<1>)>) -> [Option<Tensor<1>>; 3] {
+    let mut parts: [Vec<Tensor<1>>; GROUPS.len()] = Default::default();
+    for (g, x) in items {
+        parts[g].push(x);
+    }
+    parts.map(|p| (!p.is_empty()).then(|| Tensor::cat(p, 0)))
+}
+
+/// `[GROUPS]`: each group's sum of squares, 0 for an empty group.
+fn squares(groups: [Option<Tensor<1>>; 3], device: &Device) -> Tensor<1> {
     Tensor::cat(
-        sums.into_iter()
-            .map(|s| s.unwrap_or_else(|| Tensor::zeros([1], device)))
+        groups
+            .into_iter()
+            .map(|x| match x {
+                Some(x) => (x.clone() * x).sum(),
+                None => Tensor::zeros([1], device),
+            })
             .collect(),
         0,
     )
 }
 
-thread_local! {
-    /// The squared update of each group by the last optimizer step on this thread, for the
-    /// next step's output (training steps and optimizer steps alternate on one thread).
-    static LAST_UPDATE: RefCell<Option<Tensor<1>>> = const { RefCell::new(None) };
-}
-
-/// The optimizer step with the squared size of its update recorded per group (see
-/// [`TrainStats`]); what `TrainStep::optimize` does for the models.
+/// The optimizer step, its update's squared size per group recorded when the next training
+/// step is sampled (see [`TrainStats`]); what `TrainStep::optimize` does for the models.
 pub fn optimize_recorded<M: Module>(
     module: M,
     optim: &mut burn::optim::ModuleOptimizer,
     lr: burn::lr_scheduler::module_lr_scheduler::ModuleLearningRate,
     grads: GradientsParams,
 ) -> M {
-    let before = collect(&module, None);
+    let step = STEPS.with(|steps| steps.replace(steps.get() + 1));
+    if !sampled(step + 1) {
+        return optim.step(lr, module, grads);
+    }
+    let values = |m: &M| by_group(collect(m, None).into_iter().map(|p| (p.group, p.values)));
+    let before = values(&module);
     let module = optim.step(lr, module, grads);
-    let after: HashMap<ParamId, Tensor<1>> = collect(&module, None)
+    // The visit order is the module's, so the groups line up parameter by parameter.
+    let diffs = values(&module)
         .into_iter()
-        .map(|p| (p.id, p.values))
-        .collect();
-    if let Some(device) = before.first().map(|p| p.values.device()) {
-        let diffs: Vec<(usize, Tensor<1>)> = before
-            .into_iter()
-            .filter_map(|p| Some((p.group, after.get(&p.id)?.clone() - p.values)))
-            .collect();
-        let update = group_squares(diffs.iter().map(|(g, d)| (*g, d)), &device);
+        .zip(before)
+        .map(|(after, before)| Some(after? - before?));
+    let device = collect(&module, None).first().map(|p| p.values.device());
+    if let Some(device) = device {
+        let update = squares(
+            diffs.collect::<Vec<_>>().try_into().expect("three groups"),
+            &device,
+        );
         LAST_UPDATE.with(|slot| *slot.borrow_mut() = Some(update));
     }
     module
 }
 
-/// One training step's statistics, on the device until a metric reads them.
+/// One sampled training step's statistics, on the device until a metric reads them.
 pub struct TrainStats {
     /// `[3 GROUPS]`: per group, the squared norms of the gradient and of the weights, then
     /// of the previous step's update (zero, and flagged by `has_update`, before the first).
@@ -153,17 +186,25 @@ pub struct TrainStats {
 }
 
 impl TrainStats {
-    /// The statistics of a step on `module` with `grads`.
+    /// The statistics of a step on `module` with `grads`, if this step is sampled.
     pub fn new<M: Module>(module: &M, grads: &GradientsParams) -> Option<Self> {
+        if !sampled(STEPS.with(Cell::get)) {
+            return None;
+        }
         let params = collect(module, Some(grads));
         let device = params.first()?.values.device();
-        let grad = group_squares(
-            params
-                .iter()
-                .filter_map(|p| Some((p.group, p.grad.as_ref()?))),
+        let grad = squares(
+            by_group(
+                params
+                    .iter()
+                    .filter_map(|p| Some((p.group, p.grad.clone()?))),
+            ),
             &device,
         );
-        let weight = group_squares(params.iter().map(|p| (p.group, &p.values)), &device);
+        let weight = squares(
+            by_group(params.into_iter().map(|p| (p.group, p.values))),
+            &device,
+        );
         let update = LAST_UPDATE.with(|slot| slot.borrow_mut().take());
         let has_update = update.is_some();
         let update = update.unwrap_or_else(|| Tensor::zeros([GROUPS.len()], &device));
@@ -255,6 +296,8 @@ pub struct StatMetric {
     stat: Stat,
     group: usize,
     state: NumericMetricState,
+    /// The last sampled value, shown on the steps in between.
+    last: f64,
 }
 
 impl StatMetric {
@@ -268,6 +311,7 @@ impl StatMetric {
             stat,
             group,
             state: NumericMetricState::new(),
+            last: f64::NAN,
         }
     }
 
@@ -302,10 +346,14 @@ impl Metric for StatMetric {
                 }
             }
         };
-        // A step without the value counts for nothing in the epoch's mean.
+        // A step without a sample shows the last one and counts for nothing in the epoch's
+        // mean.
         match value {
-            Some(v) => self.state.update(f64::from(v), 1),
-            None => self.state.update(f64::NAN, 0),
+            Some(v) => {
+                self.last = f64::from(v);
+                self.state.update(self.last, 1);
+            }
+            None => self.state.update(self.last, 0),
         }
         Ok(entry(&self.state, &self.name, false))
     }

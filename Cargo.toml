@@ -10,6 +10,11 @@ clap = { version = "4", features = ["derive"] }
 rand = { version = "0.9", features = ["small_rng"] }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+# The training's experiment log (see nn::train): the same crates burn-train's own logger uses.
+log = { version = "0.4", optional = true }
+tracing-appender = { version = "0.2.5", optional = true }
+tracing-core = { version = "0.1.36", optional = true }
+tracing-subscriber = { version = "0.3.23", optional = true }
 
 [features]
 # Default: every backend that builds with no extra system requirements.
@@ -32,6 +37,10 @@ nn = [
     "burn/tui",
     "dep:serde",
     "dep:serde_json",
+    "dep:log",
+    "dep:tracing-appender",
+    "dep:tracing-core",
+    "dep:tracing-subscriber",
 ]
 # Pure-Rust CPU backend.
 flex = ["nn", "burn/flex"]

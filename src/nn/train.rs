@@ -690,6 +690,9 @@ pub struct TrainOptions {
     pub artifact_dir: PathBuf,
     /// Show the live metrics dashboard (needs an interactive terminal); otherwise log lines.
     pub tui: bool,
+    /// Training steps between two samples of the gradient and update statistics, 0 for none
+    /// (see [`super::train_stats::set_every`]).
+    pub stats_every: usize,
 }
 
 impl Default for TrainOptions {
@@ -708,6 +711,7 @@ impl Default for TrainOptions {
             seed: 0,
             artifact_dir: PathBuf::from("artifacts/train"),
             tui: true,
+            stats_every: super::train_stats::DEFAULT_EVERY,
         }
     }
 }
@@ -871,6 +875,7 @@ pub fn train<M: Trainable>(
         .set_device(device.clone())
         .build(InMemDataset::new(valid_samples.clone()));
 
+    super::train_stats::set_every(opts.stats_every);
     let model = init(&ad_device);
     let optim = AdamWConfig::new()
         .with_weight_decay(opts.weight_decay)
@@ -901,7 +906,10 @@ pub fn train<M: Trainable>(
     }
     let training = training
         .with_training_strategy(ExecutionStrategy::single(ad_device).into())
-        .with_default_checkpointers();
+        .with_default_checkpointers()
+        .with_application_logger(Some(Box::new(ExperimentLog(
+            opts.artifact_dir.join("experiment.log"),
+        ))));
     let training = if opts.tui {
         training.summary()
     } else {
@@ -945,6 +953,49 @@ pub fn train<M: Trainable>(
             ..report_base
         },
     )
+}
+
+/// The Learner's `experiment.log`, as burn's own file logger writes it (INFO and above, wgpu
+/// quieter) but with the kernel compiler's IR left out: CubeCL compiles CUDA kernels through
+/// pliron, which logs every pass's IR at INFO, about 400 MB per training run.
+struct ExperimentLog(PathBuf);
+
+impl burn::train::ApplicationLoggerInstaller for ExperimentLog {
+    fn install(&self) -> Result<(), String> {
+        use tracing_core::{Level, LevelFilter};
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::filter::filter_fn;
+        use tracing_subscriber::prelude::*;
+
+        let dir = self.0.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let file = self.0.file_name().expect("experiment.log is a file");
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(tracing_appender::rolling::never(dir, file))
+            .with_filter(LevelFilter::INFO)
+            .with_filter(filter_fn(|m| {
+                let chatty = m
+                    .module_path()
+                    .is_some_and(|p| p.starts_with("wgpu") || p.starts_with("pliron"));
+                !(chatty && *m.level() >= Level::INFO)
+            }));
+        tracing_subscriber::registry()
+            .with(layer)
+            .try_init()
+            .map_err(|_| "Failed to install the file logger.".to_string())?;
+        let hook = std::panic::take_hook();
+        let path = self.0.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            log::error!("PANIC => {info}");
+            eprintln!(
+                "=== PANIC ===\nA fatal error happened, you can check the experiment logs here => \
+                 '{}'\n=============",
+                path.display()
+            );
+            hook(info);
+        }));
+        Ok(())
+    }
 }
 
 /// The epoch with the lowest mean validation loss, read from the Learner's metric logs.

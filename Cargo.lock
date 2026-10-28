@@ -628,9 +628,13 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "clap",
+ "log",
  "rand 0.9.5",
  "serde",
  "serde_json",
+ "tracing-appender",
+ "tracing-core",
+ "tracing-subscriber",
 ]
 
 [[package]]
