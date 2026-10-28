@@ -443,7 +443,7 @@
     <span class="eyebrow">brut3 · nn::nnue_v2 · reworked trunk and heads</span>
     <h1 id="title-nnue-v2">nnue-v2 64·512·128·4 · reglu 128</h1>
     <p>The same tables and accumulator as the NNUE, then an unrectified projection that gates its first layer, ReGLU blocks, and heads in which the later layers decide how much the shortcut terms count. Drawn at hidden width 128 with ReGLU blocks of width 128; the model trained as <code>nnue-v2-64-512-96-4-reglu-96</code> has the same structure at width 96.</p>
-    <p class="note"><span class="planned">Status:</span> implemented as <code>nnue-v2 E A H L reglu D [rezero]</code>, the gated heads always included. The gates start with zero weights and biases of 1, so every gate starts at σ(1) ≈ 0.73 whatever the position; weights saved before the gates existed, like the trained <code>nnue-v2-64-512-96-4-reglu-96</code>, load with the gates at those values.</p>
+    <p class="note"><span class="planned">Status:</span> implemented as <code>nnue-v2 E A H L reglu D [rezero]</code>, the gated heads always included. The gates start with zero weights and biases, so every gate starts at ½ whatever the position; weights saved before the gates existed, like the trained <code>nnue-v2-64-512-96-4-reglu-96</code>, load with the gates so and <code>V</code>, its bias, <code>S</code>, <code>L</code> and <code>T</code> doubled, which computes exactly what they did.</p>
     <div class="dims" id="dims-nnue-v2">
       <span>embedding <b>64</b></span>
       <span>accumulator <b>512</b></span>
