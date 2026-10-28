@@ -305,11 +305,7 @@ pub fn generate_parallel(
 /// The search threads [`generate_threaded`] uses for `games` games when asked for `threads`:
 /// 0 means one per core, and never more threads than games.
 pub fn self_play_threads(threads: usize, games: usize) -> usize {
-    match threads {
-        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
-        n => n,
-    }
-    .clamp(1, games.max(1))
+    crate::selfplay::search_threads(threads, games)
 }
 
 /// Plays `games` games of search with `evaluator` as the leaf evaluator on

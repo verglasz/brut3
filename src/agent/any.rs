@@ -82,7 +82,7 @@ impl AgentSpec {
         }
     }
 
-    fn load_book(&self) -> Result<Option<Book>, String> {
+    pub fn load_book(&self) -> Result<Option<Book>, String> {
         self.book_path().map(|path| Book::load(path)).transpose()
     }
 }
@@ -223,10 +223,20 @@ impl AgentSpec {
     /// For a search agent: the leaf evaluator it searches over (random playouts, or the
     /// network). Fails for network weights that cannot be loaded.
     pub fn leaf_evaluator(&self) -> Result<Option<AnyAgent>, String> {
+        self.thread_leaf_evaluator(0)
+    }
+
+    /// [`AgentSpec::leaf_evaluator`] for search thread `thread` of several: random playouts
+    /// get a stream of their own (thread 0 the single-threaded one), a network is the same.
+    pub fn thread_leaf_evaluator(&self, thread: u64) -> Result<Option<AnyAgent>, String> {
         Ok(match self {
-            AgentSpec::Mcts { seed, .. } => Some(AnyAgent::Random(RandomAgent::new(
-                seed ^ 0x9E37_79B9_7F4A_7C15,
-            ))),
+            AgentSpec::Mcts { seed, .. } => {
+                let stream = seed ^ 0x9E37_79B9_7F4A_7C15;
+                Some(AnyAgent::Random(RandomAgent::new(match thread {
+                    0 => stream,
+                    t => crate::seed::derive_seed(stream, t),
+                })))
+            }
             #[cfg(feature = "nn")]
             AgentSpec::MctsNn { path, backend, .. } => {
                 Some(AnyAgent::Nn(NetAgent::load(path, *backend)?))
@@ -367,6 +377,10 @@ pub enum AnyAgent {
     Nn(NetAgent),
     #[cfg(feature = "nn")]
     MctsNn(Mcts<NetAgent>),
+    /// A network evaluated by an [`EvalServer`](crate::nn::EvalServer) shared with other
+    /// threads.
+    #[cfg(feature = "nn")]
+    Remote(crate::nn::RemoteEvaluator),
     /// An agent whose moves come from an opening book while the position is in it.
     Booked(Book, Box<AnyAgent>),
 }
@@ -384,6 +398,8 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Nn(a) => a.choose_move(state),
             #[cfg(feature = "nn")]
             AnyAgent::MctsNn(a) => a.choose_move(state),
+            #[cfg(feature = "nn")]
+            AnyAgent::Remote(a) => a.choose_move(state),
             AnyAgent::Booked(book, a) => match book.best_move(state) {
                 Some(mv) => mv,
                 None => a.choose_move(state),
@@ -401,6 +417,8 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Nn(a) => a.choose_move_with_policy(state),
             #[cfg(feature = "nn")]
             AnyAgent::MctsNn(a) => a.choose_move_with_policy(state),
+            #[cfg(feature = "nn")]
+            AnyAgent::Remote(a) => a.choose_move_with_policy(state),
             AnyAgent::Booked(book, a) => match book.best_move(state) {
                 Some(mv) => (mv, vec![(mv, 1.0)]),
                 None => a.choose_move_with_policy(state),
@@ -418,6 +436,8 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Nn(a) => a.evaluate(state),
             #[cfg(feature = "nn")]
             AnyAgent::MctsNn(a) => a.evaluate(state),
+            #[cfg(feature = "nn")]
+            AnyAgent::Remote(a) => a.evaluate(state),
             AnyAgent::Booked(_, a) => a.evaluate(state),
         }
     }
@@ -432,6 +452,8 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Nn(a) => a.evaluate_batch(states, out),
             #[cfg(feature = "nn")]
             AnyAgent::MctsNn(a) => a.evaluate_batch(states, out),
+            #[cfg(feature = "nn")]
+            AnyAgent::Remote(a) => a.evaluate_batch(states, out),
             AnyAgent::Booked(_, a) => a.evaluate_batch(states, out),
         }
     }
@@ -446,6 +468,8 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Nn(a) => a.begin_batch(states),
             #[cfg(feature = "nn")]
             AnyAgent::MctsNn(a) => a.begin_batch(states),
+            #[cfg(feature = "nn")]
+            AnyAgent::Remote(a) => a.begin_batch(states),
             AnyAgent::Booked(_, a) => a.begin_batch(states),
         }
     }
@@ -460,6 +484,8 @@ impl UtttAgent for AnyAgent {
             AnyAgent::Nn(a) => a.finish_batch(states, out),
             #[cfg(feature = "nn")]
             AnyAgent::MctsNn(a) => a.finish_batch(states, out),
+            #[cfg(feature = "nn")]
+            AnyAgent::Remote(a) => a.finish_batch(states, out),
             AnyAgent::Booked(_, a) => a.finish_batch(states, out),
         }
     }

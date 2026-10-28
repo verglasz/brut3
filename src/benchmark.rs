@@ -4,9 +4,17 @@
 use std::fmt;
 use std::time::Instant;
 
-use crate::agent::{AgentSpec, UtttAgent};
+use crate::agent::{AgentSpec, AnyAgent, UtttAgent};
 use crate::game::{BitState, GameState, Outcome, Player};
-use crate::selfplay::{MatchExploration, Side, lockstep_match};
+use crate::selfplay::{
+    MatchExploration,
+    MatchTally,
+    Side,
+    lockstep_match,
+    lockstep_match_games,
+    search_threads,
+    share,
+};
 
 /// Outcome of a series of games between two agents, alternating colours.
 #[derive(Clone, Debug, PartialEq)]
@@ -67,19 +75,22 @@ pub fn play_match(
     a: &AgentSpec,
     b: &AgentSpec,
     games: usize,
-    on_game: impl FnMut(usize),
+    on_game: impl FnMut(usize) + Send,
 ) -> Result<MatchResult, String> {
-    play_match_with(a, b, games, &MatchExploration::default(), on_game)
+    play_match_with(a, b, games, &MatchExploration::default(), 1, on_game)
 }
 
 /// [`play_match`] with opening exploration for the lockstep case, so that two deterministic
-/// searches do not replay the same game. Ignored when either agent is not a search.
+/// searches do not replay the same game, and the lockstep games split over
+/// [`search_threads`]`(threads, games)` threads ([`threaded_match`]). Both are ignored when
+/// either agent is not a search.
 pub fn play_match_with(
     a: &AgentSpec,
     b: &AgentSpec,
     games: usize,
     exploration: &MatchExploration,
-    mut on_game: impl FnMut(usize),
+    threads: usize,
+    mut on_game: impl FnMut(usize) + Send,
 ) -> Result<MatchResult, String> {
     let start = Instant::now();
     let mut result = MatchResult {
@@ -94,6 +105,19 @@ pub fn play_match_with(
         moves: 0,
         seconds: 0.0,
     };
+    let threads = search_threads(threads, games);
+    let searches = a.search_config().is_some() && b.search_config().is_some();
+    if searches && threads > 1 {
+        let tally = threaded_match(a, b, games, threads, exploration, on_game)?;
+        result.a_wins = tally.a_wins;
+        result.b_wins = tally.b_wins;
+        result.draws = tally.draws;
+        result.a_wins_as_x = tally.a_wins_as_x;
+        result.a_wins_as_o = tally.a_wins_as_o;
+        result.moves = tally.moves;
+        result.seconds = start.elapsed().as_secs_f32();
+        return Ok(result);
+    }
     if let (Some((mut eval_a, search_a, book_a)), Some((mut eval_b, search_b, book_b))) =
         (a.search_parts()?, b.search_parts()?)
     {
@@ -154,6 +178,137 @@ pub fn play_match_with(
     }
     result.seconds = start.elapsed().as_secs_f32();
     Ok(result)
+}
+
+/// Where a search's leaves are evaluated when its games are split over threads: a network on
+/// one [`EvalServer`](crate::nn::EvalServer) that batches every thread's leaves (its
+/// per-batch costs paid once for all), random playouts on each thread.
+enum Evaluators {
+    PerThread,
+    #[cfg(feature = "nn")]
+    Server(crate::nn::EvalServer),
+}
+
+impl Evaluators {
+    fn new(spec: &AgentSpec) -> Result<Self, String> {
+        Ok(match spec {
+            #[cfg(feature = "nn")]
+            AgentSpec::MctsNn { .. } => {
+                let spec = spec.clone();
+                Self::Server(crate::nn::EvalServer::spawn(
+                    move || Ok(spec.leaf_evaluator()?.expect("a search's leaf evaluator")),
+                    crate::nn::MAX_BATCH,
+                )?)
+            }
+            _ => Self::PerThread,
+        })
+    }
+
+    /// Thread `thread`'s evaluator for `spec`'s leaves.
+    fn for_thread(&self, spec: &AgentSpec, thread: usize) -> Result<AnyAgent, String> {
+        Ok(match self {
+            Self::PerThread => spec
+                .thread_leaf_evaluator(thread as u64)?
+                .expect("a search's leaf evaluator"),
+            #[cfg(feature = "nn")]
+            Self::Server(server) => AnyAgent::Remote(server.client()),
+        })
+    }
+}
+
+/// Whether two searches evaluate their leaves with the same network, so that one server can
+/// batch both sides' leaves.
+fn same_network(a: &AgentSpec, b: &AgentSpec) -> bool {
+    match (a, b) {
+        #[cfg(feature = "nn")]
+        (
+            AgentSpec::MctsNn {
+                path: pa,
+                backend: ba,
+                ..
+            },
+            AgentSpec::MctsNn {
+                path: pb,
+                backend: bb,
+                ..
+            },
+        ) => pa == pb && ba == bb,
+        _ => false,
+    }
+}
+
+/// A match between two searches with its games split over `threads` threads, each playing a
+/// contiguous share in lockstep ([`lockstep_match_games`]). Every game keeps its number's
+/// colours and seeds, so the games are those of the single-threaded match, except that random
+/// playouts draw from a stream per thread.
+fn threaded_match(
+    a: &AgentSpec,
+    b: &AgentSpec,
+    games: usize,
+    threads: usize,
+    exploration: &MatchExploration,
+    on_game: impl FnMut(usize) + Send,
+) -> Result<MatchTally, String> {
+    let (search_a, search_b) = (
+        a.search_config().expect("a search"),
+        b.search_config().expect("a search"),
+    );
+    let (book_a, book_b) = (a.load_book()?, b.load_book()?);
+    let evaluators_a = Evaluators::new(a)?;
+    let evaluators_b = match same_network(a, b) {
+        true => None,
+        false => Some(Evaluators::new(b)?),
+    };
+    let evaluators_b = evaluators_b.as_ref().unwrap_or(&evaluators_a);
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let on_game = std::sync::Mutex::new(on_game);
+    let parts: Vec<Result<MatchTally, String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let (evaluators_a, done, on_game) = (&evaluators_a, &done, &on_game);
+                let (search_a, search_b) = (search_a.clone(), search_b.clone());
+                let (book_a, book_b) = (book_a.as_ref(), book_b.as_ref());
+                scope.spawn(move || {
+                    let mut eval_a = evaluators_a.for_thread(a, t)?;
+                    let mut eval_b = evaluators_b.for_thread(b, t)?;
+                    Ok(lockstep_match_games(
+                        Side {
+                            evaluator: &mut eval_a,
+                            search: search_a,
+                            book: book_a,
+                        },
+                        Side {
+                            evaluator: &mut eval_b,
+                            search: search_b,
+                            book: book_b,
+                        },
+                        share(games, threads, t),
+                        exploration,
+                        |_| {
+                            let n = 1 + done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            (on_game.lock().expect("on_game panicked"))(n);
+                        },
+                    ))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("match thread panicked"))
+            .collect()
+    });
+    let mut tally = MatchTally::default();
+    for part in parts {
+        let part = part?;
+        tally.games += part.games;
+        tally.a_wins += part.a_wins;
+        tally.b_wins += part.b_wins;
+        tally.draws += part.draws;
+        tally.a_wins_as_x += part.a_wins_as_x;
+        tally.a_wins_as_o += part.a_wins_as_o;
+        tally.moves += part.moves;
+    }
+    Ok(tally)
 }
 
 /// Every pair of agents plays a match.
@@ -249,16 +404,18 @@ pub fn round_robin(
         specs,
         games_per_pair,
         &MatchExploration::default(),
+        1,
         on_match,
     )
 }
 
-/// [`round_robin`] with opening exploration for the lockstep matches
-/// ([`play_match_with`]).
+/// [`round_robin`] with opening exploration for the lockstep matches and their games split
+/// over threads ([`play_match_with`]).
 pub fn round_robin_with(
     specs: &[AgentSpec],
     games_per_pair: usize,
     exploration: &MatchExploration,
+    threads: usize,
     mut on_match: impl FnMut(&MatchResult),
 ) -> Result<Tournament, String> {
     let mut tournament = Tournament {
@@ -267,8 +424,14 @@ pub fn round_robin_with(
     };
     for i in 0..specs.len() {
         for j in i + 1..specs.len() {
-            let result =
-                play_match_with(&specs[i], &specs[j], games_per_pair, exploration, |_| {})?;
+            let result = play_match_with(
+                &specs[i],
+                &specs[j],
+                games_per_pair,
+                exploration,
+                threads,
+                |_| {},
+            )?;
             on_match(&result);
             tournament.matches.push(result);
         }
@@ -317,6 +480,26 @@ mod tests {
         assert_eq!(r.a_wins, r.a_wins_as_x + r.a_wins_as_o);
         assert!(r.a_wins >= r.b_wins, "{r}");
         assert!(r.moves >= 4 * 17);
+    }
+
+    #[test]
+    fn threaded_searches_play_every_game_once() {
+        let search = |simulations, seed| AgentSpec::Mcts {
+            simulations,
+            seed,
+            book: None,
+        };
+        let (a, b) = (search(40, 1), search(1, 2));
+        let mut seen = Vec::new();
+        let exploration = MatchExploration::default();
+        let r = play_match_with(&a, &b, 7, &exploration, 3, |n| seen.push(n)).unwrap();
+        assert_eq!(seen, (1..=7).collect::<Vec<_>>());
+        assert_eq!(r.a_wins + r.b_wins + r.draws, 7);
+        assert_eq!(r.a_wins, r.a_wins_as_x + r.a_wins_as_o);
+        assert!(r.moves >= 7 * 17);
+        // The shares cover the games once, in order.
+        let shares: Vec<_> = (0..3).map(|t| share(7, 3, t)).collect();
+        assert_eq!(shares, [0..3, 3..5, 5..7]);
     }
 
     #[test]

@@ -148,7 +148,8 @@ pub struct LoopConfig {
     pub games_growth: f64,
     pub max_games: usize,
     pub selfplay: SelfPlayConfig,
-    /// Self-play search threads per generation (see [`generate_threaded`]; 0 = one per core).
+    /// Search threads per generation, for self-play (see [`generate_threaded`]) and the
+    /// matches (see [`play_match_with`]); 0 = one per core.
     pub threads: usize,
     /// Games kept in the replay buffer when `buffer_generations` is zero.
     pub buffer_games: usize,
@@ -530,6 +531,7 @@ pub fn run_loop(
             &searcher(&best),
             cfg.eval_games,
             &cfg.eval_exploration,
+            cfg.threads,
             |_| {},
         )?;
         let promoted = eval.score_a() >= cfg.promote_threshold;
@@ -556,6 +558,7 @@ pub fn run_loop(
                 baseline,
                 cfg.baseline_games,
                 &cfg.eval_exploration,
+                cfg.threads,
                 |_| {},
             )?;
             log(format!(

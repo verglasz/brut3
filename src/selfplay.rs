@@ -387,6 +387,24 @@ pub fn search_positions<A: UtttAgent<State = BitState>>(
         .collect()
 }
 
+/// Search threads for `games` games when asked for `threads`: 0 means one per core, and never
+/// more threads than games.
+pub fn search_threads(threads: usize, games: usize) -> usize {
+    match threads {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        n => n,
+    }
+    .clamp(1, games.max(1))
+}
+
+/// Share `t` of `parts` contiguous shares of `games` games, the first `games % parts` one
+/// longer.
+pub fn share(games: usize, parts: usize, t: usize) -> std::ops::Range<usize> {
+    let (base, extra) = (games / parts, games % parts);
+    let start = t * base + t.min(extra);
+    start..start + base + usize::from(t < extra)
+}
+
 /// One side of a [`lockstep_match`]: a search with `search`'s simulations, per-tree batch,
 /// exploration constant, virtual loss and move temperature, over `evaluator`'s leaf
 /// evaluations. This is what an `mcts` or `mcts-nn` agent is, taken apart so that many of
@@ -615,12 +633,25 @@ pub fn lockstep_match<A: UtttAgent<State = BitState>, B: UtttAgent<State = BitSt
     b: Side<'_, B>,
     games: usize,
     exploration: &MatchExploration,
+    on_game: impl FnMut(usize),
+) -> MatchTally {
+    lockstep_match_games(a, b, 0..games, exploration, on_game)
+}
+
+/// [`lockstep_match`] for the games numbered `games` of a longer match: each game's colours
+/// and seeds follow its number, so a match split into ranges (over threads) plays the same
+/// games as the whole. `on_game` counts this range's games.
+pub fn lockstep_match_games<A: UtttAgent<State = BitState>, B: UtttAgent<State = BitState>>(
+    a: Side<'_, A>,
+    b: Side<'_, B>,
+    games: std::ops::Range<usize>,
+    exploration: &MatchExploration,
     mut on_game: impl FnMut(usize),
 ) -> MatchTally {
     let mut tally = MatchTally::default();
-    let mut active: Vec<MatchGame> = Vec::with_capacity(games);
+    let mut active: Vec<MatchGame> = Vec::with_capacity(games.len());
     let books = (a.book, b.book);
-    for g in 0..games {
+    for g in games {
         let a_plays = if g % 2 == 0 { Player::X } else { Player::O };
         let rngs = [
             SmallRng::seed_from_u64(a.search.seed.wrapping_add(g as u64)),

@@ -190,6 +190,10 @@ enum Command {
         /// Search vs search: Dirichlet alpha of the root noise (0 disables it).
         #[arg(long, default_value_t = 0.0)]
         dirichlet_alpha: f32,
+        /// Search vs search: threads each playing its share of a match's games (0 = one per
+        /// core). A network runs on one thread of its own that batches them all.
+        #[arg(long, default_value_t = 1)]
+        threads: usize,
         /// Agent specs, one per argument, quoted when they contain spaces.
         #[arg(required = true, num_args = 2..)]
         specs: Vec<String>,
@@ -503,8 +507,9 @@ fn main() -> ExitCode {
             games,
             temperature_moves,
             dirichlet_alpha,
+            threads,
             specs,
-        } => benchmark(games, temperature_moves, dirichlet_alpha, &specs),
+        } => benchmark(games, temperature_moves, dirichlet_alpha, threads, &specs),
         Command::Serve { addr, specs } => serve(&addr, &specs),
         Command::Book {
             search,
@@ -1119,6 +1124,7 @@ fn benchmark(
     games: usize,
     temperature_moves: usize,
     dirichlet_alpha: f32,
+    threads: usize,
     specs: &[String],
 ) -> Result<(), String> {
     use brut3::benchmark::round_robin_with;
@@ -1135,7 +1141,7 @@ fn benchmark(
         })
         .collect::<Result<Vec<_>, _>>()?;
     println!("round robin, {games} games per pair:");
-    let tournament = round_robin_with(&specs, games, &exploration, |m| println!("  {m}"))?;
+    let tournament = round_robin_with(&specs, games, &exploration, threads, |m| println!("  {m}"))?;
     print!("\n{}", tournament.table());
     Ok(())
 }
