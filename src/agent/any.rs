@@ -87,6 +87,29 @@ impl AgentSpec {
     }
 }
 
+/// The agent spec grammar, for the help of the commands that take specs.
+#[cfg(feature = "nn")]
+pub const SPEC_SYNTAX: &str = "\
+Agent specs, one argument each (quoted when they contain spaces), [..] optional:
+  random [seed]
+  greedy [seed]
+  minimax [depth] [seed]
+  mcts [simulations] [seed]
+  nn <weights> [backend]
+  mcts-nn <weights> [backend] [simulations] [batch] [seed]
+<weights> is a saved model's path stem (its .bpk and .json); [backend] is cuda, wgpu, flex or
+cpu-mlir. mcts, nn and mcts-nn may end with `book <file>`: an opening book whose moves are
+played without searching.";
+/// The agent spec grammar, for the help of the commands that take specs.
+#[cfg(not(feature = "nn"))]
+pub const SPEC_SYNTAX: &str = "\
+Agent specs, one argument each (quoted when they contain spaces), [..] optional:
+  random [seed]
+  greedy [seed]
+  minimax [depth] [seed]
+  mcts [simulations] [seed]
+mcts may end with `book <file>`: an opening book whose moves are played without searching.";
+
 #[cfg(not(feature = "nn"))]
 const NAMES: &str = "`random`, `greedy`, `minimax` or `mcts`";
 #[cfg(feature = "nn")]

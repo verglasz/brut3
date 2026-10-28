@@ -6,7 +6,7 @@ pub mod heuristic;
 pub mod minimax;
 pub mod random;
 
-pub use any::{AgentSpec, AnyAgent};
+pub use any::{AgentSpec, AnyAgent, SPEC_SYNTAX};
 pub use greedy::GreedyAgent;
 pub use minimax::MinimaxAgent;
 pub use random::RandomAgent;

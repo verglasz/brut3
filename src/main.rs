@@ -21,21 +21,25 @@ enum Command {
     /// `mcts-nn models/value cuda 400 16`; `mcts`, `nn` and `mcts-nn` may end with
     /// `book <file>` to play an opening book's moves without searching. Defaults to
     /// `mcts 400`.
+    #[command(after_help = brut3::agent::SPEC_SYNTAX)]
     Play {
         #[arg(trailing_var_arg = true)]
         spec: Vec<String>,
     },
     /// Generate self-play games and train the value network on them.
     #[cfg(feature = "nn")]
+    #[command(after_help = brut3::agent::SPEC_SYNTAX)]
     Train(TrainArgs),
     /// Play lockstep self-play games with a search agent and save them, without training:
     /// e.g. `selfplay --evaluator random --games 4000 --out models/mcts-200.games`, for
     /// `loop --initial-games` or `train --data`.
     #[cfg(feature = "nn")]
+    #[command(after_help = brut3::agent::SPEC_SYNTAX)]
     Selfplay(SelfplayArgs),
     /// Self-play training loop: generate games with the best model, train a candidate on a
     /// replay buffer, promote it if it beats the best; repeat.
     #[cfg(feature = "nn")]
+    #[command(after_help = brut3::agent::SPEC_SYNTAX)]
     Loop(LoopArgs),
     /// Convert the uttt.ai text datasets (stage1-mcts, stage2-nmcts) into a games file for
     /// `train --data`: e.g. `import-utttai --out datasets/stage1.games datasets/stage1-mcts`.
@@ -123,6 +127,7 @@ enum Command {
     /// search agent, e.g. `book --search "mcts-nn models/big cuda 100000 16" --out models/book.txt`.
     /// An existing book file is extended, and its entries to --plies whose search had fewer
     /// simulations are searched again with their visit shares as the root priors.
+    #[command(after_help = brut3::agent::SPEC_SYNTAX)]
     Book {
         /// The search that evaluates each position: `mcts [simulations] [seed]` or
         /// `mcts-nn <weights> [backend] [simulations] [batch] [seed]`.
@@ -170,6 +175,7 @@ enum Command {
     /// models/book.txt`. Dropped entries stay in the file, marked: lookups and the export
     /// skip them, while `book` and the walks of later passes still use them, so the book can
     /// be pruned in passes (say, different settings from different plies) and deepened again.
+    #[command(after_help = brut3::agent::SPEC_SYNTAX)]
     PruneBook(PruneArgs),
     /// Show what an opening book file holds, without searching: its header, its entries,
     /// dropped entries and open positions by ply, and the visits of their searches.
@@ -178,6 +184,7 @@ enum Command {
         book: std::path::PathBuf,
     },
     /// Round-robin tournament between agents, e.g. `benchmark "mcts 400" "nn models/value" random`.
+    #[command(after_help = brut3::agent::SPEC_SYNTAX)]
     Benchmark {
         /// Games per pair of agents (colours alternate; game g uses each agent's seed + g).
         #[arg(long, default_value_t = 20)]
@@ -201,6 +208,7 @@ enum Command {
     /// Serve a web page for playing against agents, e.g.
     /// `serve "mcts 800" "mcts-nn models/x cuda 400 16 book models/book.txt"`. Each side of
     /// the board is a human or one of the agents, chosen on the page.
+    #[command(after_help = brut3::agent::SPEC_SYNTAX)]
     Serve {
         /// Address to listen on.
         #[arg(long, default_value = "127.0.0.1:8080")]

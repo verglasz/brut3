@@ -288,6 +288,10 @@ pub struct BitState {
     to_move: Player,
 }
 
+// Searches and playouts copy states all the time: 42 bytes of masks, the last move and the
+// side to move. Exact, so that a smaller layout updates it and a larger one cannot go unnoticed.
+const _: () = assert!(std::mem::size_of::<BitState>() == 46);
+
 impl BitState {
     #[inline]
     fn occupied(&self, board: usize) -> u16 {
@@ -666,8 +670,6 @@ mod tests {
         }
         assert!(!WIN[0b000_000_011]);
         assert!(WIN[0b100_010_001]);
-        // 42 bytes of masks, the last move and the side to move.
-        assert_eq!(std::mem::size_of::<BitState>(), 46);
     }
 
     #[test]
