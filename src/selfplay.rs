@@ -743,7 +743,10 @@ mod tests {
             stats.positions,
             records.iter().map(|r| r.positions.len()).sum::<usize>()
         );
-        assert_eq!(stats.simulations, 24 * stats.positions as u64);
+        // Every search spends its budget, except where its root is proven at expansion (a win
+        // in one, or every move decided), which ends it after that one simulation.
+        assert!(stats.simulations <= 24 * stats.positions as u64);
+        assert!(stats.simulations > 20 * stats.positions as u64, "{stats:?}");
         for record in &records {
             assert!(record.positions.len() >= 17);
             // Each position follows the previous by a legal move, and ends in the outcome.
