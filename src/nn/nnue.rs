@@ -585,7 +585,7 @@ fn accumulate(e: &Ends, ids: NnueInput) -> Tensor<2> {
 /// policy, which also reads the nine boards' contents (`[n, BOARDS]`) in the policy tables
 /// `local_policy` (`[_, CELLS]`) and `send_policy` (`[_, 1]`), the model's own or re-indexed
 /// copies. With gates, `h` weighs the skip and the tables (see [`GATES`]).
-fn heads(
+pub(crate) fn heads(
     e: &Ends,
     h: Tensor<2>,
     acc: Tensor<2>,

@@ -18,8 +18,9 @@
 //! The heads are the NNUE's with gates (see [`GATES`]): the stream mixes the value's own
 //! logits with the accumulator's skip, `(1 − g) V h + g S acc`, and scales each board's local
 //! policy table and each destination's send table by a gate of its own, so that no shortcut
-//! reaches the output unconditionally. The gates start with zero weights and biases of 1, the
-//! values they keep when weights saved before them are loaded (see [`NnueV2::load_weights`]).
+//! reaches the output unconditionally. The gates start with zero weights and biases, at 1/2
+//! for every position; weights saved before the gates load with them so and the gated terms
+//! doubled, which computes what those weights did (see [`NnueV2::load_weights`]).
 
 use std::path::Path;
 
@@ -92,10 +93,9 @@ impl NnueV2Config {
                 .collect(),
             false => Vec::new(),
         };
-        let mut gates = LinearConfig::new(d_h, GATES)
+        let gates = LinearConfig::new(d_h, GATES)
             .with_initializer(Initializer::Zeros)
             .init(device);
-        gates.bias = Some(Param::from_tensor(Tensor::ones([GATES], device)));
         let e = EndLayers::new(self.d_embed, self.d_acc, d_h, device);
         NnueV2 {
             config: self.clone(),
@@ -172,15 +172,28 @@ impl NnueV2 {
     }
 
     /// Loads the weights saved at `path`, strictly, except that weights saved before the
-    /// heads had gates load too, the gates keeping their initial values.
+    /// heads had gates load too: the gates keep their initial values, every gate 1/2, and the
+    /// value's two terms and the policy tables are doubled, so that the network computes what
+    /// the saved one did.
     pub fn load_weights(self, path: &Path) -> Result<Self, RecordError> {
         let record = ModuleRecord::load(path)?;
         match self.clone().try_load_record(record.clone()) {
             Err(RecordError::Validation(e)) if only_gates_missing(&e) => {
-                self.try_load_record(record.allow_partial(true))
+                Ok(self.try_load_record(record.allow_partial(true))?.ungated())
             }
             loaded => loaded,
         }
+    }
+
+    /// Doubles everything the gates scale, which at their initial 1/2 undoes them.
+    fn ungated(mut self) -> Self {
+        let double = |p: Param<Tensor<2>>| p.map(|t| t * 2.0);
+        self.value.weight = double(self.value.weight);
+        self.value.bias = self.value.bias.map(|b| b.map(|t| t * 2.0));
+        self.value_skip.weight = double(self.value_skip.weight);
+        self.local_policy.weight = double(self.local_policy.weight);
+        self.send_policy.weight = double(self.send_policy.weight);
+        self
     }
 }
 
@@ -253,7 +266,7 @@ crate::nn::train::impl_train_steps!(NnueV2);
 mod tests {
     use super::*;
     use crate::nn::BackendKind;
-    use crate::nn::nnue::assert_folds;
+    use crate::nn::nnue::{assert_folds, heads};
 
     fn small() -> NnueV2Config {
         NnueV2Config::new()
@@ -298,13 +311,45 @@ mod tests {
     }
 
     #[test]
-    fn gates_start_constant_and_their_absence_alone_is_tolerated() {
+    fn gates_start_at_a_half_and_doubling_undoes_them() {
         let _lock = crate::nn::device_lock();
         let device = BackendKind::preferred().device();
         let model = small().init(&device);
         let weight: f32 = model.gates.weight.val().abs().max().into_scalar();
-        let bias: f32 = model.gates.bias.as_ref().unwrap().val().min().into_scalar();
-        assert_eq!((weight, bias), (0.0, 1.0));
+        let bias: f32 = model.gates.bias.as_ref().unwrap().val().abs().max().into_scalar();
+        assert_eq!((weight, bias), (0.0, 0.0));
+        // Doubled, the gated heads compute what the ungated ones did.
+        let (n, d_acc) = (4, 32);
+        let random = |dims: [usize; 2]| {
+            Tensor::<2>::random(dims, burn::tensor::Distribution::Normal(0.0, 1.0), &device)
+        };
+        let (h, acc) = (random([n, 16]), random([n, d_acc]));
+        let contents = Tensor::<2, Int>::random(
+            [n, 9],
+            burn::tensor::Distribution::Uniform(0.0, 1000.0),
+            &device,
+        );
+        let head = |m: &NnueV2, gated: bool| {
+            let mut e = m.ends();
+            if !gated {
+                e.gates = None;
+            }
+            let p = heads(
+                &e,
+                h.clone(),
+                acc.clone(),
+                contents.clone(),
+                m.local_policy.weight.val(),
+                m.send_policy.weight.val(),
+            );
+            Tensor::cat(vec![p.wdl, p.policy], 1)
+        };
+        let ungated = model.clone().ungated();
+        let diff: f32 = (head(&model, false) - head(&ungated, true))
+            .abs()
+            .max()
+            .into_scalar();
+        assert!(diff < 1e-5, "doubled gated heads differ by {diff}");
         assert!(only_gates_missing(
             r#"Missing tensors: ["gates.weight", "gates.bias"]"#
         ));
