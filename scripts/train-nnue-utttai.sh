@@ -29,18 +29,19 @@ BIN=target/release/brut3
 # The burn dashboard assumes a dark background. When it is going to be shown (a terminal,
 # and no --no-tui among the extra arguments), give the terminal a dark background and a light
 # foreground for the run and restore its own colours on exit. Inside tmux this styles the
-# pane through tmux (OSC sequences would need allow-passthrough); elsewhere it uses OSC 11
-# and 10, reset with OSC 111 and 110.
+# script's own pane through tmux ($TMUX_PANE, so switching panes meanwhile is fine; OSC
+# sequences would need allow-passthrough); elsewhere it uses OSC 11 and 10, reset with OSC
+# 111 and 110.
 dark_on() {
     if [ -n "${TMUX:-}" ]; then
-        tmux select-pane -P 'bg=#1c1c1c,fg=#d7d7d7'
+        tmux select-pane -t "$TMUX_PANE" -P 'bg=#1c1c1c,fg=#d7d7d7'
     else
         printf '\033]11;#1c1c1c\007\033]10;#d7d7d7\007'
     fi
 }
 dark_off() {
     if [ -n "${TMUX:-}" ]; then
-        tmux select-pane -P 'default'
+        tmux select-pane -t "$TMUX_PANE" -P 'default'
     else
         printf '\033]111\007\033]110\007'
     fi
