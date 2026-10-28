@@ -24,6 +24,7 @@ use super::heads::{
     encode_all_to_all,
 };
 use super::model::{MOVES, Model, Prediction, Verdict};
+use super::nnue::raw_code;
 use crate::game::{BitState, BoardStatus, GameState, Square};
 
 /// Number of small-board contents: each of 9 cells is empty, mine or theirs.
@@ -196,7 +197,7 @@ pub struct BoardTransformerV2 {
 pub type BoardTokens = Tensor<2, Int>;
 
 /// Embedding ids of one position, board-major: for each board its content id
-/// (`CONTENT_BASE + index in 0..3^9`), nine cell ids (`CELL_BASE + cell * 3 + content`), its
+/// (`CONTENT_BASE +` its [`raw_code`]), nine cell ids (`CELL_BASE + cell * 3 + content`), its
 /// position, status (`0` open, `1` won by the side to move, `2` won by the opponent, `3`
 /// full) and whether it is the forced board, each at its table offset.
 pub type BoardTokenIds = [i32; IDS];
@@ -210,8 +211,7 @@ pub fn board_token_ids(state: &BitState, out: &mut BoardTokenIds) {
         let token = &mut out[b * IDS_PER_BOARD..(b + 1) * IDS_PER_BOARD];
         let mine = state.board_marks(me, b);
         let theirs = state.board_marks(them, b);
-        let mut index = 0i32;
-        for cell in (0..CELLS).rev() {
+        for cell in 0..CELLS {
             let value = if mine >> cell & 1 != 0 {
                 1
             } else if theirs >> cell & 1 != 0 {
@@ -219,10 +219,9 @@ pub fn board_token_ids(state: &BitState, out: &mut BoardTokenIds) {
             } else {
                 0
             };
-            index = index * 3 + value;
             token[1 + cell] = (CELL_BASE + cell * 3) as i32 + value;
         }
-        token[0] = CONTENT_BASE as i32 + index;
+        token[0] = (CONTENT_BASE + raw_code(mine, theirs)) as i32;
         token[1 + CELLS] = (POSITION_BASE + b) as i32;
         token[2 + CELLS] = STATUS_BASE as i32
             + match state.board_status(*square) {
