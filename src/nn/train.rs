@@ -32,6 +32,7 @@ use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use super::linear::LinearNet;
 use super::model::{MOVES, Model, Verdict, expected_value, legal_mask, most_likely, predict_host};
+use super::train_stats::{LrMetric, StatMetric};
 use crate::agent::{AgentSpec, UtttAgent};
 use crate::game::{BitState, GameState, Move, Outcome, Symmetry};
 
@@ -582,15 +583,15 @@ impl<M: Model> Batcher<Sample, Batch<M>> for ModelBatcher<M> {
     }
 }
 
-/// Output of one training or validation step: the summed loss, the `[batch, 3]` verdict
-/// logits and the `[batch]` verdict targets, which burn's loss and accuracy metrics read.
-pub type StepOutput = ClassificationOutput;
+pub use super::train_stats::StepOutput;
 
 /// Forward pass plus the loss: the weighted cross-entropy between the win/draw/loss target
 /// and the verdict logits (averaged over the samples that have a target), the weighted squared error
 /// of the expected value (`p_win - p_loss`) against the scalar value target, and the
-/// cross-entropy between the target move distribution and the legal-masked policy.
-pub fn forward_step<M: Model>(model: &M, batch: Batch<M>) -> StepOutput {
+/// cross-entropy between the target move distribution and the legal-masked policy. The
+/// output holds the summed loss, the `[batch, 3]` verdict logits and the `[batch]` verdict
+/// targets, which burn's loss and accuracy metrics read.
+pub fn forward_step<M: Model>(model: &M, batch: Batch<M>) -> ClassificationOutput {
     let prediction = model.predict(batch.input);
     let n = batch.verdicts.dims()[0];
     // Averaged over the positions that have a win/draw/loss target, so that the term keeps
@@ -626,7 +627,25 @@ macro_rules! impl_train_steps {
                 batch: Self::Input,
             ) -> ::burn::train::TrainOutput<$crate::nn::train::StepOutput> {
                 let item = $crate::nn::train::forward_step(self, batch);
-                ::burn::train::TrainOutput::new(self, item.loss.backward(), item)
+                let grads = ::burn::optim::GradientsParams::from_grads(item.loss.backward(), self);
+                let stats = $crate::nn::train_stats::TrainStats::new(self, &grads)
+                    .map(::std::sync::Arc::new);
+                ::burn::train::TrainOutput {
+                    grads,
+                    item: $crate::nn::train::StepOutput {
+                        classification: item,
+                        stats,
+                    },
+                }
+            }
+
+            fn optimize(
+                self,
+                optim: &mut ::burn::optim::ModuleOptimizer,
+                lr: ::burn::lr_scheduler::module_lr_scheduler::ModuleLearningRate,
+                grads: ::burn::optim::GradientsParams,
+            ) -> Self {
+                $crate::nn::train_stats::optimize_recorded(self, optim, lr, grads)
             }
         }
 
@@ -635,7 +654,10 @@ macro_rules! impl_train_steps {
             type Output = $crate::nn::train::StepOutput;
 
             fn step(&self, batch: Self::Input) -> $crate::nn::train::StepOutput {
-                $crate::nn::train::forward_step(self, batch)
+                $crate::nn::train::StepOutput {
+                    classification: $crate::nn::train::forward_step(self, batch),
+                    stats: None,
+                }
             }
         }
     };
@@ -870,12 +892,18 @@ pub fn train<M: Trainable>(
         Learner::new(model, optim, opts.learning_rate)
     };
 
-    let training = SupervisedTraining::new(&opts.artifact_dir, loader_train, loader_valid)
+    let mut training = SupervisedTraining::new(&opts.artifact_dir, loader_train, loader_valid)
         .num_epochs(opts.epochs)
         .metric_train_numeric(LossMetric::new())
         .metric_valid_numeric(LossMetric::new())
         .metric_train_numeric(AccuracyMetric::new())
         .metric_valid_numeric(AccuracyMetric::new())
+        .metric_train_numeric(LrMetric::new());
+    // Per part of the network: the gradient norm and the size of each step against the weights.
+    for metric in StatMetric::all() {
+        training = training.metric_train_numeric(metric);
+    }
+    let training = training
         .with_training_strategy(ExecutionStrategy::single(ad_device).into())
         .with_default_checkpointers();
     let training = if opts.tui {

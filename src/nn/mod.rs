@@ -26,6 +26,7 @@ pub mod nnue_v2;
 pub mod pipeline;
 pub mod server;
 pub mod train;
+pub mod train_stats;
 pub mod utttai;
 
 pub use agent::NetAgent;
