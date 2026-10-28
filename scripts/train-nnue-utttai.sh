@@ -23,6 +23,8 @@ STAGE1=${STAGE1:-datasets/stage1.games}
 STAGE2=${STAGE2:-datasets/stage2.games}
 WORKERS=${WORKERS:-0}
 
+STARTING_MODEL=${BASE:+"--init '$BASE'"}
+
 # cargo build --release --features "$BACKEND"
 BIN=target/release/brut3
 
@@ -58,7 +60,7 @@ if [ "$EPOCHS1" -gt 0 ]; then
         --epochs "$EPOCHS1" --batch-size "$BATCH" --lr "$LR" --lr-min "$LR_MIN" \
         --augment all --validation-fraction "$VALID" --workers "$WORKERS" \
         --outcome-weight 1 --search-value-weight 0.5 \
-        --out "models/$NAME-s1" --artifact-dir "artifacts/$NAME-s1" "$@"
+        --out "models/$NAME-s1" --artifact-dir "artifacts/$NAME-s1" $STARTING_MODEL "$@"
 fi
 if [ "$EPOCHS2" -gt 0 ]; then
     "$BIN" train --backend "$BACKEND" --data "$STAGE2" --model "$MODEL" \
