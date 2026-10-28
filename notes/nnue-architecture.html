@@ -130,6 +130,19 @@
   .panel { display: flex; flex-direction: column; gap: 28px; }
   /* The page's own display rule would otherwise beat the browser's default for [hidden]. */
   [hidden] { display: none !important; }
+  .controls {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 10px 20px;
+    padding: 14px 16px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+  }
+  .controls label { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; font-size: 13px; color: var(--muted); }
+  .controls input { grid-column: 1 / -1; width: 100%; accent-color: var(--accent); }
+  .controls output { font: 500 13px var(--font-mono); color: var(--fg); font-variant-numeric: tabular-nums; }
+  .controls .note { grid-column: 1 / -1; font-size: 12px; }
   .tabs { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--line); }
   .tabs button {
     font: 500 14px/1 var(--font-body);
@@ -159,9 +172,9 @@
   <div class="panel" id="panel-nnue" role="tabpanel" aria-labelledby="tab-nnue">
   <header>
     <span class="eyebrow">brut3 · nn::nnue · medium net</span>
-    <h1>NNUE 64·512·128·4</h1>
+    <h1 id="title-nnue">NNUE 64·512·128·4</h1>
     <p>The table-driven network behind <code>models/nnue-64-512-128-4_mediumnet-full</code>, the model the Haskell engine is exported from. It reads a position from the side to move's view and returns win/draw/loss logits and one logit per move.</p>
-    <div class="dims">
+    <div class="dims" id="dims-nnue">
       <span>embedding <b>64</b></span>
       <span>accumulator <b>512</b></span>
       <span>hidden <b>128</b></span>
@@ -170,6 +183,13 @@
       <span>multiply-adds after folding <b>126,976</b></span>
     </div>
   </header>
+  <div class="controls" data-model="nnue">
+    <label><span>embedding</span><input type="range" data-key="e"><output></output></label>
+    <label><span>accumulator</span><input type="range" data-key="a"><output></output></label>
+    <label><span>hidden</span><input type="range" data-key="h"><output></output></label>
+    <label><span>layers</span><input type="range" data-key="l"><output></output></label>
+    <p class="note">The sliders recompute the title, sizes and parameter table; the diagrams keep the default sizes in their labels.</p>
+  </div>
 
   <section>
     <h2>One evaluation, as trained</h2>
@@ -398,7 +418,7 @@
         <thead>
           <tr><th>Component</th><th>Shape</th><th class="num">Parameters</th></tr>
         </thead>
-        <tbody>
+        <tbody id="params-nnue">
           <tr><td>Content table</td><td><code>11,125 × 64</code></td><td class="num">712,000</td></tr>
           <tr><td>mix (board matrices)</td><td><code>576 × 512 + 512</code></td><td class="num">295,424</td></tr>
           <tr><td>forced_mix</td><td><code>64 × 512</code></td><td class="num">32,768</td></tr>
@@ -421,10 +441,10 @@
   <div class="panel" id="panel-nnue-v2" role="tabpanel" aria-labelledby="tab-nnue-v2" hidden>
   <header>
     <span class="eyebrow">brut3 · nn::nnue_v2 · reworked trunk and heads</span>
-    <h1>nnue-v2 64·512·128·4 · reglu 128</h1>
+    <h1 id="title-nnue-v2">nnue-v2 64·512·128·4 · reglu 128</h1>
     <p>The same tables and accumulator as the NNUE, then an unrectified projection that gates its first layer, ReGLU blocks, and heads in which the later layers decide how much the shortcut terms count. Drawn at hidden width 128 with ReGLU blocks of width 128; the model trained as <code>nnue-v2-64-512-96-4-reglu-96</code> has the same structure at width 96.</p>
     <p class="note"><span class="planned">Status:</span> the trunk (projection, gated layer, ReGLU blocks, optional ReZero) is implemented as <code>nnue-v2 E A H L reglu D [rezero]</code>. The gated heads, the convex value mix and the gated policy tables, are the planned <code>mix</code> option and not built yet; the trained model has the NNUE's heads.</p>
-    <div class="dims">
+    <div class="dims" id="dims-nnue-v2">
       <span>embedding <b>64</b></span>
       <span>accumulator <b>512</b></span>
       <span>hidden <b>128</b></span>
@@ -433,6 +453,14 @@
       <span>multiply-adds after folding <b>211,328</b></span>
     </div>
   </header>
+  <div class="controls" data-model="nnue-v2">
+    <label><span>embedding</span><input type="range" data-key="e"><output></output></label>
+    <label><span>accumulator</span><input type="range" data-key="a"><output></output></label>
+    <label><span>hidden</span><input type="range" data-key="h"><output></output></label>
+    <label><span>layers</span><input type="range" data-key="l"><output></output></label>
+    <label><span>ReGLU width</span><input type="range" data-key="d"><output></output></label>
+    <p class="note">The sliders recompute the title, sizes and parameter table; the diagrams keep the default sizes in their labels.</p>
+  </div>
 
   <section>
     <h2>One evaluation, with the planned heads</h2>
@@ -532,7 +560,7 @@
         <thead>
           <tr><th>Component</th><th>Shape</th><th class="num">Parameters</th></tr>
         </thead>
-        <tbody>
+        <tbody id="params-nnue-v2">
           <tr><td>First layer (content, mix, forced_mix, feature tables)</td><td><code>as in the NNUE</code></td><td class="num">1,349,952</td></tr>
           <tr><td>Projection</td><td><code>512 × 128 + 128</code></td><td class="num">65,664</td></tr>
           <tr><td>Gated layer (up, down)</td><td><code>128 × 128 + 128, 128 × 128</code></td><td class="num">32,896</td></tr>
@@ -547,7 +575,7 @@
         </tbody>
       </table>
     </div>
-    <p class="note">With <code>rezero</code>, three more scalars. Per evaluation after folding: projection 65,536, gated layer 32,768, ReGLU blocks 98,304, heads 14,720 (value 512, skip 1,536, policy 10,368, gates 2,304): 211,328 multiply-adds, 1.66× the medium NNUE's 126,976.</p>
+    <p class="note" id="cost-nnue-v2">With <code>rezero</code>, three more scalars. Per evaluation after folding: projection 65,536, gated layer 32,768, ReGLU blocks 98,304, heads 14,720 (value 512, skip 1,536, policy 10,368, gates 2,304): 211,328 multiply-adds, 1.66× the medium NNUE's 126,976.</p>
   </section>
   </div>
 </main>
@@ -572,5 +600,105 @@
     const fromHash = () => show(location.hash === "#nnue-v2" ? "nnue-v2" : "nnue");
     window.addEventListener("hashchange", fromHash);
     fromHash();
+  })();
+</script>
+
+<script>
+  (() => {
+    const STEPS = {
+      e: [16, 24, 32, 48, 64, 96, 128],
+      a: [128, 192, 256, 384, 512, 768, 1024],
+      h: [32, 48, 64, 96, 128, 192, 256, 384, 512],
+      l: [1, 2, 3, 4, 5, 6],
+      d: [32, 48, 64, 96, 128, 192, 256, 384, 512],
+    };
+    // Fixed table sizes from nnue.rs: compact contents, content-table rows, feature rows.
+    const CONTENTS = 11096, CONTENT_ROWS = 11125, FEATURE_ROWS = 605, MOVES = 81;
+    const DEFAULTS = { nnue: { e: 64, a: 512, h: 128, l: 4 }, "nnue-v2": { e: 64, a: 512, h: 128, l: 4, d: 128 } };
+    const n = (x) => x.toLocaleString("en-US");
+    const row = (name, shape, count) => `<tr><td>${name}</td><td><code>${shape}</code></td><td class="num">${n(count)}</td></tr>`;
+
+    function nnue({ e, a, h, l }) {
+      const rows = [
+        ["Content table", `${n(CONTENT_ROWS)} × ${e}`, CONTENT_ROWS * e],
+        ["mix (board matrices)", `${9 * e} × ${a} + ${a}`, 9 * e * a + a],
+        ["forced_mix", `${e} × ${a}`, e * a],
+        ["Feature table", `${FEATURE_ROWS} × ${a}`, FEATURE_ROWS * a],
+        ["Dense", `${a} × ${h} + ${h}`, a * h + h],
+        [`Residual × ${l - 1}`, `${l - 1} × (${h} × ${h} + ${h})`, (l - 1) * (h * h + h)],
+        ["Value", `${h} × 3 + 3`, h * 3 + 3],
+        ["Value skip", `${a} × 3`, a * 3],
+        ["Policy", `${h} × 81 + 81`, h * MOVES + MOVES],
+        ["Local policy table", `${n(CONTENTS)} × 9`, CONTENTS * 9],
+        ["Send policy table", `${n(CONTENTS)} × 1`, CONTENTS],
+      ];
+      const macs = a * h + (l - 1) * h * h + 3 * h + 3 * a + MOVES * h;
+      return { rows, macs, title: `NNUE ${e}·${a}·${h}·${l}`,
+        dims: [["embedding", e], ["accumulator", a], ["hidden", h], ["layers", `${l} (1 dense + ${l - 1} residual)`]] };
+    }
+
+    function v2({ e, a, h, l, d }) {
+      const later = l - 2;
+      const rows = [
+        ["First layer (content, mix, forced_mix, feature tables)", "as in the NNUE",
+          CONTENT_ROWS * e + 9 * e * a + a + e * a + FEATURE_ROWS * a],
+        ["Projection", `${a} × ${h} + ${h}`, a * h + h],
+        ["Gated layer (up, down)", `${h} × ${h} + ${h}, ${h} × ${h}`, 2 * h * h + h],
+        [`ReGLU × ${later} (gate, up, down)`, `${later} × (2 × (${h} × ${d} + ${d}) + ${d} × ${h})`, later * (3 * h * d + 2 * d)],
+        ["Value with gate", `${h} × 4 + 4`, h * 4 + 4],
+        ["Value skip", `${a} × 3`, a * 3],
+        ["Policy", `${h} × 81 + 81`, h * MOVES + MOVES],
+        ["Policy gates", `${h} × 18 + 18`, h * 18 + 18],
+        ["Local policy table", `${n(CONTENTS)} × 9`, CONTENTS * 9],
+        ["Send policy table", `${n(CONTENTS)} × 1`, CONTENTS],
+      ];
+      const parts = { proj: a * h, gated: 2 * h * h, blocks: later * 3 * h * d, heads: 4 * h + 3 * a + MOVES * h + 18 * h };
+      const macs = parts.proj + parts.gated + parts.blocks + parts.heads;
+      return { rows, macs, parts, title: `nnue-v2 ${e}·${a}·${h}·${l} · reglu ${d}`,
+        dims: [["embedding", e], ["accumulator", a], ["hidden", h], ["layers", `${l} (projection + gated + ${later} ReGLU)`], ["ReGLU width", d]] };
+    }
+
+    const MEDIUM = nnue(DEFAULTS.nnue).macs;
+    function render(model, v) {
+      const r = model === "nnue" ? nnue(v) : v2(v);
+      const total = r.rows.reduce((sum, x) => sum + x[2], 0);
+      document.getElementById(`title-${model}`).textContent = r.title;
+      document.getElementById(`params-${model}`).innerHTML =
+        r.rows.map((x) => row(...x)).join("") + `<tr class="total"><td>Total</td><td></td><td class="num">${n(total)}</td></tr>`;
+      document.getElementById(`dims-${model}`).innerHTML =
+        r.dims.map(([k, x]) => `<span>${k} <b>${typeof x === "number" ? n(x) : x}</b></span>`).join("") +
+        `<span>parameters${model === "nnue" ? "" : " with mix"} <b>${n(total)}</b></span>` +
+        `<span>multiply-adds after folding <b>${n(r.macs)}</b></span>`;
+      if (model === "nnue-v2") {
+        const p = r.parts;
+        document.getElementById("cost-nnue-v2").innerHTML =
+          `With <code>rezero</code>, ${l2(v)} more scalars. Per evaluation after folding: projection ${n(p.proj)}, gated layer ${n(p.gated)}, ` +
+          `ReGLU blocks ${n(p.blocks)}, heads ${n(p.heads)}: ${n(r.macs)} multiply-adds, ${(r.macs / MEDIUM).toFixed(2)}× the medium NNUE's ${n(MEDIUM)}.`;
+      }
+    }
+    const l2 = (v) => v.l - 1;
+
+    for (const box of document.querySelectorAll(".controls")) {
+      const model = box.dataset.model;
+      const v = { ...DEFAULTS[model] };
+      for (const input of box.querySelectorAll("input")) {
+        const key = input.dataset.key;
+        const steps = model === "nnue-v2" && key === "l" ? STEPS.l.filter((x) => x >= 2) : STEPS[key];
+        input.id = `${model}-${key}`;
+        input.min = 0;
+        input.max = steps.length - 1;
+        input.step = 1;
+        input.value = steps.indexOf(v[key]);
+        const out = input.nextElementSibling;
+        const update = () => {
+          v[key] = steps[+input.value];
+          out.textContent = v[key];
+          render(model, v);
+        };
+        input.addEventListener("input", update);
+        out.textContent = v[key];
+      }
+      render(model, v);
+    }
   })();
 </script>
