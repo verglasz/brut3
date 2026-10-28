@@ -7,8 +7,9 @@
 //! thread's time, and with several threads the launches contended (1.5 ms each at four
 //! threads) while every thread also held its own folded table. Here only the server thread
 //! touches the device: it takes whatever requests are queued, evaluates them as one batch and
-//! hands each its rows back, while the search threads keep searching. It keeps two batches in
-//! flight, one launching while the other is read back.
+//! hands each its rows back, while the search threads keep searching. It can keep a second
+//! batch in flight, launching one while the other is read back ([`EvalServer::spawn_with`]),
+//! which measured no faster.
 
 use std::ops::Range;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -35,28 +36,43 @@ pub struct EvalServer {
 }
 
 impl EvalServer {
-    /// Starts the evaluator thread, which builds two agents with `build` (there, so that a
-    /// device agent's work stays on that thread: two so that one batch can be launched while
-    /// the other is read back), and returns once the builds have succeeded or failed. Batches
-    /// hold at most `max_batch` positions (a single larger request is still evaluated whole).
+    /// [`EvalServer::spawn_with`] one batch deep: a second batch in flight measured the same
+    /// (`examples/server_bench`: 1.36-1.44M positions/s both ways at 4 clients of 4096 or 8192
+    /// positions, 64-512-128-4 on an RTX 2080), and costs a second agent and folded table.
     pub fn spawn<A, F>(build: F, max_batch: usize) -> Result<Self, String>
     where
         A: UtttAgent<State = BitState>,
         F: Fn() -> Result<A, String> + Send + 'static,
     {
+        Self::spawn_with(build, max_batch, 1)
+    }
+
+    /// Starts the evaluator thread, which builds `depth` agents (1 or 2) with `build` (there,
+    /// so that a device agent's work stays on that thread), and returns once the builds have
+    /// succeeded or failed. With two, one batch is launched while the other is read back; with
+    /// one, each batch is finished before the next is gathered. Batches hold at most
+    /// `max_batch` positions (a single larger request is still evaluated whole).
+    pub fn spawn_with<A, F>(build: F, max_batch: usize, depth: usize) -> Result<Self, String>
+    where
+        A: UtttAgent<State = BitState>,
+        F: Fn() -> Result<A, String> + Send + 'static,
+    {
+        assert!(matches!(depth, 1 | 2), "server depth must be 1 or 2");
         let (requests, queue) = mpsc::channel::<Request>();
         let (ready, built) = mpsc::channel::<Result<(), String>>();
         let thread = std::thread::Builder::new()
             .name("evaluator".to_string())
-            .spawn(move || match build().and_then(|a| Ok([a, build()?])) {
-                Ok(agents) => {
-                    let _ = ready.send(Ok(()));
-                    serve(agents, &queue, max_batch);
-                }
-                Err(e) => {
-                    let _ = ready.send(Err(e));
-                }
-            })
+            .spawn(
+                move || match (0..depth).map(|_| build()).collect::<Result<Vec<A>, _>>() {
+                    Ok(agents) => {
+                        let _ = ready.send(Ok(()));
+                        serve(agents, &queue, max_batch);
+                    }
+                    Err(e) => {
+                        let _ = ready.send(Err(e));
+                    }
+                },
+            )
             .map_err(|e| format!("cannot start the evaluator thread: {e}"))?;
         built
             .recv()
@@ -97,20 +113,21 @@ struct Slot {
     in_flight: bool,
 }
 
-/// The evaluator thread's loop, two batches deep: gather the queued requests into one batch
-/// and launch it on one agent, then read back the other agent's batch and answer it, so that
-/// the device works on the new batch during the readback. It only waits for requests when
-/// nothing is in flight, and ends when the queue is closed and both slots are empty.
+/// The evaluator thread's loop, one batch in flight per agent: gather the queued requests into
+/// one batch and launch it on one agent, then read back the other agent's batch (with one
+/// agent, that same batch) and answer it, so that with two the device works on the new batch
+/// during the readback. It only waits for requests when nothing is in flight, and ends when
+/// the queue is closed and every slot is empty.
 fn serve<A: UtttAgent<State = BitState>>(
-    mut agents: [A; 2],
+    mut agents: Vec<A>,
     queue: &Receiver<Request>,
     max_batch: usize,
 ) {
-    let mut slots = [Slot::default(), Slot::default()];
+    let mut slots: Vec<Slot> = agents.iter().map(|_| Slot::default()).collect();
     let mut evals = Evaluations::default();
     let mut current = 0;
     loop {
-        let other = 1 - current;
+        let other = (current + 1) % agents.len();
         let wait = !slots[other].in_flight;
         if !gather(queue, &mut slots[current].requests, max_batch, wait) {
             break;
