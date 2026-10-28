@@ -47,7 +47,7 @@ pub enum ModelSpec {
 impl ModelSpec {
     pub const NAMES: &str = "`linear`; `board-transformer`, `cell-transformer`, `board-v2` or \
          `cell-v2`, each followed by `[d_model] [layers] [heads]`; or `nnue` followed by \
-         `[d_embed] [d_acc] [d_hidden] [layers]`";
+         `[d_embed] [d_acc] [d_hidden] [layers] [reglu D_FF]`";
 
     /// Parses a model name with optional hyperparameters, e.g. `linear`,
     /// `board-transformer 64 2 4` (`d_model`, layers, heads).
@@ -107,8 +107,25 @@ fn num(words: &[&str], i: usize, what: &str, default: usize) -> Result<usize, St
     }
 }
 
-/// `[d_embed] [d_acc] [d_hidden] [layers]`, each optional.
+/// `[d_embed] [d_acc] [d_hidden] [layers]`, each optional, then optionally `reglu D_FF` for
+/// ReGLU blocks of inner width `D_FF` after the first hidden layer.
 fn nnue(words: &[&str]) -> Result<NnueConfig, String> {
+    let (words, reglu) = match words.iter().position(|w| *w == "reglu") {
+        Some(i) => match &words[i + 1..] {
+            [width] => (
+                &words[..i],
+                Some(
+                    width
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|&w| w > 0)
+                        .ok_or_else(|| format!("reglu needs a positive width, got {width:?}"))?,
+                ),
+            ),
+            _ => return Err("reglu takes exactly one width, e.g. `reglu 176`".into()),
+        },
+        None => (words, None),
+    };
     if let Some(extra) = words.get(4) {
         return Err(format!("unexpected argument {extra:?} after layers"));
     }
@@ -117,7 +134,8 @@ fn nnue(words: &[&str]) -> Result<NnueConfig, String> {
         .with_d_embed(num(words, 0, "d_embed", d.d_embed)?)
         .with_d_acc(num(words, 1, "d_acc", d.d_acc)?)
         .with_d_hidden(num(words, 2, "d_hidden", d.d_hidden)?)
-        .with_layers(num(words, 3, "layers", d.layers)?);
+        .with_layers(num(words, 3, "layers", d.layers)?)
+        .with_reglu(reglu);
     if cfg.d_embed == 0 || cfg.d_acc == 0 || cfg.d_hidden == 0 || cfg.layers == 0 {
         return Err("nnue sizes must be positive".into());
     }
@@ -167,11 +185,17 @@ impl fmt::Display for ModelSpec {
                 "cell-v2 (d_model {}, {} layers, {} heads)",
                 cfg.body.d_model, cfg.body.n_layers, cfg.body.n_heads
             ),
-            ModelSpec::Nnue(cfg) => write!(
-                f,
-                "nnue (d_embed {}, d_acc {}, d_hidden {}, {} layers)",
-                cfg.d_embed, cfg.d_acc, cfg.d_hidden, cfg.layers
-            ),
+            ModelSpec::Nnue(cfg) => {
+                write!(
+                    f,
+                    "nnue (d_embed {}, d_acc {}, d_hidden {}, {} layers",
+                    cfg.d_embed, cfg.d_acc, cfg.d_hidden, cfg.layers
+                )?;
+                match cfg.reglu {
+                    None => write!(f, ")"),
+                    Some(d_ff) => write!(f, ", ReGLU {d_ff})"),
+                }
+            }
         }
     }
 }
@@ -354,6 +378,12 @@ mod tests {
         }
         assert!(ModelSpec::parse(&["nnue", "32", "512", "512", "0"]).is_err());
         assert!(ModelSpec::parse(&["nnue", "1", "2", "3", "4", "5"]).is_err());
+        match ModelSpec::parse(&["nnue", "64", "512", "128", "4", "reglu", "176"]).unwrap() {
+            ModelSpec::Nnue(cfg) => assert_eq!((cfg.layers, cfg.reglu), (4, Some(176))),
+            other => panic!("parsed {other}"),
+        }
+        assert!(ModelSpec::parse(&["nnue", "reglu"]).is_err());
+        assert!(ModelSpec::parse(&["nnue", "reglu", "0"]).is_err());
     }
 
     #[test]

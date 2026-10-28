@@ -117,6 +117,10 @@ pub struct Weights {
 impl Weights {
     pub fn from_model(model: &Nnue) -> Self {
         let config = model.config();
+        assert!(
+            config.reglu.is_none(),
+            "the Haskell export has residual hidden layers only, not the ReGLU blocks of this model"
+        );
         let d_embed = config.d_embed;
         let mix = Dense::from_linear(&model.mix);
         let mix_t = mix.weight.transposed(); // [9 * d_embed, d_acc] again

@@ -311,9 +311,15 @@ pub struct NnueConfig {
     /// Width of the hidden layers.
     #[config(default = 32)]
     pub d_hidden: usize,
-    /// Hidden layers: one from the accumulator, the rest residual.
+    /// Hidden layers: one from the accumulator, the rest residual layers or ReGLU blocks.
     #[config(default = 2)]
     pub layers: usize,
+    /// Inner width of the layers after the first as ReGLU blocks,
+    /// `h <- h + W_down (ReLU(W_gate h + b) * (W_up h + b)) + b` with `W_gate` and `W_up`
+    /// mapping to this width (see [`ReGlu`]); `None` keeps residual layers
+    /// `h <- ReLU(h + W h + b)`. An `Option` so that specs saved before it existed, which lack
+    /// the field, load as residual networks.
+    pub reglu: Option<usize>,
 }
 
 impl Default for NnueConfig {
@@ -327,8 +333,16 @@ impl NnueConfig {
         assert!(self.layers >= 1, "at least one hidden layer");
         let normal = |std: f64| Initializer::Normal { mean: 0.0, std };
         let mut hidden = vec![LinearConfig::new(self.d_acc, self.d_hidden).init(device)];
+        let mut glu = Vec::new();
         for _ in 1..self.layers {
-            hidden.push(LinearConfig::new(self.d_hidden, self.d_hidden).init(device));
+            match self.reglu {
+                Some(d_ff) => glu.push(ReGlu {
+                    gate: LinearConfig::new(self.d_hidden, d_ff).init(device),
+                    up: LinearConfig::new(self.d_hidden, d_ff).init(device),
+                    down: LinearConfig::new(d_ff, self.d_hidden).init(device),
+                }),
+                None => hidden.push(LinearConfig::new(self.d_hidden, self.d_hidden).init(device)),
+            }
         }
         Nnue {
             config: self.clone(),
@@ -343,6 +357,7 @@ impl NnueConfig {
                 .with_initializer(normal(0.02))
                 .init(device),
             hidden,
+            glu,
             value: LinearConfig::new(self.d_hidden, Verdict::ALL.len()).init(device),
             value_skip: LinearConfig::new(self.d_acc, Verdict::ALL.len())
                 .with_bias(false)
@@ -358,6 +373,24 @@ impl NnueConfig {
     }
 }
 
+/// A gated hidden block: `h + W_down (ReLU(W_gate h + b) * (W_up h + b)) + b`, the ReLU-gated
+/// linear unit of Shazeer's "GLU variants" (ReGLU) on a residual connection. Unlike the
+/// residual layers, the stream itself is not rectified, so it carries negative values on.
+#[derive(Module, Debug)]
+pub struct ReGlu {
+    gate: Linear,
+    up: Linear,
+    down: Linear,
+}
+
+impl ReGlu {
+    /// The block's branch, to add to `h`.
+    fn forward(&self, h: Tensor<2>) -> Tensor<2> {
+        self.down
+            .forward(relu(self.gate.forward(h.clone())) * self.up.forward(h))
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct Nnue {
     #[module(skip)]
@@ -370,7 +403,10 @@ pub struct Nnue {
     pub(crate) forced_mix: Linear,
     /// `[FEATURE_ROWS, d_acc]`.
     pub(crate) features: Embedding,
+    /// The first hidden layer, then the residual layers when `reglu` is `None`.
     pub(crate) hidden: Vec<Linear>,
+    /// The layers after the first when `reglu` is set.
+    pub(crate) glu: Vec<ReGlu>,
     pub(crate) value: Linear,
     pub(crate) value_skip: Linear,
     pub(crate) policy: Linear,
@@ -389,8 +425,12 @@ impl Nnue {
     /// the value heads and the policy over all 81 moves.
     pub fn folded_macs(&self) -> usize {
         let c = &self.config;
+        let later = match c.reglu {
+            None => c.d_hidden * c.d_hidden,
+            Some(d_ff) => 3 * c.d_hidden * d_ff,
+        };
         c.d_acc * c.d_hidden
-            + (c.layers - 1) * c.d_hidden * c.d_hidden
+            + (c.layers - 1) * later
             + c.d_hidden * 3
             + c.d_acc * 3
             + c.d_hidden * MOVES
@@ -438,6 +478,9 @@ impl Nnue {
         let mut h = relu(self.hidden[0].forward(acc.clone()));
         for layer in &self.hidden[1..] {
             h = relu(h.clone() + layer.forward(h));
+        }
+        for block in &self.glu {
+            h = h.clone() + block.forward(h);
         }
 
         let wdl = self.value.forward(h.clone()) + self.value_skip.forward(acc);
@@ -769,18 +812,12 @@ mod tests {
         assert_eq!(ids[2 * IDS_PER_BOARD + 1], (CELL_BASE + 2) as i32);
     }
 
-    /// The folded network computes what the network does, up to rounding, on positions from
-    /// random games (forced and free moves, decided boards).
-    #[test]
-    fn folded_network_matches_the_network() {
+    /// The folded network computes what the network `config` builds does, up to rounding, on
+    /// positions from random games (forced and free moves, decided boards).
+    fn folded_matches(config: NnueConfig) {
         let _device = crate::nn::device_lock();
         let device = BackendKind::preferred().device();
-        let model = NnueConfig::new()
-            .with_d_embed(16)
-            .with_d_acc(32)
-            .with_d_hidden(16)
-            .with_layers(2)
-            .init(&device);
+        let model = config.init(&device);
         let mut rng = SmallRng::seed_from_u64(5);
         let mut states = Vec::new();
         for _ in 0..8 {
@@ -802,6 +839,42 @@ mod tests {
                 "logit {i}: {e} vs {f}"
             );
         }
+    }
+
+    fn small() -> NnueConfig {
+        NnueConfig::new()
+            .with_d_embed(16)
+            .with_d_acc(32)
+            .with_d_hidden(16)
+            .with_layers(2)
+    }
+
+    #[test]
+    fn folded_network_matches_the_network() {
+        folded_matches(small());
+    }
+
+    #[test]
+    fn folded_reglu_network_matches_the_network() {
+        folded_matches(small().with_layers(3).with_reglu(Some(24)));
+    }
+
+    #[test]
+    fn reglu_shapes_macs_and_old_specs() {
+        let device = BackendKind::preferred().device();
+        let _lock = crate::nn::device_lock();
+        let model = small().with_layers(3).with_reglu(Some(24)).init(&device);
+        assert_eq!(model.hidden.len(), 1);
+        assert_eq!(model.glu.len(), 2);
+        assert_eq!(
+            model.folded_macs(),
+            32 * 16 + 2 * 3 * 16 * 24 + 16 * 3 + 32 * 3 + 16 * 81
+        );
+        // Specs saved before the option existed load as residual networks.
+        let old: NnueConfig =
+            serde_json::from_str(r#"{"d_embed":64,"d_acc":512,"d_hidden":128,"layers":4}"#)
+                .expect("an old spec parses");
+        assert_eq!(old.reglu, None);
     }
 
     #[test]
