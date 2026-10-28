@@ -127,9 +127,34 @@
   .steps li span { font-weight: 600; }
   .steps code { font-family: var(--font-mono); font-size: 0.9em; overflow-wrap: anywhere; }
   .note { font-size: 14px; color: var(--muted); }
+  .panel { display: flex; flex-direction: column; gap: 28px; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--line); }
+  .tabs button {
+    font: 500 14px/1 var(--font-body);
+    color: var(--muted);
+    background: none;
+    border: 1px solid transparent;
+    border-bottom: none;
+    border-radius: 6px 6px 0 0;
+    padding: 10px 14px;
+    cursor: pointer;
+    margin-bottom: -1px;
+  }
+  .tabs button[aria-selected="true"] {
+    color: var(--fg);
+    background: var(--panel);
+    border-color: var(--line);
+  }
+  .tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .planned { color: var(--accent); font-weight: 600; }
 </style>
 
 <main>
+  <nav class="tabs" role="tablist" aria-label="Network design">
+    <button role="tab" id="tab-nnue" aria-controls="panel-nnue" aria-selected="true">NNUE (current)</button>
+    <button role="tab" id="tab-nnue-v2" aria-controls="panel-nnue-v2" aria-selected="false">nnue-v2 with gated heads</button>
+  </nav>
+  <div class="panel" id="panel-nnue" role="tabpanel" aria-labelledby="tab-nnue">
   <header>
     <span class="eyebrow">brut3 · nn::nnue · medium net</span>
     <h1>NNUE 64·512·128·4</h1>
@@ -389,4 +414,161 @@
     </div>
     <p class="note">The Haskell export ships the same 1,588,484 weights as int16 (3,176,968 bytes). Most of them sit in tables that an evaluation only reads a few rows of: the content, feature and policy tables.</p>
   </section>
+  </div>
+
+  <div class="panel" id="panel-nnue-v2" role="tabpanel" aria-labelledby="tab-nnue-v2" hidden>
+  <header>
+    <span class="eyebrow">brut3 · nn::nnue_v2 · reworked trunk and heads</span>
+    <h1>nnue-v2 64·512·96·4 · reglu 96</h1>
+    <p>The same tables and accumulator as the NNUE, then an unrectified projection that gates its first layer, ReGLU blocks, and heads in which the later layers decide how much the shortcut terms count. This is the shape of the model trained as <code>nnue-v2-64-512-96-4-reglu-96</code>, about as costly per evaluation as the medium NNUE.</p>
+    <p class="note"><span class="planned">Status:</span> the trunk (projection, gated layer, ReGLU blocks, optional ReZero) is implemented as <code>nnue-v2 E A H L reglu D [rezero]</code>. The gated heads, the convex value mix and the gated policy tables, are the planned <code>mix</code> option and not built yet; the trained model has the NNUE's heads.</p>
+    <div class="dims">
+      <span>embedding <b>64</b></span>
+      <span>accumulator <b>512</b></span>
+      <span>hidden <b>96</b></span>
+      <span>layers <b>4</b> (projection + gated + 2 ReGLU)</span>
+      <span>parameters with mix <b>1,595,895</b></span>
+      <span>multiply-adds after folding <b>134,304</b></span>
+    </div>
+  </header>
+
+  <section>
+    <h2>One evaluation, with the planned heads</h2>
+    <figure>
+      <div class="scroll">
+        <svg class="diagram" viewBox="0 0 1240 470" role="img" aria-label="The accumulator from the NNUE's tables goes through an unrectified projection to 96; a first layer gated by the projection's own ReLU and two ReGLU blocks update the stream; the value head mixes its own logits with the accumulator skip through a learned gate, and the policy head adds the global map of the stream to the board tables, each scaled by a gate the stream computes.">
+          <defs>
+            <marker id="v2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0 0 L10 5 L0 10 z"/></marker>
+            <marker id="v2m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head m" d="M0 0 L10 5 L0 10 z"/></marker>
+          </defs>
+
+          <rect class="zone" x="858" y="26" width="376" height="418" rx="6"/>
+          <text class="lbl a" x="1046" y="18" text-anchor="middle">the planned mix heads</text>
+
+          <rect class="box acc" x="16" y="150" width="170" height="180" rx="4"/>
+          <text class="t" x="28" y="172">First layer</text>
+          <text class="s" x="28" y="190">as in the NNUE:</text>
+          <text class="s" x="28" y="206">tables, Σ, ReLU</text>
+          <text class="big" x="28" y="244">acc</text>
+          <text class="n" x="28" y="266">512</text>
+          <text class="s" x="28" y="300">folded for inference</text>
+          <text class="s" x="28" y="316">into one table</text>
+
+          <rect class="box" x="226" y="200" width="150" height="80" rx="4"/>
+          <text class="t" x="238" y="220">Projection</text>
+          <text class="n" x="238" y="240">h₀ = W₁·acc + b₁</text>
+          <text class="s" x="238" y="258">96 wide, no ReLU</text>
+
+          <rect class="box" x="416" y="160" width="190" height="160" rx="4"/>
+          <text class="t" x="428" y="180">Gated layer</text>
+          <text class="s" x="428" y="200">gate: ReLU(h₀) itself</text>
+          <text class="s" x="428" y="216">up: W_up·h₀ + b</text>
+          <text class="s" x="428" y="232">down: W_down, no bias</text>
+          <text class="n" x="428" y="258">h = h₀ + α₁·W_down·</text>
+          <text class="n" x="428" y="276">  (ReLU(h₀) ⊙ up)</text>
+          <text class="s" x="428" y="302">no gate matrix, width 96</text>
+
+          <rect class="box" x="646" y="160" width="180" height="160" rx="4"/>
+          <text class="t" x="658" y="180">ReGLU × 2</text>
+          <text class="s" x="658" y="200">gate: ReLU(W_g·h + b)</text>
+          <text class="s" x="658" y="216">up: W_u·h + b</text>
+          <text class="s" x="658" y="232">width 96, no down bias</text>
+          <text class="n" x="658" y="258">h ← h + αₗ·W_d·</text>
+          <text class="n" x="658" y="276">  (gate ⊙ up)</text>
+          <text class="s" x="658" y="302">α: ReZero, else 1</text>
+
+          <line class="wire" x1="186" y1="240" x2="224" y2="240" marker-end="url(#v2a)"/>
+          <text class="lbl" x="205" y="233" text-anchor="middle">acc</text>
+          <line class="wire" x1="376" y1="240" x2="414" y2="240" marker-end="url(#v2a)"/>
+          <text class="lbl" x="395" y="233" text-anchor="middle">h₀</text>
+          <line class="wire" x1="606" y1="240" x2="644" y2="240" marker-end="url(#v2a)"/>
+          <text class="lbl" x="625" y="233" text-anchor="middle">h</text>
+
+          <rect class="box" x="870" y="40" width="354" height="130" rx="4"/>
+          <text class="t" x="884" y="62">Value head · 96 → 4</text>
+          <text class="s" x="884" y="84">logits v = V·h + b, and z: gate g = σ(z)</text>
+          <text class="n" x="884" y="110">wdl = (1 − g)·v + g·S·acc</text>
+          <text class="s" x="884" y="134">a convex mix: the stream decides how much</text>
+          <text class="s" x="884" y="150">the accumulator's linear view counts</text>
+
+          <rect class="box" x="870" y="210" width="354" height="196" rx="4"/>
+          <text class="t" x="884" y="232">Policy head</text>
+          <text class="n" x="884" y="254">P·h + b (96 → 81)</text>
+          <text class="s" x="884" y="276">gates γ, γ′ = σ(U·h + b), 96 → 9 + 9</text>
+          <text class="n" x="884" y="302">+ γ_b · L[c_b]</text>
+          <text class="s" x="884" y="320">each board's 9 cell logits, gated per board</text>
+          <text class="n" x="884" y="346">+ γ′_s · T[c_s]</text>
+          <text class="s" x="884" y="364">the send logit of board s, on square s of</text>
+          <text class="s" x="884" y="380">every board, gated per destination</text>
+          <text class="s" x="884" y="398">→ 81 move logits</text>
+
+          <polyline class="wire" points="826,240 846,240 846,110 868,110" marker-end="url(#v2a)"/>
+          <polyline class="wire" points="826,240 846,240 846,300 868,300" marker-end="url(#v2a)"/>
+          <text class="lbl" x="838" y="232" text-anchor="middle">h</text>
+          <polyline class="wire" points="101,150 101,60 868,60" marker-end="url(#v2a)"/>
+          <text class="lbl" x="480" y="53" text-anchor="middle">acc (512), for the value's skip S·acc (512 → 3)</text>
+          <polyline class="wire dash" points="101,330 101,456 1046,456 1046,408" marker-end="url(#v2m)"/>
+          <text class="lbl" x="560" y="449" text-anchor="middle">content ids c₀ … c₈, for the local and send tables</text>
+        </svg>
+      </div>
+      <figcaption>The accumulator is the NNUE's, folded the same way for inference. The projection to 96 is left unrectified, so the first layer can use its ReLU as the gate of a GLU and carry the raw projection on the skip. With <code>rezero</code> every layer after the projection scales its branch by a learned α starting at 0. In the heads, nothing reaches the output unconditionally any more: the value's linear skip from the accumulator and the policy's content tables each pass through a gate the stream computes, so the later layers can turn them down or off per position.</figcaption>
+    </figure>
+    <ol class="steps">
+      <li><span>Accumulator, 512:</span> as in the NNUE, <code>acc = ReLU(Σ_k W_k·t_k + b_mix + F·t_f + Σ_j R[f_j])</code>.</li>
+      <li><span>Projection, 96:</span> <code>h₀ = W₁·acc + b₁</code>, no ReLU.</li>
+      <li><span>Gated layer:</span> <code>h = h₀ + α₁·W_down·(ReLU(h₀) ⊙ (W_up·h₀ + b))</code>, <code>W_down</code> without bias. Without <code>reglu</code> it is <code>h = ReLU(h₀ + α₁·(W·ReLU(h₀) + b))</code> and the later layers residual.</li>
+      <li><span>ReGLU blocks:</span> <code>h ← h + α_l·W_d·(ReLU(W_g·h + b) ⊙ (W_u·h + b))</code> for l = 2, 3, width 96, <code>W_d</code> without bias. Each α is 1 unless <code>rezero</code> makes it a learned scalar starting at 0.</li>
+      <li><span>Value (planned):</span> <code>[v, z] = V·h + b</code>, <code>g = σ(z)</code>, <code>wdl = (1 − g)·v + g·S·acc</code>.</li>
+      <li><span>Policy (planned):</span> <code>[γ, γ′] = σ(U·h + b)</code>, <code>p[b·9 + s] = (P·h + b_P)[b·9 + s] + γ_b·L[c_b][s] + γ′_s·T[c_s]</code>.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Parameters, with the planned heads</h2>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr><th>Component</th><th>Shape</th><th class="num">Parameters</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>First layer (content, mix, forced_mix, feature tables)</td><td><code>as in the NNUE</code></td><td class="num">1,349,952</td></tr>
+          <tr><td>Projection</td><td><code>512 × 96 + 96</code></td><td class="num">49,248</td></tr>
+          <tr><td>Gated layer (up, down)</td><td><code>96 × 96 + 96, 96 × 96</code></td><td class="num">18,528</td></tr>
+          <tr><td>ReGLU × 2 (gate, up, down)</td><td><code>2 × (2 × (96 × 96 + 96) + 96 × 96)</code></td><td class="num">55,680</td></tr>
+          <tr><td>Value with gate</td><td><code>96 × 4 + 4</code></td><td class="num">388</td></tr>
+          <tr><td>Value skip</td><td><code>512 × 3</code></td><td class="num">1,536</td></tr>
+          <tr><td>Policy</td><td><code>96 × 81 + 81</code></td><td class="num">7,857</td></tr>
+          <tr><td>Policy gates</td><td><code>96 × 18 + 18</code></td><td class="num">1,746</td></tr>
+          <tr><td>Local policy table</td><td><code>11,096 × 9</code></td><td class="num">99,864</td></tr>
+          <tr><td>Send policy table</td><td><code>11,096 × 1</code></td><td class="num">11,096</td></tr>
+          <tr class="total"><td>Total</td><td></td><td class="num">1,595,895</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">With <code>rezero</code>, three more scalars. Per evaluation after folding: projection 49,152, gated layer 18,432, ReGLU blocks 55,296, heads 11,424 (value 384, skip 1,536, policy 7,776, gates 1,728): 134,304 multiply-adds, against 126,976 for the medium NNUE.</p>
+  </section>
+  </div>
 </main>
+
+<script>
+  (() => {
+    const tabs = [...document.querySelectorAll('[role="tab"]')];
+    function show(id) {
+      for (const tab of tabs) {
+        const on = tab.id === "tab-" + id;
+        tab.setAttribute("aria-selected", String(on));
+        document.getElementById(tab.getAttribute("aria-controls")).hidden = !on;
+      }
+    }
+    for (const tab of tabs) {
+      tab.addEventListener("click", () => {
+        const id = tab.id.slice(4);
+        show(id);
+        if (location.hash !== "#" + id) location.hash = id;
+      });
+    }
+    const fromHash = () => show(location.hash === "#nnue-v2" ? "nnue-v2" : "nnue");
+    window.addEventListener("hashchange", fromHash);
+    fromHash();
+  })();
+</script>
