@@ -98,9 +98,13 @@ enum Command {
         /// Backend to load the model with (default: fastest compiled in).
         #[arg(long)]
         backend: Option<String>,
-        /// Reference positions to emit for the port's tests.
+        /// Reference positions to emit for the port's tests (at most 129).
         #[arg(long, default_value_t = 16)]
         positions: usize,
+        /// Positions from seeded random games that the reported quantisation error is
+        /// measured over.
+        #[arg(long, default_value_t = 1024)]
+        error_positions: usize,
         /// Seed of the random games the reference positions come from.
         #[arg(long, default_value_t = 1)]
         seed: u64,
@@ -628,6 +632,7 @@ fn main() -> ExitCode {
             module,
             backend,
             positions,
+            error_positions,
             seed,
             lookups,
             vec_extra,
@@ -643,6 +648,7 @@ fn main() -> ExitCode {
             module,
             backend.as_deref(),
             positions,
+            error_positions,
             seed,
             lookups,
             vec_extra
@@ -1496,6 +1502,7 @@ fn export(
     module: String,
     backend: Option<&str>,
     positions: usize,
+    error_positions: usize,
     seed: u64,
     lookups: usize,
     vec_flags: Vec<String>,
@@ -1586,6 +1593,7 @@ fn export(
     let opts = ExportOptions {
         prefix: module,
         positions,
+        error_positions,
         seed,
         lookups,
         vec_extra,
@@ -1604,10 +1612,11 @@ fn export(
     }
     if weights.is_some() {
         eprintln!(
-            "weights: {} bytes in {} literals; quantisation error over the reference positions \
+            "weights: {} bytes in {} literals; quantisation error over {} positions \
              (largest / rms): wdl {:.2e} / {:.2e}, value {:.2e} / {:.2e}, policy {:.2e} / {:.2e}",
             report.stream_bytes,
             report.chunks,
+            report.error_positions,
             report.wdl_error,
             report.wdl_rms,
             report.value_error,

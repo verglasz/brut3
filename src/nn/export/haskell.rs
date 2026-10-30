@@ -48,8 +48,10 @@ use crate::nn::nnue::{
 pub struct ExportOptions {
     /// Module prefix and directory name, e.g. `Gen` for `Gen/Spec.hs`.
     pub prefix: String,
-    /// Reference positions to emit.
+    /// Reference positions to emit (at most 129: see [`reference_positions`]).
     pub positions: usize,
+    /// Positions the quantisation error is measured over (see [`error_positions`]).
+    pub error_positions: usize,
     /// Seed of the random games the reference positions come from.
     pub seed: u64,
     /// Characters of base64 per weight string literal.
@@ -71,6 +73,7 @@ impl Default for ExportOptions {
         Self {
             prefix: "Gen".into(),
             positions: 16,
+            error_positions: 1024,
             seed: 1,
             chunk: 64 * 1024,
             lookups: 40,
@@ -102,6 +105,8 @@ pub struct Report {
     pub wdl_rms: f32,
     pub value_rms: f32,
     pub policy_rms: f32,
+    /// Positions the deviations are over.
+    pub error_positions: usize,
     /// The book export, if one was written.
     pub book: Option<super::book::BookStats>,
 }
@@ -171,7 +176,9 @@ pub fn write_all(
             squares[k].0 += f64::from(d) * f64::from(d);
             squares[k].1 += 1;
         };
-        for (_, state) in &positions {
+        let measured = error_positions(opts.seed, opts.error_positions);
+        report.error_positions = measured.len();
+        for state in &measured {
             let exact = weights.evaluate(state);
             let other = rounded.evaluate(state);
             for (a, b) in exact.wdl.iter().zip(&other.wdl) {
@@ -547,6 +554,26 @@ pub fn spec_module(weights: &Weights, prefix: &str) -> String {
     let _ = writeln!(s, "foldedMacs = {}", weights.folded_macs());
     bundle_body_end(&mut s);
     s
+}
+
+/// `n` positions for measuring the quantisation error: one every few plies (from the fourth)
+/// along seeded random games, as many games as it takes.
+pub fn error_positions(seed: u64, n: usize) -> Vec<BitState> {
+    let mut rng = SmallRng::seed_from_u64(crate::seed::derive_seed(seed, 0x9a7e));
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        let mut state = BitState::initial();
+        let mut ply = 0;
+        while !state.is_terminal() && out.len() < n {
+            if ply % 5 == 3 {
+                out.push(state);
+            }
+            let legal = state.legal_moves_vec();
+            state.apply(legal[rng.random_range(0..legal.len())].into());
+            ply += 1;
+        }
+    }
+    out
 }
 
 /// Named positions for the reference vectors: the initial position, then a mix of early,
