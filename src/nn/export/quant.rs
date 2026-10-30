@@ -59,6 +59,22 @@ pub const INT8_STEPS_PER_OCTAVE: f32 = 8.0;
 /// scale still covers the row's largest value in 127 steps (so at least about 116 are used),
 /// and `e = 255` for a row of zeros.
 pub fn quantise_int8(data: &[f32], cols: usize) -> (Vec<u8>, f32, Vec<f32>) {
+    quantise_int8_with(data, cols, None)
+}
+
+/// [`quantise_int8`], rounding each row GPTQ's way when `factor` is given: the upper Cholesky
+/// factor `U` (`cols x cols`, `U^T U = H^-1`) of the matrix `H` that weighs a row's error
+/// `e` as `e^T H e` (the error as the layers that read the row see it). The row's values are
+/// rounded in order, each one's rounding error spread over the values not yet rounded so that
+/// they make up for it under `H` (Frantar et al., "GPTQ").
+pub fn quantise_int8_with(
+    data: &[f32],
+    cols: usize,
+    factor: Option<&[f64]>,
+) -> (Vec<u8>, f32, Vec<f32>) {
+    if let Some(u) = factor {
+        assert_eq!(u.len(), cols * cols, "a factor for rows of {cols}");
+    }
     let max = data.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
     let base = if max > 0.0 { max / 127.0 } else { 1.0 };
     let mut bytes = Vec::with_capacity(data.len() + data.len() / cols.max(1));
@@ -74,13 +90,71 @@ pub fn quantise_int8(data: &[f32], cols: usize) -> (Vec<u8>, f32, Vec<f32>) {
         };
         let scale = int8_row_scale(base, e);
         bytes.push(e);
-        for &x in row {
-            let q = (x / scale).round().clamp(-127.0, 127.0) as i8;
+        let mut w: Vec<f64> = row.iter().map(|&x| f64::from(x)).collect();
+        for j in 0..cols {
+            let q = (w[j] / f64::from(scale)).round().clamp(-127.0, 127.0);
+            if let Some(u) = factor {
+                let error = (w[j] - q * f64::from(scale)) / u[j * cols + j];
+                for k in j + 1..cols {
+                    w[k] -= error * u[j * cols + k];
+                }
+            }
+            let q = q as i8;
             bytes.push(q as u8);
             values.push(f32::from(q) * scale);
         }
     }
     (bytes, base, values)
+}
+
+/// The lower Cholesky factor `L` of a symmetric positive definite `n x n` matrix
+/// (`L L^T = a`), row-major.
+fn cholesky(a: &[f64], n: usize) -> Vec<f64> {
+    let mut l = vec![0.0; n * n];
+    for i in 0..n {
+        for j in 0..=i {
+            let dot: f64 = (0..j).map(|k| l[i * n + k] * l[j * n + k]).sum();
+            l[i * n + j] = match i == j {
+                true => (a[i * n + i] - dot).max(f64::MIN_POSITIVE).sqrt(),
+                false => (a[i * n + j] - dot) / l[j * n + j],
+            };
+        }
+    }
+    l
+}
+
+/// GPTQ's factor for rows weighed by `h` (`n x n`, see [`quantise_int8_with`]): the upper
+/// Cholesky factor of `(h + damping)^-1`, the damping 1% of `h`'s mean diagonal.
+pub fn gptq_factor(h: &[f64], n: usize) -> Vec<f64> {
+    let damping = 0.01 * (0..n).map(|i| h[i * n + i]).sum::<f64>() / n as f64;
+    let mut h = h.to_vec();
+    for i in 0..n {
+        h[i * n + i] += damping;
+    }
+    // The inverse from the Cholesky factor: L Y = I, then L^T X = Y.
+    let l = cholesky(&h, n);
+    let mut inverse = vec![0.0; n * n];
+    for c in 0..n {
+        let mut y = vec![0.0; n];
+        for i in 0..n {
+            let target = if i == c { 1.0 } else { 0.0 };
+            let dot: f64 = (0..i).map(|k| l[i * n + k] * y[k]).sum();
+            y[i] = (target - dot) / l[i * n + i];
+        }
+        for i in (0..n).rev() {
+            let dot: f64 = (i + 1..n).map(|k| l[k * n + i] * inverse[k * n + c]).sum();
+            inverse[i * n + c] = (y[i] - dot) / l[i * n + i];
+        }
+    }
+    // The upper factor U of the inverse (U^T U = inverse) is the lower one transposed.
+    let lower = cholesky(&inverse, n);
+    let mut upper = vec![0.0; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            upper[i * n + j] = lower[j * n + i];
+        }
+    }
+    upper
 }
 
 /// The scale of an int8 row with exponent byte `e`, as the Haskell decoder computes it.
@@ -130,20 +204,52 @@ impl Weights {
     /// The weights after the round trip of the export's quantisation (int8 for the arrays
     /// `int8` covers, int16 for the others): what the Haskell evaluator computes with.
     pub fn dequantised(&self, int8: &Int8Arrays) -> Self {
+        let factor = self.content_factor();
         self.map_arrays(|a| match int8.covers(&a.name) {
-            true => quantise_int8(a.data, a.cols).2,
+            true => quantise_int8_with(a.data, a.cols, self.rounding(&a.name, &factor)).2,
             false => dequantise(a.data),
         })
     }
 
+    /// GPTQ's factor for the content arrays (see [`quantise_int8_with`]): a token's error
+    /// reaches the accumulator through every board's slice `W` of the first layer and the
+    /// forced board's, so `H` is the sum of their `W^T W`. (Weighing the accumulator's
+    /// dimensions further by the first hidden layer and the value's skip that read them
+    /// measured no better: the largest output deviations over 256 reference positions went
+    /// from 0.012 / 0.015 / 0.016 for win/draw/loss, value and policy to 0.016 / 0.016 /
+    /// 0.016, against 0.021 / 0.022 / 0.016 rounding to nearest.)
+    fn content_factor(&self) -> Vec<f64> {
+        let n = self.d_embed;
+        let mut h = vec![0.0f64; n * n];
+        for w in self.mix.iter().chain(std::iter::once(&self.forced)) {
+            for r in 0..w.rows {
+                let row = w.row(r);
+                for i in 0..n {
+                    let x = f64::from(row[i]);
+                    for j in 0..n {
+                        h[i * n + j] += x * f64::from(row[j]);
+                    }
+                }
+            }
+        }
+        gptq_factor(&h, n)
+    }
+
+    /// How array `name` is rounded to int8: GPTQ's way for the content arrays.
+    fn rounding<'f>(&self, name: &str, content: &'f [f64]) -> Option<&'f [f64]> {
+        name.starts_with("content").then_some(content)
+    }
+
     /// Every array quantised, in [`Weights::arrays`] order.
     pub fn quantised(&self, int8: &Int8Arrays) -> Vec<QuantisedArray> {
+        let factor = self.content_factor();
         self.arrays()
             .into_iter()
             .map(|a| {
                 let (scale, bytes) = match int8.covers(&a.name) {
                     true => {
-                        let (bytes, base, _) = quantise_int8(a.data, a.cols);
+                        let rounding = self.rounding(&a.name, &factor);
+                        let (bytes, base, _) = quantise_int8_with(a.data, a.cols, rounding);
                         (base, bytes)
                     }
                     false => {
