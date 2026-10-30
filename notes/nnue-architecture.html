@@ -141,6 +141,8 @@
   }
   .controls label { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; font-size: 13px; color: var(--muted); }
   .controls input { grid-column: 1 / -1; width: 100%; accent-color: var(--accent); }
+  .controls label.check { grid-template-columns: auto 1fr; align-items: center; align-self: end; }
+  .controls label.check input { grid-column: 1; width: auto; margin: 0; }
   .controls output { font: 500 13px var(--font-mono); color: var(--fg); font-variant-numeric: tabular-nums; }
   .controls .note { grid-column: 1 / -1; font-size: 12px; }
   .tabs { display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--line); }
@@ -188,6 +190,7 @@
     <label><span>accumulator</span><input type="range" data-key="a"><output></output></label>
     <label><span>hidden</span><input type="range" data-key="h"><output></output></label>
     <label><span>layers</span><input type="range" data-key="l"><output></output></label>
+    <label class="check"><input type="checkbox" data-key="lines"><span>small-board lines</span></label>
     <p class="note">The sliders recompute the title, sizes and parameter table; the diagrams keep the default sizes in their labels.</p>
   </div>
 
@@ -234,6 +237,7 @@
           <text class="s" x="274" y="148">theirs), padding</text>
           <text class="s" x="274" y="172">a token is the sum</text>
           <text class="s" x="274" y="188">of its 10 rows</text>
+          <text class="s" x="274" y="204">(+ 8 line rows: lines)</text>
 
           <rect class="box" x="262" y="300" width="176" height="118" rx="4"/>
           <text class="t" x="274" y="320">Feature table</text>
@@ -331,6 +335,7 @@
     </figure>
     <ol class="steps">
       <li><span>Board tokens, 64 each:</span> <code>t_k = E[c_k] + Σ_i E[cell_k,i]</code> for the nine boards, and <code>t_f</code> the same for the forced board (or the “none” token).</li>
+      <li><span>Small-board lines, with <code>lines</code>:</span> an open board's token also adds <code>Σ_l Λ[27·l + 9a + 3b + c]</code> over its eight lines, <code>a, b, c</code> the values (0 empty, 1 mine, 2 theirs) of the line's three cells, from a 216 × 64 line table that starts at zero, so a model with lines starts as the same model without them. Every one of these terms depends only on the content, so the inputs stay the same: the line rows fold into the content row, and the export ships whole tokens (or, with <code>rank R</code>, the line table as it is). These are the small board's own rows, columns and diagonals, not the eight big-board lines of the feature table.</li>
       <li><span>Accumulator, 512:</span> <code>acc = ReLU(Σ_k W_k·t_k + b_mix + F·t_f + Σ_j R[f_j])</code>, with <code>W_k</code> the nine 512 × 64 blocks of mix, <code>F</code> = forced_mix (no bias) and <code>R[f_j]</code> the eleven feature rows.</li>
       <li><span>First hidden layer, 128:</span> <code>h = ReLU(W₁·acc + b₁)</code>, <code>W₁</code> 128 × 512.</li>
       <li><span>Three residual layers:</span> <code>h ← ReLU(h + W_l·h + b_l)</code>, each <code>W_l</code> 128 × 128. With the <code>reglu D</code> option instead <code>h ← h + W_down·(ReLU(W_gate·h + b) ⊙ (W_up·h + b)) + b</code>, gate and up D wide.</li>
@@ -443,7 +448,7 @@
     <span class="eyebrow">brut3 · nn::nnue_v2 · reworked trunk and heads</span>
     <h1 id="title-nnue-v2">nnue-v2 64·512·128·4 · reglu 128</h1>
     <p>The same tables and accumulator as the NNUE, then an unrectified projection that gates its first layer, ReGLU blocks, and heads in which the later layers decide how much the shortcut terms count. Drawn at hidden width 128 with ReGLU blocks of width 128; the model trained as <code>nnue-v2-64-512-96-4-reglu-96</code> has the same structure at width 96.</p>
-    <p class="note"><span class="planned">Status:</span> implemented as <code>nnue-v2 E A H L reglu D [rezero]</code>, the gated heads always included. The gates start with zero weights and biases, so every gate starts at ½ whatever the position; weights saved before the gates existed, like the trained <code>nnue-v2-64-512-96-4-reglu-96</code>, load with the gates so and <code>V</code>, its bias, <code>S</code>, <code>L</code> and <code>T</code> doubled, which computes exactly what they did. With <code>rank R</code> the open contents' rows of the content table are R wide (step 1 below), and the export ships them so.</p>
+    <p class="note"><span class="planned">Status:</span> implemented as <code>nnue-v2 E A H L reglu D [rezero]</code>, the gated heads always included. The gates start with zero weights and biases, so every gate starts at ½ whatever the position; weights saved before the gates existed, like the trained <code>nnue-v2-64-512-96-4-reglu-96</code>, load with the gates so and <code>V</code>, its bias, <code>S</code>, <code>L</code> and <code>T</code> doubled, which computes exactly what they did. With <code>rank R</code> the open contents' rows of the content table are R wide (step 1 below), and the export ships them so. Small-board <code>lines</code> work as in the NNUE.</p>
     <div class="dims" id="dims-nnue-v2">
       <span>embedding <b>64</b></span>
       <span>accumulator <b>512</b></span>
@@ -460,6 +465,7 @@
     <label><span>layers</span><input type="range" data-key="l"><output></output></label>
     <label><span>ReGLU width</span><input type="range" data-key="d"><output></output></label>
     <label><span>content rank</span><input type="range" data-key="r"><output></output></label>
+    <label class="check"><input type="checkbox" data-key="lines"><span>small-board lines</span></label>
     <p class="note">The sliders recompute the title, sizes and parameter table; the diagrams keep the default sizes in their labels.</p>
   </div>
 
@@ -480,11 +486,12 @@
           <text class="t" x="28" y="172">First layer</text>
           <text class="s" x="28" y="190">as in the NNUE:</text>
           <text class="s" x="28" y="206">tables, Σ, ReLU</text>
-          <text class="s" x="28" y="224">rank R: open rows R wide</text>
-          <text class="big" x="28" y="244">acc</text>
-          <text class="n" x="28" y="266">512</text>
-          <text class="s" x="28" y="300">folded for inference</text>
-          <text class="s" x="28" y="316">into one table</text>
+          <text class="s" x="28" y="222">rank R: open rows R wide</text>
+          <text class="s" x="28" y="238">lines: + 8 line rows</text>
+          <text class="big" x="28" y="268">acc</text>
+          <text class="n" x="28" y="286">512</text>
+          <text class="s" x="28" y="306">folded for inference</text>
+          <text class="s" x="28" y="322">into one table</text>
 
           <rect class="box" x="226" y="200" width="150" height="80" rx="4"/>
           <text class="t" x="238" y="220">Projection</text>
@@ -621,13 +628,17 @@
     };
     // Fixed table sizes from nnue.rs: compact contents, content-table rows, feature rows.
     const CONTENTS = 11096, CONTENT_ROWS = 11125, OPEN_CONTENTS = 11093, FEATURE_ROWS = 605, MOVES = 81;
-    const DEFAULTS = { nnue: { e: 64, a: 512, h: 128, l: 4 }, "nnue-v2": { e: 64, a: 512, h: 128, l: 4, d: 128, r: 0 } };
+    // Small-board line table: 8 lines × 27 states of their three cells.
+    const LINE_ROWS = 8 * 27;
+    const DEFAULTS = { nnue: { e: 64, a: 512, h: 128, l: 4, lines: false }, "nnue-v2": { e: 64, a: 512, h: 128, l: 4, d: 128, r: 0, lines: false } };
+    const lineRow = (e) => ["Small-board line table", `${LINE_ROWS} × ${e}`, LINE_ROWS * e];
     const n = (x) => x.toLocaleString("en-US");
     const row = (name, shape, count) => `<tr><td>${name}</td><td><code>${shape}</code></td><td class="num">${n(count)}</td></tr>`;
 
-    function nnue({ e, a, h, l }) {
+    function nnue({ e, a, h, l, lines }) {
       const rows = [
         ["Content table", `${n(CONTENT_ROWS)} × ${e}`, CONTENT_ROWS * e],
+        ...(lines ? [lineRow(e)] : []),
         ["mix (board matrices)", `${9 * e} × ${a} + ${a}`, 9 * e * a + a],
         ["forced_mix", `${e} × ${a}`, e * a],
         ["Feature table", `${FEATURE_ROWS} × ${a}`, FEATURE_ROWS * a],
@@ -640,11 +651,12 @@
         ["Send policy table", `${n(CONTENTS)} × 1`, CONTENTS],
       ];
       const macs = a * h + (l - 1) * h * h + 3 * h + 3 * a + MOVES * h;
-      return { rows, macs, title: `NNUE ${e}·${a}·${h}·${l}`,
-        dims: [["embedding", e], ["accumulator", a], ["hidden", h], ["layers", `${l} (1 dense + ${l - 1} residual)`]] };
+      return { rows, macs, title: `NNUE ${e}·${a}·${h}·${l}${lines ? " · lines" : ""}`,
+        dims: [["embedding", e], ["accumulator", a], ["hidden", h], ["layers", `${l} (1 dense + ${l - 1} residual)`],
+          ["small-board lines", lines ? "yes" : "no"]] };
     }
 
-    function v2({ e, a, h, l, d, r }) {
+    function v2({ e, a, h, l, d, r, lines }) {
       const later = l - 2;
       // A rank at or above the embedding width is the full table.
       const rank = r && r < e ? r : 0;
@@ -653,6 +665,7 @@
         rank
           ? [`Content table (rank ${rank})`, `${n(OPEN_CONTENTS)} × ${rank} + ${other} × ${e}`, OPEN_CONTENTS * rank + other * e]
           : ["Content table", `${n(CONTENT_ROWS)} × ${e}`, CONTENT_ROWS * e],
+        ...(lines ? [lineRow(e)] : []),
         ["mix, forced_mix, feature tables", "as in the NNUE", 9 * e * a + a + e * a + FEATURE_ROWS * a],
         ["Projection", `${a} × ${h} + ${h}`, a * h + h],
         ["Gated layer (up, down)", `${h} × ${h} + ${h}, ${h} × ${h}`, 2 * h * h + h],
@@ -666,9 +679,9 @@
       ];
       const parts = { proj: a * h, gated: 2 * h * h, blocks: later * 3 * h * d, heads: 3 * h + 3 * a + MOVES * h + 19 * h };
       const macs = parts.proj + parts.gated + parts.blocks + parts.heads;
-      return { rows, macs, parts, title: `nnue-v2 ${e}·${a}·${h}·${l} · reglu ${d}${rank ? ` · rank ${rank}` : ""}`,
+      return { rows, macs, parts, title: `nnue-v2 ${e}·${a}·${h}·${l} · reglu ${d}${lines ? " · lines" : ""}${rank ? ` · rank ${rank}` : ""}`,
         dims: [["embedding", e], ["accumulator", a], ["hidden", h], ["layers", `${l} (projection + gated + ${later} ReGLU)`], ["ReGLU width", d],
-          ["content rank", rank || "full"]] };
+          ["content rank", rank || "full"], ["small-board lines", lines ? "yes" : "no"]] };
     }
 
     const MEDIUM = nnue(DEFAULTS.nnue).macs;
@@ -694,7 +707,16 @@
     for (const box of document.querySelectorAll(".controls")) {
       const model = box.dataset.model;
       const v = { ...DEFAULTS[model] };
-      for (const input of box.querySelectorAll("input")) {
+      for (const input of box.querySelectorAll('input[type="checkbox"]')) {
+        const key = input.dataset.key;
+        input.id = `${model}-${key}`;
+        input.checked = v[key];
+        input.addEventListener("change", () => {
+          v[key] = input.checked;
+          render(model, v);
+        });
+      }
+      for (const input of box.querySelectorAll('input[type="range"]')) {
         const key = input.dataset.key;
         const steps = model === "nnue-v2" && key === "l" ? STEPS.l.filter((x) => x >= 2) : STEPS[key];
         input.id = `${model}-${key}`;
