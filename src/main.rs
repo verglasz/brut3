@@ -59,6 +59,11 @@ enum Command {
         /// Backend to evaluate on (default: fastest compiled in).
         #[arg(long)]
         backend: Option<String>,
+        /// Evaluate the models with the tables whose export arrays start with one of these
+        /// prefixes on the export's int8 grid (as `export --int8-only` with
+        /// `--nearest-rounding` ships them), to compare networks as they would be exported.
+        #[arg(long, value_delimiter = ',')]
+        int8_only: Vec<String>,
         /// Model stems (`<stem>.bpk` + `<stem>.json`).
         #[arg(required = true, num_args = 1..)]
         models: Vec<std::path::PathBuf>,
@@ -627,12 +632,14 @@ fn main() -> ExitCode {
             validation_fraction,
             seed,
             backend,
+            int8_only,
             models,
         } => evaluate_models(
             &data,
             validation_fraction,
             seed,
             backend.as_deref(),
+            &brut3::nn::export::Int8Arrays(int8_only),
             &models,
         ),
         #[cfg(feature = "nn")]
@@ -1297,6 +1304,7 @@ fn evaluate_models(
     validation_fraction: f32,
     seed: u64,
     backend: Option<&str>,
+    int8: &brut3::nn::export::Int8Arrays,
     models: &[std::path::PathBuf],
 ) -> Result<(), String> {
     use brut3::nn::{AnyModel, BackendKind};
@@ -1343,8 +1351,12 @@ fn evaluate_models(
         );
     };
     row(&baseline, "(baseline)");
+    if !int8.0.is_empty() {
+        println!("(tables {} on the int8 grid)", int8.0.join(","));
+    }
     for path in models {
-        let model = AnyModel::load(path, &device)?;
+        let mut model = AnyModel::load(path, &device)?;
+        model.set_qat(int8);
         row(
             &model.evaluate(&device, &valid.samples),
             &path.display().to_string(),
