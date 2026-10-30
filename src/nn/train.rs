@@ -32,7 +32,7 @@ use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use super::linear::LinearNet;
 use super::model::{MOVES, Model, Verdict, expected_value, legal_mask, most_likely, predict_host};
-use super::train_stats::{LrMetric, StatMetric};
+use super::train_stats::{LossPartMetric, LossParts, LrMetric, StatMetric};
 use crate::agent::{AgentSpec, UtttAgent};
 use crate::game::{BitState, GameState, Move, Outcome, Symmetry};
 
@@ -218,6 +218,42 @@ impl Dataset {
             .map(|s| (s.value_target() - mean).powi(2))
             .sum::<f32>()
             / n
+    }
+
+    /// Always predicting the most common verdict (and the mean win/draw/loss target), the mean
+    /// value, and a uniformly random legal move.
+    pub fn baseline(&self) -> Evaluation {
+        Evaluation {
+            verdict_accuracy: self.baseline_accuracy(),
+            value_mse: self.baseline_mse(),
+            policy_accuracy: self.baseline_policy_accuracy(),
+            wdl_loss: self.baseline_wdl_loss(),
+            policy_loss: self.baseline_policy_loss(),
+        }
+    }
+
+    /// Cross-entropy of always predicting the mean win/draw/loss target, over the samples that
+    /// have one.
+    pub fn baseline_wdl_loss(&self) -> f32 {
+        let targets: Vec<[f32; 3]> = self.samples.iter().filter_map(|s| s.wdl).collect();
+        if targets.is_empty() {
+            return 0.0;
+        }
+        let n = targets.len() as f32;
+        let mean: [f32; 3] = std::array::from_fn(|k| targets.iter().map(|t| t[k]).sum::<f32>() / n);
+        targets.iter().map(|t| cross_entropy(t, &mean)).sum::<f32>() / n
+    }
+
+    /// Cross-entropy of a uniform policy over the legal moves: the mean of their log count.
+    pub fn baseline_policy_loss(&self) -> f32 {
+        if self.is_empty() {
+            return 0.0;
+        }
+        self.samples
+            .iter()
+            .map(|s| (s.state.legal_moves_vec().len() as f32).ln())
+            .sum::<f32>()
+            / self.len() as f32
     }
 
     /// Expected accuracy of picking a legal move uniformly at random.
@@ -586,8 +622,9 @@ pub use super::train_stats::StepOutput;
 /// of the expected value (`p_win - p_loss`) against the scalar value target, and the
 /// cross-entropy between the target move distribution and the legal-masked policy. The
 /// output holds the summed loss, the `[batch, 3]` verdict logits and the `[batch]` verdict
-/// targets, which burn's loss and accuracy metrics read.
-pub fn forward_step<M: Model>(model: &M, batch: Batch<M>) -> ClassificationOutput {
+/// targets, which burn's loss and accuracy metrics read, and the three terms unweighted (see
+/// [`LossParts`](super::train_stats::LossParts)).
+pub fn forward_step<M: Model>(model: &M, batch: Batch<M>) -> (ClassificationOutput, LossParts) {
     let prediction = model.predict(batch.input);
     let n = batch.verdicts.dims()[0];
     // Averaged over the positions that have a win/draw/loss target, so that the term keeps
@@ -596,19 +633,24 @@ pub fn forward_step<M: Model>(model: &M, batch: Batch<M>) -> ClassificationOutpu
     let wdl_loss = (-(log_softmax(prediction.wdl.clone(), 1) * batch.wdl).sum_dim(1)
         * batch.wdl_mask)
         .sum()
-        .div(labelled)
-        .mul_scalar(batch.outcome_weight);
+        .div(labelled);
     let probabilities = softmax(prediction.wdl.clone(), 1);
     let expected = probabilities.clone().slice([0..n, 0..1]) - probabilities.slice([0..n, 2..3]);
-    let value_loss = (expected - batch.values)
-        .powf_scalar(2.0)
-        .mean()
-        .mul_scalar(batch.search_value_weight);
+    let value_loss = (expected - batch.values).powf_scalar(2.0).mean();
     let policy_loss = -(prediction.policy_log_probabilities(batch.legal) * batch.policy)
         .sum_dim(1)
         .mean();
-    let loss = wdl_loss + value_loss + policy_loss;
-    ClassificationOutput::new(loss, prediction.wdl, batch.verdicts)
+    let loss = wdl_loss.clone().mul_scalar(batch.outcome_weight)
+        + value_loss.clone().mul_scalar(batch.search_value_weight)
+        + policy_loss.clone();
+    let parts = LossParts::new(
+        Tensor::cat(vec![wdl_loss, value_loss, policy_loss], 0).detach(),
+        n,
+    );
+    (
+        ClassificationOutput::new(loss, prediction.wdl, batch.verdicts),
+        parts,
+    )
 }
 
 /// Implements burn's step traits for a model type.
@@ -622,7 +664,7 @@ macro_rules! impl_train_steps {
                 &self,
                 batch: Self::Input,
             ) -> ::burn::train::TrainOutput<$crate::nn::train::StepOutput> {
-                let item = $crate::nn::train::forward_step(self, batch);
+                let (item, parts) = $crate::nn::train::forward_step(self, batch);
                 let grads = ::burn::optim::GradientsParams::from_grads(item.loss.backward(), self);
                 let stats = $crate::nn::train_stats::TrainStats::new(self, &grads)
                     .map(::std::sync::Arc::new);
@@ -631,6 +673,7 @@ macro_rules! impl_train_steps {
                     item: $crate::nn::train::StepOutput {
                         classification: item,
                         stats,
+                        parts: ::std::sync::Arc::new(parts),
                     },
                 }
             }
@@ -650,9 +693,11 @@ macro_rules! impl_train_steps {
             type Output = $crate::nn::train::StepOutput;
 
             fn step(&self, batch: Self::Input) -> $crate::nn::train::StepOutput {
+                let (classification, parts) = $crate::nn::train::forward_step(self, batch);
                 $crate::nn::train::StepOutput {
-                    classification: $crate::nn::train::forward_step(self, batch),
+                    classification,
                     stats: None,
+                    parts: ::std::sync::Arc::new(parts),
                 }
             }
         }
@@ -733,10 +778,16 @@ pub struct Evaluation {
     /// Fraction of positions with a win/draw/loss target whose most likely verdict is the
     /// target's.
     pub verdict_accuracy: f32,
-    /// MSE of `p_win - p_loss` against the scalar value target.
+    /// MSE of `p_win - p_loss` against the scalar value target: the loss's value term.
     pub value_mse: f32,
     /// Fraction of positions whose most likely move is the target's most likely move.
     pub policy_accuracy: f32,
+    /// Cross-entropy of the win/draw/loss prediction against the target, over the positions
+    /// that have one: the loss's win/draw/loss term.
+    pub wdl_loss: f32,
+    /// Cross-entropy of the policy over the legal moves against the target distribution: the
+    /// loss's policy term.
+    pub policy_loss: f32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -841,11 +892,7 @@ pub fn train<M: Trainable>(
     let report_base = TrainReport {
         train_positions,
         validation_positions: valid_data.len(),
-        baseline: Evaluation {
-            verdict_accuracy: valid_data.baseline_accuracy(),
-            value_mse: valid_data.baseline_mse(),
-            policy_accuracy: valid_data.baseline_policy_accuracy(),
-        },
+        baseline: valid_data.baseline(),
         ..Default::default()
     };
     let batch = opts.batch_size.max(1);
@@ -900,6 +947,12 @@ pub fn train<M: Trainable>(
         .metric_train_numeric(AccuracyMetric::new())
         .metric_valid_numeric(AccuracyMetric::new())
         .metric_train_numeric(LrMetric::new());
+    // The loss's terms, unweighted: which of the heads a change helps.
+    for part in 0..LossParts::NAMES.len() {
+        training = training
+            .metric_train_numeric(LossPartMetric::new(part))
+            .metric_valid_numeric(LossPartMetric::new(part));
+    }
     // Per part of the network: the gradient norm and the size of each step against the weights.
     for metric in StatMetric::all() {
         training = training.metric_train_numeric(metric);
@@ -1031,6 +1084,7 @@ pub fn evaluate<M: Model>(model: &M, device: &Device, samples: &[Sample]) -> Eva
     let mut verdict_total = 0usize;
     let mut policy_hits = 0usize;
     let mut value_err = 0.0f64;
+    let (mut wdl_loss, mut policy_loss) = (0.0f64, 0.0f64);
     let mut states = Vec::new();
     for chunk in samples.chunks(1024) {
         states.clear();
@@ -1043,8 +1097,20 @@ pub fn evaluate<M: Model>(model: &M, device: &Device, samples: &[Sample]) -> Eva
                 verdict_total += 1;
                 verdict_hits += usize::from(most_likely(p) == target);
             }
+            if let Some(target) = &s.wdl {
+                wdl_loss += f64::from(cross_entropy(target, p));
+            }
             policy_hits += usize::from(best_moves[i] == s.best_move());
             value_err += (expected_value(p) - s.value_target()).powi(2) as f64;
+            let moves = &prediction.policy[i];
+            policy_loss -= s
+                .policy
+                .iter()
+                .map(|&(mv, t)| {
+                    let q = moves.iter().find(|m| m.0 == mv).map_or(0.0, |m| m.1);
+                    f64::from(t) * f64::from(q.max(1e-12)).ln()
+                })
+                .sum::<f64>();
         }
     }
     let n = samples.len();
@@ -1056,7 +1122,16 @@ pub fn evaluate<M: Model>(model: &M, device: &Device, samples: &[Sample]) -> Eva
         },
         value_mse: (value_err / n as f64) as f32,
         policy_accuracy: policy_hits as f32 / n as f32,
+        wdl_loss: (wdl_loss / verdict_total.max(1) as f64) as f32,
+        policy_loss: (policy_loss / n as f64) as f32,
     }
+}
+
+/// `-sum_k target_k ln p_k`, with the probabilities floored to keep it finite.
+fn cross_entropy(target: &[f32; 3], p: &[f32; 3]) -> f32 {
+    -(0..3)
+        .map(|k| target[k] * p[k].max(1e-12).ln())
+        .sum::<f32>()
 }
 
 /// A fresh temporary artifact directory for one run (tests, throwaway runs).

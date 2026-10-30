@@ -41,6 +41,28 @@ enum Command {
     #[cfg(feature = "nn")]
     #[command(after_help = brut3::agent::SPEC_SYNTAX)]
     Loop(LoopArgs),
+    /// Evaluate saved models on a training run's held-out games: the same --data,
+    /// --validation-fraction and --seed as the run give the same split. Prints each model's
+    /// verdict and policy accuracy and its loss terms (win/draw/loss and policy
+    /// cross-entropy, value MSE), with the baselines.
+    #[cfg(feature = "nn")]
+    Evaluate {
+        /// Games files, as given to `train --data`.
+        #[arg(long, required = true, num_args = 1..)]
+        data: Vec<std::path::PathBuf>,
+        /// Fraction of the games held out, as given to `train`.
+        #[arg(long, default_value_t = 0.1)]
+        validation_fraction: f32,
+        /// The training run's seed, which picks the held-out games.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Backend to evaluate on (default: fastest compiled in).
+        #[arg(long)]
+        backend: Option<String>,
+        /// Model stems (`<stem>.bpk` + `<stem>.json`).
+        #[arg(required = true, num_args = 1..)]
+        models: Vec<std::path::PathBuf>,
+    },
     /// Convert the uttt.ai text datasets (stage1-mcts, stage2-nmcts) into a games file for
     /// `train --data`: e.g. `import-utttai --out datasets/stage1.games datasets/stage1-mcts`.
     #[cfg(feature = "nn")]
@@ -570,6 +592,20 @@ fn main() -> ExitCode {
         Command::BookStats { book } => book_stats(&book),
         #[cfg(feature = "nn")]
         Command::ImportUtttai { paths, out } => import_utttai(&paths, &out),
+        #[cfg(feature = "nn")]
+        Command::Evaluate {
+            data,
+            validation_fraction,
+            seed,
+            backend,
+            models,
+        } => evaluate_models(
+            &data,
+            validation_fraction,
+            seed,
+            backend.as_deref(),
+            &models,
+        ),
         #[cfg(feature = "nn")]
         Command::Export {
             model,
@@ -1215,6 +1251,52 @@ fn play(spec: &[String]) -> Result<(), String> {
 }
 
 #[cfg(feature = "nn")]
+fn evaluate_models(
+    data: &[std::path::PathBuf],
+    validation_fraction: f32,
+    seed: u64,
+    backend: Option<&str>,
+    models: &[std::path::PathBuf],
+) -> Result<(), String> {
+    use brut3::nn::{AnyModel, BackendKind};
+
+    let backend = match backend {
+        Some(name) => name.parse::<BackendKind>()?,
+        None => BackendKind::preferred(),
+    };
+    let device = backend.device();
+    let (_, valid) = brut3::nn::games::load_many(data)?.split(validation_fraction, seed);
+    println!(
+        "{} validation positions from {} games",
+        valid.len(),
+        valid.games()
+    );
+    println!(
+        "{:>8} {:>8} {:>8} {:>8} {:>8}  model",
+        "verdict", "policy", "wdl", "value", "policy"
+    );
+    println!(
+        "{:>8} {:>8} {:>8} {:>8} {:>8}",
+        "acc", "acc", "loss", "mse", "loss"
+    );
+    let row = |e: &brut3::nn::Evaluation, name: &str| {
+        println!(
+            "{:>8.4} {:>8.4} {:>8.4} {:>8.4} {:>8.4}  {name}",
+            e.verdict_accuracy, e.policy_accuracy, e.wdl_loss, e.value_mse, e.policy_loss
+        );
+    };
+    row(&valid.baseline(), "(baseline)");
+    for path in models {
+        let model = AnyModel::load(path, &device)?;
+        row(
+            &model.evaluate(&device, &valid.samples),
+            &path.display().to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "nn")]
 fn run_loop(args: &LoopArgs) -> Result<(), String> {
     use brut3::nn::{BackendKind, LoopConfig, ModelSpec, TrainOptions, run_loop};
     use brut3::selfplay::{MatchExploration, SelfPlayConfig};
@@ -1580,6 +1662,14 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         report.baseline.value_mse,
         report.validation.policy_accuracy,
         report.baseline.policy_accuracy
+    );
+    println!(
+        "  validation loss terms: wdl {:.4} (baseline {:.4}), value {:.4}, policy {:.4} (baseline {:.4})",
+        report.validation.wdl_loss,
+        report.baseline.wdl_loss,
+        report.validation.value_mse,
+        report.validation.policy_loss,
+        report.baseline.policy_loss
     );
 
     if let Some(dir) = args.out.parent().filter(|d| !d.as_os_str().is_empty()) {

@@ -284,6 +284,15 @@ impl AnyModel {
         with_model!(self, |m| m.num_params())
     }
 
+    /// The model's quality over `samples` (see [`super::train::evaluate`]).
+    pub fn evaluate(
+        &self,
+        device: &Device,
+        samples: &[super::train::Sample],
+    ) -> super::train::Evaluation {
+        with_model!(self, |m| super::train::evaluate(m, device, samples))
+    }
+
     pub fn predict_host(&self, states: &[BitState], device: &Device) -> HostPrediction {
         with_model!(self, |m| predict_host(m, states, device))
     }

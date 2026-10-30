@@ -54,6 +54,7 @@ pub use server::{EvalServer, MAX_BATCH, RemoteEvaluator};
 pub use train::{
     Augment,
     Dataset,
+    Evaluation,
     Sample,
     TrainOptions,
     TrainReport,

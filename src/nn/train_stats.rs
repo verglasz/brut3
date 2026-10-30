@@ -227,18 +227,131 @@ impl TrainStats {
 }
 
 /// Output of one training or validation step: the loss and verdicts that burn's loss and
-/// accuracy metrics read, and for training steps the [`TrainStats`].
+/// accuracy metrics read, the loss's terms, and for sampled training steps the
+/// [`TrainStats`].
 pub struct StepOutput {
     pub classification: ClassificationOutput,
     pub stats: Option<Arc<TrainStats>>,
+    pub parts: Arc<LossParts>,
 }
 
 impl ItemLazy for StepOutput {
     fn sync(self) -> Result<Self, ExecutionError> {
+        let parts = LossParts::new(self.parts.values.clone().without_autodiff(), self.parts.n);
         Ok(Self {
             classification: self.classification.sync()?,
             stats: self.stats,
+            parts: Arc::new(parts),
         })
+    }
+}
+
+/// The terms of a step's loss before their weights: the win/draw/loss cross-entropy (over the
+/// positions with a target), the value's squared error and the policy's cross-entropy, on the
+/// device until a metric reads them.
+pub struct LossParts {
+    values: Tensor<1>,
+    /// Positions in the step.
+    n: usize,
+    host: OnceLock<Vec<f32>>,
+}
+
+impl LossParts {
+    /// The metrics' names, in the order of the values.
+    pub const NAMES: [&str; 3] = ["WDL loss", "Value loss", "Policy loss"];
+
+    /// `values` are `[3]`, in [`LossParts::NAMES`] order, over a step of `n` positions.
+    pub fn new(values: Tensor<1>, n: usize) -> Self {
+        Self {
+            values,
+            n,
+            host: OnceLock::new(),
+        }
+    }
+
+    /// The values on the host, read once for every metric.
+    fn host(&self) -> Result<&[f32], TensorReadError> {
+        if let Some(values) = self.host.get() {
+            return Ok(values);
+        }
+        let values = self.values.clone().try_into_data()?.try_into_vec::<f32>()?;
+        Ok(self.host.get_or_init(|| values))
+    }
+}
+
+impl Adaptor<Arc<LossParts>> for StepOutput {
+    fn adapt(&self) -> Arc<LossParts> {
+        self.parts.clone()
+    }
+}
+
+/// One term of the loss (see [`LossParts`]), as a numeric training and validation metric.
+#[derive(Clone)]
+pub struct LossPartMetric {
+    name: MetricName,
+    part: usize,
+    state: NumericMetricState,
+}
+
+impl LossPartMetric {
+    pub fn new(part: usize) -> Self {
+        Self {
+            name: Arc::new(LossParts::NAMES[part].to_string()),
+            part,
+            state: NumericMetricState::new(),
+        }
+    }
+}
+
+impl Metric for LossPartMetric {
+    type Input = Arc<LossParts>;
+
+    fn update(
+        &mut self,
+        item: &Arc<LossParts>,
+        _metadata: &MetricMetadata,
+    ) -> Result<SerializedEntry, TensorReadError> {
+        let value = item.host()?[self.part];
+        self.state.update(f64::from(value), item.n);
+        Ok(self
+            .state
+            .compute_update(FormatOptions::new(self.name.clone()).precision(4)))
+    }
+
+    fn compute(&mut self) -> Result<SerializedEntry, TensorReadError> {
+        Ok(self
+            .state
+            .compute_final(FormatOptions::new(self.name.clone()).precision(4)))
+    }
+
+    fn clear(&mut self) {
+        self.state.reset()
+    }
+
+    fn name(&self) -> MetricName {
+        self.name.clone()
+    }
+
+    fn attributes(&self) -> MetricAttributes {
+        NumericAttributes {
+            unit: None,
+            higher_is_better: false,
+        }
+        .into()
+    }
+}
+
+impl Numeric for LossPartMetric {
+    fn value(&self) -> Option<NumericEntry> {
+        Some(self.state.current_value())
+    }
+
+    fn running_value(&self) -> Option<NumericEntry> {
+        Some(self.state.running_value())
+    }
+
+    fn final_value(&self) -> NumericEntry {
+        self.state.final_value()
     }
 }
 

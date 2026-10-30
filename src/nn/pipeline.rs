@@ -517,6 +517,14 @@ pub fn run_loop(
             train_report.baseline.policy_accuracy,
             train_report.best_epoch
         ));
+        log(format!(
+            "  validation loss terms: wdl {:.4} (baseline {:.4}), value {:.4}, policy {:.4} (baseline {:.4})",
+            train_report.validation.wdl_loss,
+            train_report.baseline.wdl_loss,
+            train_report.validation.value_mse,
+            train_report.validation.policy_loss,
+            train_report.baseline.policy_loss
+        ));
 
         let searcher = |path: &Path| AgentSpec::MctsNn {
             path: path.to_path_buf(),
