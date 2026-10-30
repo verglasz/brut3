@@ -708,14 +708,24 @@ fn accumulate(e: &Ends, qat: &Qat, ids: NnueInput) -> Tensor<2> {
     let [n, _] = ids.dims();
     let [_, d_e] = e.content.weight.dims();
     let [_, d_acc] = e.features.weight.dims();
-    // A token is its content's row of the token table: the first of its ids.
-    let contents = ids
+    let token_ids = ids
         .clone()
-        .slice([0..n, 0..TOKENS * IDS_PER_BOARD])
-        .reshape([n, TOKENS, IDS_PER_BOARD])
-        .slice([0..n, 0..TOKENS, 0..1])
-        .reshape([n, TOKENS]);
-    let tokens = rows(qat.rows(qat.content, token_table(e)), contents);
+        .slice([0..n, 0..TOKENS * IDS_PER_BOARD]);
+    let tokens = if qat.content {
+        // The int8 grid is the shipped token table's, so build it all and read each token's
+        // row by its content (the first of its ids).
+        let contents = token_ids
+            .reshape([n, TOKENS, IDS_PER_BOARD])
+            .slice([0..n, 0..TOKENS, 0..1])
+            .reshape([n, TOKENS]);
+        rows(qat.rows(true, token_table(e)), contents)
+    } else {
+        // The same sums, over only the rows this batch reads: content row plus cell rows.
+        rows(content_table(e), token_ids)
+            .reshape([n, TOKENS, IDS_PER_BOARD, d_e])
+            .sum_dim(2)
+            .reshape([n, TOKENS, d_e])
+    };
     let boards = tokens
         .clone()
         .slice([0..n, 0..BOARDS])
