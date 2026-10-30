@@ -319,6 +319,48 @@ impl AnyModel {
         with_model!(self, |m| m.set_qat(int8))
     }
 
+    /// Replaces an NNUE's open content rows by their best rank-`rank` approximation: each row
+    /// projected onto the table's top `rank` singular directions (every row counting the
+    /// same). Errors for other kinds.
+    pub fn truncate_content(&mut self, rank: usize) -> Result<(), String> {
+        use burn::prelude::*;
+
+        let content = match self {
+            AnyModel::Nnue(m) => &mut m.content,
+            AnyModel::NnueV2(m) => &mut m.content,
+            other => return Err(format!("a {} model has no content table", other.spec())),
+        };
+        let table = content.weight.val();
+        let device = table.device();
+        let [rows_n, d] = table.dims();
+        if rank >= d {
+            return Ok(());
+        }
+        let open = super::nnue::OPEN_CONTENTS;
+        let rows: Vec<f32> = table
+            .slice([0..open, 0..d])
+            .into_data()
+            .try_to_vec::<f32>()
+            .map_err(|e| format!("{e:?}"))?;
+        let (_, vectors) =
+            super::linalg::symmetric_eigen(super::linalg::gram(&rows, d, None), d);
+        // The projection V_r V_rᵀ onto the top `rank` directions.
+        let mut projection = vec![0f32; d * d];
+        for i in 0..d {
+            for j in 0..d {
+                projection[i * d + j] = (0..rank)
+                    .map(|k| vectors[i * d + k] * vectors[j * d + k])
+                    .sum::<f64>() as f32;
+            }
+        }
+        let projection = Tensor::<2>::from_data(TensorData::new(projection, [d, d]), &device);
+        content.weight = content.weight.clone().map(|w| {
+            let open_rows = w.clone().slice([0..open, 0..d]).matmul(projection.clone());
+            Tensor::cat(vec![open_rows, w.slice([open..rows_n, 0..d])], 0)
+        });
+        Ok(())
+    }
+
     /// The model's quality over `samples` (see [`super::train::evaluate`]).
     pub fn evaluate(
         &self,

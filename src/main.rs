@@ -64,6 +64,11 @@ enum Command {
         /// `--nearest-rounding` ships them), to compare networks as they would be exported.
         #[arg(long, value_delimiter = ',')]
         int8_only: Vec<String>,
+        /// Also evaluate each NNUE with its open content rows replaced by their best rank-r
+        /// approximation, for each of these ranks (e.g. `16,32,48`): how much of the table a
+        /// low-rank one could keep without retraining.
+        #[arg(long, value_delimiter = ',')]
+        content_rank: Vec<usize>,
         /// Model stems (`<stem>.bpk` + `<stem>.json`).
         #[arg(required = true, num_args = 1..)]
         models: Vec<std::path::PathBuf>,
@@ -674,6 +679,7 @@ fn main() -> ExitCode {
             seed,
             backend,
             int8_only,
+            content_rank,
             models,
         } => evaluate_models(
             &data,
@@ -681,6 +687,7 @@ fn main() -> ExitCode {
             seed,
             backend.as_deref(),
             &brut3::nn::export::Int8Arrays(int8_only),
+            &content_rank,
             &models,
         ),
         #[cfg(feature = "nn")]
@@ -1390,6 +1397,7 @@ fn evaluate_models(
     seed: u64,
     backend: Option<&str>,
     int8: &brut3::nn::export::Int8Arrays,
+    content_ranks: &[usize],
     models: &[std::path::PathBuf],
 ) -> Result<(), String> {
     use brut3::nn::{AnyModel, BackendKind};
@@ -1446,6 +1454,15 @@ fn evaluate_models(
             &model.evaluate(&device, &valid.samples),
             &path.display().to_string(),
         );
+        for &rank in content_ranks {
+            let mut truncated = AnyModel::load(path, &device)?;
+            truncated.set_qat(int8);
+            truncated.truncate_content(rank)?;
+            row(
+                &truncated.evaluate(&device, &valid.samples),
+                &format!("{} (content rank {rank})", path.display()),
+            );
+        }
     }
     Ok(())
 }

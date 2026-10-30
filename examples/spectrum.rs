@@ -8,6 +8,7 @@
 use brut3::game::{BitState, GameState, Symmetry};
 use brut3::nn::AnyModel;
 use brut3::nn::backend::BackendKind;
+use brut3::nn::linalg::{gram, symmetric_eigen};
 use brut3::nn::nnue::{IDS, IDS_PER_BOARD, OPEN_CONTENTS, TOKENS, nnue_ids};
 
 fn main() {
@@ -90,19 +91,7 @@ fn coverage(label: &str, counts: &[f64]) {
 fn report(label: &str, rows: &[f32], d: usize, weights: &[f64]) {
     // The weighted Gram matrix: its eigenvalues are the squared singular values of the rows
     // scaled by the square roots of their weights.
-    let mut gram = vec![0f64; d * d];
-    for (row, &w) in rows.chunks_exact(d).zip(weights) {
-        if w == 0.0 {
-            continue;
-        }
-        for i in 0..d {
-            for j in 0..d {
-                gram[i * d + j] += w * f64::from(row[i]) * f64::from(row[j]);
-            }
-        }
-    }
-    let mut eig = jacobi_eigenvalues(gram, d);
-    eig.sort_by(|a, b| b.total_cmp(a));
+    let (eig, _) = symmetric_eigen(gram(rows, d, Some(weights)), d);
     let total: f64 = eig.iter().sum();
     let mut line = format!("  {label:<24}");
     for r in [4, 8, 16, 24, 32, 48] {
@@ -114,41 +103,4 @@ fn report(label: &str, rows: &[f32], d: usize, weights: &[f64]) {
     let top = eig[0].sqrt();
     let sv: Vec<String> = eig.iter().take(16).map(|e| format!("{:.2}", e.sqrt() / top)).collect();
     println!("  {:<24}  singular values / largest: {}", "", sv.join(" "));
-}
-
-/// The eigenvalues of the symmetric `d x d` matrix `a` by cyclic Jacobi rotations.
-fn jacobi_eigenvalues(mut a: Vec<f64>, d: usize) -> Vec<f64> {
-    for _sweep in 0..100 {
-        let off: f64 = (0..d)
-            .flat_map(|i| (0..d).filter(move |&j| j != i).map(move |j| (i, j)))
-            .map(|(i, j)| a[i * d + j] * a[i * d + j])
-            .sum();
-        if off < 1e-18 {
-            break;
-        }
-        for p in 0..d {
-            for q in p + 1..d {
-                let apq = a[p * d + q];
-                if apq.abs() < 1e-300 {
-                    continue;
-                }
-                let theta = (a[q * d + q] - a[p * d + p]) / (2.0 * apq);
-                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
-                let t = if theta == 0.0 { 1.0 } else { t };
-                let c = 1.0 / (t * t + 1.0).sqrt();
-                let s = t * c;
-                for k in 0..d {
-                    let (akp, akq) = (a[k * d + p], a[k * d + q]);
-                    a[k * d + p] = c * akp - s * akq;
-                    a[k * d + q] = s * akp + c * akq;
-                }
-                for k in 0..d {
-                    let (apk, aqk) = (a[p * d + k], a[q * d + k]);
-                    a[p * d + k] = c * apk - s * aqk;
-                    a[q * d + k] = s * apk + c * aqk;
-                }
-            }
-        }
-    }
-    (0..d).map(|i| a[i * d + i]).collect()
 }

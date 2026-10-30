@@ -20,6 +20,7 @@ pub mod export;
 pub mod games;
 pub mod heads;
 pub mod linear;
+pub mod linalg;
 pub mod model;
 pub mod nnue;
 pub mod nnue_v2;
