@@ -32,7 +32,7 @@ pub fn train_model(
     if let Some(path) = start_from {
         // Surface a bad path or a mismatched spec here rather than inside the init closure.
         let existing = AnyModel::load(path, device)?;
-        if existing.spec() != *spec {
+        if !spec.initialisable_from(&existing.spec()) {
             return Err(format!(
                 "weights at {} are a {} model, not {spec}",
                 path.display(),

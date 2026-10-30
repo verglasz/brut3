@@ -49,6 +49,22 @@ pub enum ModelSpec {
 }
 
 impl ModelSpec {
+    /// Whether weights of kind `from` can start a model of this kind: the same kind, or an
+    /// NNUE without line features for the same one with them (the line table starts at zero,
+    /// so the model computes what `from` did).
+    pub fn initialisable_from(&self, from: &ModelSpec) -> bool {
+        let gains_lines = |to: Option<bool>, from: Option<bool>| to == Some(true) && from != Some(true);
+        match (self, from) {
+            (ModelSpec::Nnue(to), ModelSpec::Nnue(f)) if gains_lines(to.lines, f.lines) => {
+                to.clone().with_lines(f.lines) == *f
+            }
+            (ModelSpec::NnueV2(to), ModelSpec::NnueV2(f)) if gains_lines(to.lines, f.lines) => {
+                to.clone().with_lines(f.lines) == *f
+            }
+            _ => self == from,
+        }
+    }
+
     pub const NAMES: &str = "`linear`; `board-transformer`, `cell-transformer`, `board-v2` or \
          `cell-v2`, each followed by `[d_model] [layers] [heads]`; or `nnue` followed by \
          `[d_embed] [d_acc] [d_hidden] [layers] [reglu D_FF] [lines]`; or `nnue-v2` likewise, with \

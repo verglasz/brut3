@@ -297,6 +297,43 @@ pub fn content_table(e: &Ends) -> Tensor<2> {
     table + Tensor::cat(vec![sums, rest], 0)
 }
 
+/// Each token's eight line rows summed (`[n, t, d]`) from its ids (`[n, t, IDS_PER_BOARD]`),
+/// as [`content_table`] folds them in: the line states come from the cell ids, so only the
+/// rows the batch reads are gathered. Decided boards and "no forced board" get zeros.
+fn token_lines(lines: Tensor<2>, token_ids: Tensor<3, Int>) -> Tensor<3> {
+    let [n, t, _] = token_ids.dims();
+    let [_, d] = lines.dims();
+    let device = token_ids.device();
+    let open = token_ids
+        .clone()
+        .slice([0..n, 0..t, 0..1])
+        .lower_elem(OPEN_CONTENTS as i32)
+        .float();
+    // Cell values (0 empty, 1 mine, 2 theirs) from the ids CELL_BASE + 3 cell + v; padding
+    // ids give values out of range, clamped and then masked out.
+    let base = Tensor::<1, Int>::arange(0..CELLS as i64, &device)
+        .mul_scalar(3)
+        .add_scalar(CELL_BASE as i64)
+        .reshape([1, 1, CELLS])
+        .expand([n, t, CELLS]);
+    let values = (token_ids.slice([0..n, 0..t, 1..IDS_PER_BOARD]) - base).clamp(0, 2);
+    let cell = |i: usize| values.clone().slice([0..n, 0..t, i..i + 1]);
+    let ids = LINES
+        .iter()
+        .enumerate()
+        .map(|(l, line)| {
+            (cell(line[0]).mul_scalar(9) + cell(line[1]).mul_scalar(3) + cell(line[2]))
+                .add_scalar((l * 27) as i64)
+        })
+        .collect();
+    let ids = Tensor::cat(ids, 2).reshape([n, t * LINES.len()]);
+    rows(lines, ids)
+        .reshape([n, t, LINES.len(), d])
+        .sum_dim(2)
+        .reshape([n, t, d])
+        * open.expand([n, t, d])
+}
+
 /// The paths of the tensors a validation error says are missing (burn reports them only as a
 /// message, `Missing tensors: ["gates.weight", ...]`), or `None` for any other error.
 fn missing_paths(error: &str) -> Option<Vec<&str>> {
@@ -720,11 +757,19 @@ fn accumulate(e: &Ends, qat: &Qat, ids: NnueInput) -> Tensor<2> {
             .reshape([n, TOKENS]);
         rows(qat.rows(true, token_table(e)), contents)
     } else {
-        // The same sums, over only the rows this batch reads: content row plus cell rows.
-        rows(content_table(e), token_ids)
+        // The same sums, over only the rows this batch reads: content row plus cell rows,
+        // plus the line rows.
+        let tokens = rows(e.content.weight.val(), token_ids.clone())
             .reshape([n, TOKENS, IDS_PER_BOARD, d_e])
             .sum_dim(2)
-            .reshape([n, TOKENS, d_e])
+            .reshape([n, TOKENS, d_e]);
+        match &e.lines {
+            Some(lines) => {
+                let token_ids = token_ids.reshape([n, TOKENS, IDS_PER_BOARD]);
+                tokens + token_lines(lines.weight.val(), token_ids)
+            }
+            None => tokens,
+        }
     };
     let boards = tokens
         .clone()
@@ -1250,6 +1295,38 @@ mod tests {
         );
         assert_eq!(missing_paths("Missing tensors: []"), None);
         assert_eq!(missing_paths(r#"Apply errors: ["gates.weight"]"#), None);
+    }
+
+    /// Weights saved without line features start a model with them that computes the same.
+    #[test]
+    fn weights_without_lines_load_into_a_model_with_them() {
+        use crate::nn::{AnyModel, ModelSpec};
+
+        let _lock = crate::nn::device_lock();
+        let device = BackendKind::preferred().device();
+        let config = NnueConfig::new()
+            .with_d_embed(16)
+            .with_d_acc(32)
+            .with_d_hidden(16);
+        let plain = config.init(&device);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-tmp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = dir.join("nnue-without-lines");
+        AnyModel::Nnue(plain.clone()).save(&stem).unwrap();
+
+        let lined = config.clone().with_lines(Some(true));
+        assert!(ModelSpec::Nnue(lined.clone()).initialisable_from(&ModelSpec::Nnue(config)));
+        let loaded = lined
+            .init(&device)
+            .load_weights(&ModelSpec::weights_path(&stem))
+            .unwrap();
+        assert!(loaded.lines.is_some());
+        let states = [BitState::initial()];
+        let expected = crate::nn::model::predict_logits(&plain, &states, &device);
+        let got = crate::nn::model::predict_logits(&loaded, &states, &device);
+        for (e, g) in expected.iter().zip(&got) {
+            assert!((e - g).abs() <= 1e-5 * (1.0 + e.abs()), "{e} vs {g}");
+        }
     }
 
     #[test]
