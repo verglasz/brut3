@@ -114,8 +114,8 @@ enum Command {
         /// Do not write FixedVec.hs (keep a hand-generated one).
         #[arg(long)]
         no_fixed_vec: bool,
-        /// Ship the matrices and tables as int8 with a scale per row instead of int16: about
-        /// half the weights' text. The reported quantisation error and the reference values
+        /// Ship every weight array as int8 with a scale per row instead of int16: about half
+        /// the weights' text. The reported quantisation error and the reference values
         /// follow.
         #[arg(long)]
         int8: bool,

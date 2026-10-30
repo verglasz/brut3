@@ -60,8 +60,8 @@ pub struct ExportOptions {
     pub vec_extra: Option<VecSpec>,
     /// Whether to write `<prefix>/FixedVec.hs` at all.
     pub fixed_vec: bool,
-    /// Ship the matrices and tables as int8 with a scale per row (see
-    /// [`Format`](super::quant::Format)) instead of int16: about half the text.
+    /// Ship every array as int8 with a scale per row (see
+    /// [`quantise_int8`](super::quant::quantise_int8)) instead of int16: about half the text.
     pub int8: bool,
 }
 
@@ -236,18 +236,14 @@ pub fn weights_module(
         &format!(
             "the network's {} weights ({})",
             weights.parameters(),
-            if int8 {
-                "int8 matrices and tables, int16 the rest"
-            } else {
-                "int16"
-            }
+            if int8 { "int8" } else { "int16" }
         ),
         bytes * 4 / 3,
     );
     s.push_str(
-        "-- | One weight array: rows * cols little-endian Int16 values, each worth q * scale, or\n\
-         -- for an array followed by its rows' scales (`<name>_scales`) signed bytes, each worth\n\
-         -- q * its row's scale; matrices one row per output, as base64 text (standard alphabet,\n\
+        "-- | One weight array: rows * cols little-endian Int16 values, each worth q * scale, or in\n\
+         -- an int8 export each row an exponent byte e then its signed bytes, each worth\n\
+         -- q * scale * 2^(-e/8); matrices one row per output, as base64 text (standard alphabet,\n\
          -- padded) split into pieces of a multiple of four characters.\n\
          data Array = Array\n\
          \x20 { arrayName :: String -- ^ the array's name, checked by the decoder\n\
