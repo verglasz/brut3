@@ -15,8 +15,11 @@
 //! told apart per line by the number of fields.
 //!
 //! Each position becomes a [`Sample`] with the visit distribution as its policy, the
-//! win/draw/loss frequencies (stage 1) or the mean value (stage 2) as its value target, and
-//! its own game id, since the games the positions came from are not recorded.
+//! win/draw/loss frequencies (stage 1) or the mean value (stage 2) as its value target. The
+//! games the positions came from are not recorded (the files hold one ply each, in no order
+//! that chains positions into games), so each distinct position gets a game id of its own,
+//! repeats of it sharing the id: a split by game then keeps every copy of a position on one
+//! side.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -60,14 +63,18 @@ pub fn import(paths: &[PathBuf]) -> Result<Dataset, String> {
             .collect()
     });
     let mut data = Dataset::default();
+    let mut next_game = 0;
     for part in parts {
-        let part = part?;
-        let offset = data.len();
-        data.samples
-            .extend(part.into_iter().enumerate().map(|(i, s)| Sample {
-                game: offset + i,
-                ..s
-            }));
+        // A position's repeats share its id. They are all in the same file: a file is one ply,
+        // and a position's ply is its number of marks.
+        let mut ids = std::collections::HashMap::new();
+        for sample in part? {
+            let game = *ids.entry(sample.state).or_insert_with(|| {
+                next_game += 1;
+                next_game - 1
+            });
+            data.samples.push(Sample { game, ..sample });
+        }
     }
     Ok(data)
 }
@@ -343,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn imports_a_file_with_sequential_game_ids() {
+    fn imports_files_with_a_game_id_per_distinct_position() {
         let dir = std::env::temp_dir().join(format!("uttt-utttai-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let line =
@@ -354,6 +361,8 @@ mod tests {
         let data = import(&[dir.clone()]).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(data.len(), 3);
-        assert_eq!(data.games(), 3);
+        // The two copies in depth00 share an id; depth01's is a file of its own.
+        assert_eq!(data.games(), 2);
+        assert_eq!(data.samples[0].game, data.samples[1].game);
     }
 }
