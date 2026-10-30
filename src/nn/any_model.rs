@@ -51,8 +51,8 @@ pub enum ModelSpec {
 impl ModelSpec {
     pub const NAMES: &str = "`linear`; `board-transformer`, `cell-transformer`, `board-v2` or \
          `cell-v2`, each followed by `[d_model] [layers] [heads]`; or `nnue` followed by \
-         `[d_embed] [d_acc] [d_hidden] [layers] [reglu D_FF]`; or `nnue-v2` likewise, with at least 2 \
-         layers, and optionally `rezero`";
+         `[d_embed] [d_acc] [d_hidden] [layers] [reglu D_FF] [lines]`; or `nnue-v2` likewise, with \
+         at least 2 layers, and optionally `rezero`";
 
     /// Parses a model name with optional hyperparameters, e.g. `linear`,
     /// `board-transformer 64 2 4` (`d_model`, layers, heads).
@@ -129,12 +129,17 @@ fn nnue_v2(words: &[&str]) -> Result<NnueV2Config, String> {
         .with_d_hidden(c.d_hidden)
         .with_layers(c.layers)
         .with_reglu(c.reglu)
-        .with_rezero(rezero))
+        .with_rezero(rezero)
+        .with_lines(c.lines))
 }
 
 /// `[d_embed] [d_acc] [d_hidden] [layers]`, each optional, then optionally `reglu D_FF` for
-/// ReGLU blocks of inner width `D_FF` after the first hidden layer.
+/// ReGLU blocks of inner width `D_FF` after the first hidden layer, and anywhere `lines` for
+/// small-board line features.
 fn nnue(words: &[&str]) -> Result<NnueConfig, String> {
+    let lines = words.contains(&"lines");
+    let words: Vec<&str> = words.iter().copied().filter(|w| *w != "lines").collect();
+    let words = words.as_slice();
     let (words, reglu) = match words.iter().position(|w| *w == "reglu") {
         Some(i) => match &words[i + 1..] {
             [width] => (
@@ -160,7 +165,8 @@ fn nnue(words: &[&str]) -> Result<NnueConfig, String> {
         .with_d_acc(num(words, 1, "d_acc", d.d_acc)?)
         .with_d_hidden(num(words, 2, "d_hidden", d.d_hidden)?)
         .with_layers(num(words, 3, "layers", d.layers)?)
-        .with_reglu(reglu);
+        .with_reglu(reglu)
+        .with_lines(lines.then_some(true));
     if cfg.d_embed == 0 || cfg.d_acc == 0 || cfg.d_hidden == 0 || cfg.layers == 0 {
         return Err("nnue sizes must be positive".into());
     }
@@ -216,10 +222,13 @@ impl fmt::Display for ModelSpec {
                     "nnue (d_embed {}, d_acc {}, d_hidden {}, {} layers",
                     cfg.d_embed, cfg.d_acc, cfg.d_hidden, cfg.layers
                 )?;
-                match cfg.reglu {
-                    None => write!(f, ")"),
-                    Some(d_ff) => write!(f, ", ReGLU {d_ff})"),
+                if let Some(d_ff) = cfg.reglu {
+                    write!(f, ", ReGLU {d_ff}")?;
                 }
+                if cfg.lines == Some(true) {
+                    write!(f, ", lines")?;
+                }
+                write!(f, ")")
             }
             ModelSpec::NnueV2(cfg) => {
                 write!(
@@ -232,6 +241,9 @@ impl fmt::Display for ModelSpec {
                 }
                 if cfg.rezero {
                     write!(f, ", ReZero")?;
+                }
+                if cfg.lines == Some(true) {
+                    write!(f, ", lines")?;
                 }
                 write!(f, ")")
             }
@@ -366,7 +378,7 @@ impl AnyModel {
                     .valid(),
             ),
             AnyModel::Nnue(m) => AnyModel::Nnue(
-                m.try_load_file(ModelSpec::weights_path(path))
+                m.load_weights(&ModelSpec::weights_path(path))
                     .map_err(load_err)?
                     .valid(),
             ),
@@ -452,6 +464,16 @@ mod tests {
             other => panic!("parsed {other}"),
         }
         assert!(ModelSpec::parse(&["nnue-v2", "64", "512", "128", "1"]).is_err());
+        match ModelSpec::parse(&["nnue", "64", "512", "128", "4", "lines"]).unwrap() {
+            ModelSpec::Nnue(cfg) => assert_eq!((cfg.layers, cfg.lines), (4, Some(true))),
+            other => panic!("parsed {other}"),
+        }
+        match ModelSpec::parse(&["nnue-v2", "lines", "64", "512", "128", "4", "reglu", "96"])
+            .unwrap()
+        {
+            ModelSpec::NnueV2(cfg) => assert_eq!((cfg.reglu, cfg.lines), (Some(96), Some(true))),
+            other => panic!("parsed {other}"),
+        }
         match ModelSpec::parse(&["nnue-v2", "64", "512", "128", "3", "rezero", "reglu", "96"])
             .unwrap()
         {

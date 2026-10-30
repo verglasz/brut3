@@ -251,6 +251,89 @@ pub fn nnue_ids(state: &BitState, out: &mut [i32; IDS]) {
     features[2 + LINES.len()] = (OPEN_MARKS_BASE + open_marks as usize) as i32;
 }
 
+/// Rows of the small-board line table: for each of a board's eight lines ([`LINES`]), one per
+/// state of its three cells (`9 a + 3 b + c`, each 0 empty, 1 mine, 2 theirs). Only open
+/// boards read it: a decided board's row, and "no forced board"'s, are their own already.
+pub const LINE_ROWS: usize = LINES.len() * 27;
+
+/// For every open content, its eight line rows.
+fn content_lines() -> &'static [i32] {
+    static TABLE: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = vec![0; OPEN_CONTENTS * LINES.len()];
+        for code in 0..RAW_CONTENTS {
+            let Some(c) = compact_id(code).filter(|&c| c < OPEN_CONTENTS) else {
+                continue;
+            };
+            let cell = |i: usize| code / 3usize.pow(i as u32) % 3;
+            for (l, line) in LINES.iter().enumerate() {
+                let state = 9 * cell(line[0]) + 3 * cell(line[1]) + cell(line[2]);
+                table[c * LINES.len() + l] = (l * 27 + state) as i32;
+            }
+        }
+        table
+    })
+}
+
+/// The content table as the model uses it: with small-board line features, each open
+/// content's row plus its eight line rows. A content's lines are a function of the content,
+/// so they fold into its row: the inputs, the folded tables and the export (which ships this
+/// table) are the same with or without them.
+pub fn content_table(e: &Ends) -> Tensor<2> {
+    let table = e.content.weight.val();
+    let Some(lines) = e.lines else {
+        return table;
+    };
+    let device = table.device();
+    let [rows_n, d] = table.dims();
+    let ids = Tensor::<2, Int>::from_data(
+        TensorData::new(content_lines().to_vec(), [OPEN_CONTENTS, LINES.len()]),
+        &device,
+    );
+    let sums = rows(lines.weight.val(), ids)
+        .sum_dim(1)
+        .reshape([OPEN_CONTENTS, d]);
+    let rest = Tensor::zeros([rows_n - OPEN_CONTENTS, d], &device);
+    table + Tensor::cat(vec![sums, rest], 0)
+}
+
+/// The paths of the tensors a validation error says are missing (burn reports them only as a
+/// message, `Missing tensors: ["gates.weight", ...]`), or `None` for any other error.
+fn missing_paths(error: &str) -> Option<Vec<&str>> {
+    let list = error.strip_prefix("Missing tensors: ")?;
+    // The quoted paths are the odd pieces between quotes.
+    let paths: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// Loads the weights saved at `path` into `model`, strictly, except that the tensors of the
+/// fields named in `optional` may be missing (weights saved before those fields existed):
+/// they keep their initial values. Returns the model and which of those fields were missing.
+pub fn load_tolerating<M: Module + Clone>(
+    model: M,
+    path: &std::path::Path,
+    optional: &[&str],
+) -> Result<(M, Vec<String>), burn::store::RecordError> {
+    use burn::store::{ModuleRecord, RecordError};
+
+    let record = ModuleRecord::load(path)?;
+    match model.clone().try_load_record(record.clone()) {
+        Ok(model) => Ok((model, Vec::new())),
+        Err(RecordError::Validation(e)) => {
+            let field = |p: &str| p.split('.').next().unwrap_or(p).to_string();
+            match missing_paths(&e) {
+                Some(paths) if paths.iter().all(|p| optional.contains(&field(p).as_str())) => {
+                    let mut fields: Vec<String> = paths.iter().map(|p| field(p)).collect();
+                    fields.dedup();
+                    Ok((model.try_load_record(record.allow_partial(true))?, fields))
+                }
+                _ => Err(RecordError::Validation(e)),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// One board token's ids: the content, then the nine cell rows for an open board or padding
 /// for a decided one (whose cells must not matter, so that a row is a function of the
 /// compact content alone).
@@ -272,17 +355,12 @@ fn write_token(token: &mut [i32], content: usize, mine: u16, theirs: u16) {
     }
 }
 
-/// Rows `ids` (`[n, k]`) of an embedding table, as `[n, k, d]`.
+/// Rows `ids` (`[n, k]`) of `table`, as `[n, k, d]`.
 ///
 /// Not `Embedding::forward`: on the CubeCL backends its gradient goes through `select_assign`,
 /// a kernel with one thread per table column that loops over every index in the batch, which
 /// made the embedding gradients most of a training step. `gather` on indices broadcast across
 /// the row has an atomic scatter-add gradient that is parallel over every element.
-fn lookup(table: &Embedding, ids: Tensor<2, Int>) -> Tensor<3> {
-    rows(table.weight.val(), ids)
-}
-
-/// Rows `ids` (`[n, k]`) of `table`, as `[n, k, d]` (see [`lookup`]).
 fn rows(table: Tensor<2>, ids: Tensor<2, Int>) -> Tensor<3> {
     let [n, k] = ids.dims();
     let [_, d] = table.dims();
@@ -320,6 +398,9 @@ pub struct NnueConfig {
     /// `h <- ReLU(h + W h + b)`. An `Option` so that specs saved before it existed, which lack
     /// the field, load as residual networks.
     pub reglu: Option<usize>,
+    /// Small-board line features (see [`LINE_ROWS`]): `Some(true)` adds them; an `Option` so
+    /// that specs saved before it existed load without them.
+    pub lines: Option<bool>,
 }
 
 impl Default for NnueConfig {
@@ -339,7 +420,13 @@ impl NnueConfig {
                 None => hidden.push(LinearConfig::new(self.d_hidden, self.d_hidden).init(device)),
             }
         }
-        let e = EndLayers::new(self.d_embed, self.d_acc, self.d_hidden, device);
+        let e = EndLayers::new(
+            self.d_embed,
+            self.d_acc,
+            self.d_hidden,
+            self.lines == Some(true),
+            device,
+        );
         Nnue {
             config: self.clone(),
             content: e.content,
@@ -353,6 +440,7 @@ impl NnueConfig {
             policy: e.policy,
             local_policy: e.local_policy,
             send_policy: e.send_policy,
+            lines: e.lines,
             qat: Qat::default(),
         }
     }
@@ -371,10 +459,19 @@ pub struct EndLayers {
     pub policy: Linear,
     pub local_policy: Embedding,
     pub send_policy: Embedding,
+    pub lines: Option<Embedding>,
 }
 
 impl EndLayers {
-    pub fn new(d_embed: usize, d_acc: usize, d_hidden: usize, device: &Device) -> Self {
+    /// With `lines`, the small-board line table too, at zero: the model then starts as the
+    /// same model without it.
+    pub fn new(
+        d_embed: usize,
+        d_acc: usize,
+        d_hidden: usize,
+        lines: bool,
+        device: &Device,
+    ) -> Self {
         let normal = |std: f64| Initializer::Normal { mean: 0.0, std };
         Self {
             content: EmbeddingConfig::new(CONTENT_ROWS, d_embed)
@@ -398,6 +495,11 @@ impl EndLayers {
             send_policy: EmbeddingConfig::new(CONTENTS, 1)
                 .with_initializer(normal(0.02))
                 .init(device),
+            lines: lines.then(|| {
+                EmbeddingConfig::new(LINE_ROWS, d_embed)
+                    .with_initializer(Initializer::Zeros)
+                    .init(device)
+            }),
         }
     }
 }
@@ -416,6 +518,8 @@ pub struct Ends<'a> {
     /// The head gates, `[d_hidden, GATES]` (see [`GATES`]); `None` for heads that add every
     /// term as it is.
     pub gates: Option<&'a Linear>,
+    /// The small-board line table (see [`LINE_ROWS`]), for models that have one.
+    pub lines: Option<&'a Embedding>,
 }
 
 /// Outputs of the head gates' layer, all through a sigmoid: the value's mix `g`, then the
@@ -490,6 +594,9 @@ pub struct Nnue {
     pub local_policy: Embedding,
     /// `[CONTENTS, 1]`: the logit of sending the opponent to a board with this content.
     pub send_policy: Embedding,
+    /// `[LINE_ROWS, d_embed]`: small-board line rows (see [`content_table`]), when the
+    /// config asks for them.
+    pub lines: Option<Embedding>,
     #[module(skip)]
     qat: Qat,
 }
@@ -516,6 +623,13 @@ impl Nnue {
 }
 
 impl Nnue {
+    /// Loads the weights saved at `path`, strictly, except that weights saved without
+    /// small-board line features load into a model with them, the line table staying at zero
+    /// (so that the network computes what the saved one did).
+    pub fn load_weights(self, path: &std::path::Path) -> Result<Self, burn::store::RecordError> {
+        Ok(load_tolerating(self, path, &["lines"])?.0)
+    }
+
     /// The same network for inference, with its first layer folded into one table of
     /// accumulator rows indexed by raw board code (see [`FoldedNnue`]). Computed here on the
     /// model's device.
@@ -537,6 +651,7 @@ impl NnueNet for Nnue {
             local_policy: &self.local_policy,
             send_policy: &self.send_policy,
             gates: None,
+            lines: self.lines.as_ref(),
         }
     }
 
@@ -580,7 +695,7 @@ fn accumulate(e: &Ends, qat: &Qat, ids: NnueInput) -> Tensor<2> {
     let [_, d_acc] = e.features.weight.dims();
     let token_ids = ids.clone().slice([0..n, 0..TOKENS * IDS_PER_BOARD]);
     // Every token is the sum of its content row and its nine cell rows.
-    let content = qat.rows(qat.content, e.content.weight.val());
+    let content = qat.rows(qat.content, content_table(e));
     let tokens = rows(content, token_ids)
         .reshape([n, TOKENS, IDS_PER_BOARD, d_e])
         .sum_dim(2)
@@ -772,7 +887,7 @@ pub fn fold<N: NnueNet + Clone>(net: &N) -> FoldedNnue<N> {
         &device,
     );
     // The token of every content (rows 0..CONTENTS) and of "no forced board" (the last).
-    let tokens = lookup(e.content, ids)
+    let tokens = rows(content_table(&e), ids)
         .sum_dim(1)
         .reshape([CONTENTS + 1, d_e]);
     // Spread over the raw codes; codes no game reaches get zero rows (and so zero products),
@@ -1099,6 +1214,43 @@ mod tests {
             .with_d_acc(32)
             .with_d_hidden(16)
             .with_layers(2)
+    }
+
+    #[test]
+    fn missing_tensors_are_read_from_the_error() {
+        assert_eq!(
+            missing_paths(r#"Missing tensors: ["gates.weight", "gates.bias"]"#),
+            Some(vec!["gates.weight", "gates.bias"])
+        );
+        assert_eq!(missing_paths("Missing tensors: []"), None);
+        assert_eq!(missing_paths(r#"Apply errors: ["gates.weight"]"#), None);
+    }
+
+    #[test]
+    fn folded_network_with_lines_matches_the_network() {
+        let _lock = crate::nn::device_lock();
+        let device = BackendKind::preferred().device();
+        let model = NnueConfig::new()
+            .with_d_embed(16)
+            .with_d_acc(32)
+            .with_d_hidden(16)
+            .with_lines(Some(true))
+            .init(&device);
+        assert_eq!(
+            model.lines.as_ref().map(|l| l.weight.dims()),
+            Some([LINE_ROWS, 16])
+        );
+        // At zero, the line table changes nothing; make it matter.
+        let model = Nnue {
+            lines: model.lines.clone().map(|mut l| {
+                l.weight = l
+                    .weight
+                    .map(|w| w.random_like(burn::tensor::Distribution::Normal(0.0, 0.1)));
+                l
+            }),
+            ..model
+        };
+        assert_folds(&model, &device);
     }
 
     #[test]

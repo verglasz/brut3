@@ -293,9 +293,18 @@ mod tests {
             .with_d_acc(32)
             .with_d_hidden(16)
             .with_layers(3);
-        for config in [nnue.clone(), nnue.with_reglu(Some(24))] {
+        for config in [
+            nnue.clone(),
+            nnue.clone().with_reglu(Some(24)),
+            nnue.with_lines(Some(true)),
+        ] {
             let model = config.init(&device).map(&mut Jitter);
-            assert_matches(&model, &Weights::from_model(&model), 0, &device);
+            // The line table folds into the content rows.
+            let folded = match config.lines {
+                Some(true) => crate::nn::nnue::LINE_ROWS * config.d_embed,
+                _ => 0,
+            };
+            assert_matches(&model, &Weights::from_model(&model), folded, &device);
         }
         let v2 = NnueV2Config::new()
             .with_d_embed(16)

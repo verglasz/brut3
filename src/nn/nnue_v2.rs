@@ -27,7 +27,7 @@ use std::path::Path;
 use burn::module::Param;
 use burn::nn::{Initializer, Linear, LinearConfig};
 use burn::prelude::*;
-use burn::store::{ModuleRecord, RecordError};
+use burn::store::RecordError;
 use burn::tensor::activation::relu;
 
 use super::model::{MOVES, Model, Prediction};
@@ -41,6 +41,7 @@ use super::nnue::{
     Qat,
     ReGlu,
     fold,
+    load_tolerating,
     nnue_input,
     predict,
 };
@@ -66,6 +67,9 @@ pub struct NnueV2Config {
     /// starting at 0.
     #[config(default = false)]
     pub rezero: bool,
+    /// Small-board line features (see [`super::nnue::LINE_ROWS`]): `Some(true)` adds them; an
+    /// `Option` so that specs saved before it existed load without them.
+    pub lines: Option<bool>,
 }
 
 impl NnueV2Config {
@@ -97,7 +101,13 @@ impl NnueV2Config {
         let gates = LinearConfig::new(d_h, GATES)
             .with_initializer(Initializer::Zeros)
             .init(device);
-        let e = EndLayers::new(self.d_embed, self.d_acc, d_h, device);
+        let e = EndLayers::new(
+            self.d_embed,
+            self.d_acc,
+            d_h,
+            self.lines == Some(true),
+            device,
+        );
         NnueV2 {
             config: self.clone(),
             content: e.content,
@@ -116,6 +126,7 @@ impl NnueV2Config {
             local_policy: e.local_policy,
             send_policy: e.send_policy,
             gates,
+            lines: e.lines,
             qat: Qat::default(),
         }
     }
@@ -149,6 +160,9 @@ pub struct NnueV2 {
     pub send_policy: burn::nn::Embedding,
     /// `h -> GATES`, through a sigmoid in the heads.
     pub gates: Linear,
+    /// Small-board line rows (see [`super::nnue::content_table`]), when the config asks for
+    /// them.
+    pub lines: Option<burn::nn::Embedding>,
     #[module(skip)]
     qat: Qat,
 }
@@ -176,17 +190,16 @@ impl NnueV2 {
     }
 
     /// Loads the weights saved at `path`, strictly, except that weights saved before the
-    /// heads had gates load too: the gates keep their initial values, every gate 1/2, and the
-    /// value's two terms and the policy tables are doubled, so that the network computes what
-    /// the saved one did.
+    /// heads had gates, or without small-board line features, load too, so that the network
+    /// computes what the saved one did: missing gates keep their initial values, every gate
+    /// 1/2, with the value's two terms and the policy tables doubled; a missing line table
+    /// stays at zero.
     pub fn load_weights(self, path: &Path) -> Result<Self, RecordError> {
-        let record = ModuleRecord::load(path)?;
-        match self.clone().try_load_record(record.clone()) {
-            Err(RecordError::Validation(e)) if only_gates_missing(&e) => {
-                Ok(self.try_load_record(record.allow_partial(true))?.ungated())
-            }
-            loaded => loaded,
-        }
+        let (model, missing) = load_tolerating(self, path, &["gates", "lines"])?;
+        Ok(match missing.iter().any(|f| f == "gates") {
+            true => model.ungated(),
+            false => model,
+        })
     }
 
     /// Doubles everything the gates scale, which at their initial 1/2 undoes them.
@@ -199,17 +212,6 @@ impl NnueV2 {
         self.send_policy.weight = double(self.send_policy.weight);
         self
     }
-}
-
-/// Whether a validation error is about missing tensors, all of them the gates'. Burn reports
-/// them only as a message, `Missing tensors: ["gates.weight", ...]`.
-fn only_gates_missing(error: &str) -> bool {
-    let Some(list) = error.strip_prefix("Missing tensors: ") else {
-        return false;
-    };
-    // The quoted paths are the odd pieces between quotes.
-    let mut paths = list.split('"').skip(1).step_by(2).peekable();
-    paths.peek().is_some() && paths.all(|p| p.starts_with("gates."))
 }
 
 impl NnueNet for NnueV2 {
@@ -225,6 +227,7 @@ impl NnueNet for NnueV2 {
             local_policy: &self.local_policy,
             send_policy: &self.send_policy,
             gates: Some(&self.gates),
+            lines: self.lines.as_ref(),
         }
     }
 
@@ -370,13 +373,5 @@ mod tests {
             .max()
             .into_scalar();
         assert!(diff < 1e-5, "doubled gated heads differ by {diff}");
-        assert!(only_gates_missing(
-            r#"Missing tensors: ["gates.weight", "gates.bias"]"#
-        ));
-        assert!(!only_gates_missing(
-            r#"Missing tensors: ["gates.weight", "policy.bias"]"#
-        ));
-        assert!(!only_gates_missing("Missing tensors: []"));
-        assert!(!only_gates_missing(r#"Apply errors: ["gates.weight"]"#));
     }
 }

@@ -12,6 +12,7 @@ use serde_json::json;
 use super::any_model::{AnyModel, ModelSpec};
 use super::backend::BackendKind;
 use super::games;
+use super::nnue::Nnue;
 use super::nnue_v2::NnueV2;
 use super::train::{Dataset, Sample, TrainOptions, TrainReport, generate_threaded, train};
 use crate::agent::AgentSpec;
@@ -70,7 +71,9 @@ pub fn train_model(
         ModelSpec::CellTransformer(cfg) => run!(CellTransformer, |d| cfg.init(d)),
         ModelSpec::BoardTransformerV2(cfg) => run!(BoardTransformerV2, |d| cfg.init(d)),
         ModelSpec::CellTransformerV2(cfg) => run!(CellTransformerV2, |d| cfg.init(d)),
-        ModelSpec::Nnue(cfg) => run!(Nnue, |d| cfg.init(d)),
+        ModelSpec::Nnue(cfg) => run!(Nnue, |d| cfg.init(d), |m: Nnue, path: &Path| m
+            .load_weights(&ModelSpec::weights_path(path))
+            .map_err(|e| e.to_string())),
         ModelSpec::NnueV2(cfg) => run!(NnueV2, |d| cfg.init(d), |m: NnueV2, path: &Path| m
             .load_weights(&ModelSpec::weights_path(path))
             .map_err(|e| e.to_string())),

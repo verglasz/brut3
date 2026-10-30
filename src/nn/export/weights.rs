@@ -233,7 +233,8 @@ impl Shared {
         let mix = Dense::from_linear(e.mix);
         let mix_t = mix.weight.transposed(); // [9 * d_embed, d_acc] again
         Self {
-            content: Matrix::from_tensor(e.content.weight.val()),
+            // With small-board line features, their rows folded into the contents'.
+            content: Matrix::from_tensor(crate::nn::nnue::content_table(e)),
             mix: (0..BOARDS)
                 .map(|k| mix_t.rows(k * d_embed..(k + 1) * d_embed).transposed())
                 .collect(),
@@ -292,6 +293,9 @@ impl Weights {
         if let Some(d_ff) = c.reglu {
             spec += &format!(" reglu {d_ff}");
         }
+        if c.lines == Some(true) {
+            spec += " lines";
+        }
         Self::assemble(spec, [c.d_embed, c.d_acc, c.d_hidden], &model.ends(), trunk)
     }
 
@@ -329,6 +333,9 @@ impl Weights {
         );
         if let Some(d_ff) = c.reglu {
             spec += &format!(" reglu {d_ff}");
+        }
+        if c.lines == Some(true) {
+            spec += " lines";
         }
         Self::assemble(spec, [c.d_embed, c.d_acc, c.d_hidden], &model.ends(), trunk)
     }
