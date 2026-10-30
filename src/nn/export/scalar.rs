@@ -247,14 +247,14 @@ mod tests {
     fn assert_matches<M>(
         model: &M,
         weights: &Weights,
-        folded: usize,
+        folded: isize,
         device: &burn::prelude::Device,
     ) where
         M: crate::nn::model::Predictor + burn::module::Module,
     {
         assert_eq!(
-            weights.parameters() + folded,
-            count_parameters(model),
+            weights.parameters() as isize + folded,
+            count_parameters(model) as isize,
             "{}",
             weights.spec
         );
@@ -295,7 +295,12 @@ mod tests {
         ] {
             let model = config.init(&device).map(&mut Jitter);
             let folded = cell_rows(config.lines == Some(true)) * config.d_embed;
-            assert_matches(&model, &Weights::from_model(&model), folded, &device);
+            assert_matches(
+                &model,
+                &Weights::from_model(&model),
+                folded as isize,
+                &device,
+            );
         }
         let v2 = NnueV2Config::new()
             .with_d_embed(16)
@@ -303,10 +308,19 @@ mod tests {
             .with_d_hidden(16)
             .with_layers(3)
             .with_rezero(true);
-        for config in [v2.clone(), v2.with_reglu(Some(24))] {
+        for config in [
+            v2.clone(),
+            v2.clone().with_reglu(Some(24)),
+            v2.with_content_rank(Some(8)),
+        ] {
             let model = config.init(&device).map(&mut Jitter);
             // Two ReZero scalars: the first layer's and the third's.
-            let folded = 2 + cell_rows(false) * config.d_embed;
+            let mut folded = (2 + cell_rows(false) * config.d_embed) as isize;
+            // A low-rank content table ships as its full product.
+            if let Some(rank) = config.content_rank {
+                let (open, d) = (crate::nn::nnue::OPEN_CONTENTS as isize, config.d_embed as isize);
+                folded += open * rank as isize + rank as isize * d - open * d;
+            }
             assert_matches(&model, &Weights::from_v2(&model), folded, &device);
         }
     }
@@ -336,7 +350,7 @@ mod tests {
             .map(&mut Jitter);
         let rounded = Weights::from_model(&model).dequantised(&tables, false);
         model.set_qat(&tables);
-        assert_matches(&model, &rounded, cell_rows(false) * 16, &device);
+        assert_matches(&model, &rounded, (cell_rows(false) * 16) as isize, &device);
     }
 
     /// The embedding rows the export folds into the token rows instead of shipping: the cell

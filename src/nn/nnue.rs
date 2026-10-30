@@ -280,7 +280,7 @@ fn content_lines() -> &'static [i32] {
 /// so they fold into its row: the inputs, the folded tables and the export (which ships this
 /// table) are the same with or without them.
 pub fn content_table(e: &Ends) -> Tensor<2> {
-    let table = e.content.weight.val();
+    let table = content_rows(e);
     let Some(lines) = e.lines else {
         return table;
     };
@@ -556,9 +556,52 @@ impl EndLayers {
     }
 }
 
+/// A content table of low rank: the open contents' rows as `low · proj`, `[OPEN_CONTENTS,
+/// rank] x [rank, d_embed]`, while the other rows (decided contents, no forced board, cells,
+/// padding) stay full in the model's `content` embedding, which then starts at
+/// `OPEN_CONTENTS` (see [`content_rows`]).
+#[derive(Module, Debug)]
+pub struct LowRankContent {
+    pub low: Embedding,
+    pub proj: Linear,
+}
+
+impl LowRankContent {
+    /// With rows of about the scale of the full table's initial ones (std 0.02).
+    pub fn new(rank: usize, d_embed: usize, device: &Device) -> Self {
+        // A default-initialised `proj` entry has variance about 1 / (3 rank), so a product
+        // entry has about std / sqrt(3).
+        Self {
+            low: EmbeddingConfig::new(OPEN_CONTENTS, rank)
+                .with_initializer(Initializer::Normal {
+                    mean: 0.0,
+                    std: 0.02 * 3f64.sqrt(),
+                })
+                .init(device),
+            proj: LinearConfig::new(rank, d_embed)
+                .with_bias(false)
+                .init(device),
+        }
+    }
+}
+
+/// The content embedding's `[CONTENT_ROWS, d_embed]` rows: the embedding itself, or with a
+/// low-rank content table the open contents' products then the embedding's other rows.
+pub fn content_rows(e: &Ends) -> Tensor<2> {
+    let table = e.content.weight.val();
+    match e.content_low {
+        None => table,
+        Some(l) => Tensor::cat(vec![l.low.weight.val().matmul(l.proj.weight.val()), table], 0),
+    }
+}
+
 /// An NNUE model's layers around its hidden ones, borrowed (see [`EndLayers`]).
 pub struct Ends<'a> {
+    /// The content embedding: every content row, or with `content_low` the rows from
+    /// `OPEN_CONTENTS` on (see [`content_rows`]).
     pub content: &'a Embedding,
+    /// The open contents' rows at low rank, for models that have them.
+    pub content_low: Option<&'a LowRankContent>,
     pub mix: &'a Linear,
     pub forced_mix: &'a Linear,
     pub features: &'a Embedding,
@@ -694,6 +737,7 @@ impl NnueNet for Nnue {
     fn ends(&self) -> Ends<'_> {
         Ends {
             content: &self.content,
+            content_low: None,
             mix: &self.mix,
             forced_mix: &self.forced_mix,
             features: &self.features,
@@ -759,7 +803,7 @@ fn accumulate(e: &Ends, qat: &Qat, ids: NnueInput) -> Tensor<2> {
     } else {
         // The same sums, over only the rows this batch reads: content row plus cell rows,
         // plus the line rows.
-        let tokens = rows(e.content.weight.val(), token_ids.clone())
+        let tokens = rows(content_rows(e), token_ids.clone())
             .reshape([n, TOKENS, IDS_PER_BOARD, d_e])
             .sum_dim(2)
             .reshape([n, TOKENS, d_e]);

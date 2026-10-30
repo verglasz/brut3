@@ -68,7 +68,7 @@ impl ModelSpec {
     pub const NAMES: &str = "`linear`; `board-transformer`, `cell-transformer`, `board-v2` or \
          `cell-v2`, each followed by `[d_model] [layers] [heads]`; or `nnue` followed by \
          `[d_embed] [d_acc] [d_hidden] [layers] [reglu D_FF] [lines]`; or `nnue-v2` likewise, with \
-         at least 2 layers, and optionally `rezero`";
+         at least 2 layers, and optionally `rezero` and `rank R` (open contents' rows at rank R)";
 
     /// Parses a model name with optional hyperparameters, e.g. `linear`,
     /// `board-transformer 64 2 4` (`d_model`, layers, heads).
@@ -131,10 +131,22 @@ fn num(words: &[&str], i: usize, what: &str, default: usize) -> Result<usize, St
 }
 
 /// [`nnue`]'s words for an [`NnueV2Config`], which needs at least 2 layers, and optionally
-/// `rezero`.
+/// `rezero` and `rank R` (a low-rank content table).
 fn nnue_v2(words: &[&str]) -> Result<NnueV2Config, String> {
     let rezero = words.contains(&"rezero");
-    let words: Vec<&str> = words.iter().copied().filter(|w| *w != "rezero").collect();
+    let mut words: Vec<&str> = words.iter().copied().filter(|w| *w != "rezero").collect();
+    let content_rank = match words.iter().position(|w| *w == "rank") {
+        Some(i) => {
+            let rank = words
+                .get(i + 1)
+                .and_then(|w| w.parse::<usize>().ok())
+                .filter(|&r| r > 0)
+                .ok_or("rank takes a positive number, e.g. `rank 32`")?;
+            words.drain(i..i + 2);
+            Some(rank)
+        }
+        None => None,
+    };
     let c = nnue(&words)?;
     if c.layers < 2 {
         return Err("nnue-v2 needs at least 2 layers: the projection and a hidden layer".into());
@@ -146,7 +158,8 @@ fn nnue_v2(words: &[&str]) -> Result<NnueV2Config, String> {
         .with_layers(c.layers)
         .with_reglu(c.reglu)
         .with_rezero(rezero)
-        .with_lines(c.lines))
+        .with_lines(c.lines)
+        .with_content_rank(content_rank))
 }
 
 /// `[d_embed] [d_acc] [d_hidden] [layers]`, each optional, then optionally `reglu D_FF` for
@@ -261,6 +274,9 @@ impl fmt::Display for ModelSpec {
                 if cfg.lines == Some(true) {
                     write!(f, ", lines")?;
                 }
+                if let Some(rank) = cfg.content_rank {
+                    write!(f, ", content rank {rank}")?;
+                }
                 write!(f, ")")
             }
         }
@@ -327,6 +343,9 @@ impl AnyModel {
 
         let content = match self {
             AnyModel::Nnue(m) => &mut m.content,
+            AnyModel::NnueV2(m) if m.content_low.is_some() => {
+                return Err("its content table is low-rank already".into());
+            }
             AnyModel::NnueV2(m) => &mut m.content,
             other => return Err(format!("a {} model has no content table", other.spec())),
         };
@@ -544,6 +563,20 @@ mod tests {
             ModelSpec::NnueV2(cfg) => assert_eq!((cfg.reglu, cfg.lines), (Some(96), Some(true))),
             other => panic!("parsed {other}"),
         }
+        match ModelSpec::parse(&["nnue-v2", "64", "512", "128", "4", "rank", "32", "lines"])
+            .unwrap()
+        {
+            ModelSpec::NnueV2(cfg) => {
+                assert_eq!((cfg.content_rank, cfg.layers), (Some(32), 4));
+                assert_eq!(
+                    ModelSpec::NnueV2(cfg).to_string(),
+                    "nnue-v2 (d_embed 64, d_acc 512, d_hidden 128, 4 layers, lines, content rank 32)"
+                );
+            }
+            other => panic!("parsed {other:?}"),
+        }
+        assert!(ModelSpec::parse(&["nnue-v2", "rank"]).is_err());
+        assert!(ModelSpec::parse(&["nnue-v2", "rank", "0"]).is_err());
         match ModelSpec::parse(&["nnue-v2", "64", "512", "128", "3", "rezero", "reglu", "96"])
             .unwrap()
         {

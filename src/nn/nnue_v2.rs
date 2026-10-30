@@ -32,14 +32,17 @@ use burn::tensor::activation::relu;
 
 use super::model::{MOVES, Model, Prediction};
 use super::nnue::{
+    CONTENT_ROWS,
     EndLayers,
     Ends,
     FoldedNnue,
     GATES,
+    LowRankContent,
     NnueInput,
     NnueNet,
     Qat,
     ReGlu,
+    OPEN_CONTENTS,
     fold,
     load_tolerating,
     nnue_input,
@@ -70,6 +73,9 @@ pub struct NnueV2Config {
     /// Small-board line features (see [`super::nnue::LINE_ROWS`]): `Some(true)` adds them; an
     /// `Option` so that specs saved before it existed load without them.
     pub lines: Option<bool>,
+    /// The open contents' rows at this rank, `[OPEN_CONTENTS, rank]` times a shared `[rank,
+    /// d_embed]` (see [`super::nnue::LowRankContent`]); `None` for a full table.
+    pub content_rank: Option<usize>,
 }
 
 impl NnueV2Config {
@@ -108,9 +114,24 @@ impl NnueV2Config {
             self.lines == Some(true),
             device,
         );
+        // With a low-rank content table, the embedding keeps only the rows after the open
+        // contents.
+        let (content, content_low) = match self.content_rank {
+            None => (e.content, None),
+            Some(rank) => (
+                burn::nn::EmbeddingConfig::new(CONTENT_ROWS - OPEN_CONTENTS, self.d_embed)
+                    .with_initializer(Initializer::Normal {
+                        mean: 0.0,
+                        std: 0.02,
+                    })
+                    .init(device),
+                Some(LowRankContent::new(rank, self.d_embed, device)),
+            ),
+        };
         NnueV2 {
             config: self.clone(),
-            content: e.content,
+            content,
+            content_low,
             mix: e.mix,
             forced_mix: e.forced_mix,
             features: e.features,
@@ -136,7 +157,10 @@ impl NnueV2Config {
 pub struct NnueV2 {
     #[module(skip)]
     config: NnueV2Config,
+    /// Every content row, or with `content_low` the rows from `OPEN_CONTENTS` on.
     pub content: burn::nn::Embedding,
+    /// The open contents' rows at low rank, when the config asks for it.
+    pub content_low: Option<LowRankContent>,
     pub mix: Linear,
     pub forced_mix: Linear,
     pub features: burn::nn::Embedding,
@@ -218,6 +242,7 @@ impl NnueNet for NnueV2 {
     fn ends(&self) -> Ends<'_> {
         Ends {
             content: &self.content,
+            content_low: self.content_low.as_ref(),
             mix: &self.mix,
             forced_mix: &self.forced_mix,
             features: &self.features,
@@ -295,7 +320,11 @@ mod tests {
     fn folds_with_residual_and_gated_layers() {
         let _lock = crate::nn::device_lock();
         let device = BackendKind::preferred().device();
-        for config in [small(), small().with_reglu(Some(24))] {
+        for config in [
+            small(),
+            small().with_reglu(Some(24)),
+            small().with_content_rank(Some(8)),
+        ] {
             let model = config.init(&device);
             match config.reglu {
                 Some(_) => assert_eq!((model.hidden.len(), model.glu.len()), (0, 1)),
