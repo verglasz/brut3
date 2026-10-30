@@ -149,6 +149,124 @@ impl Weights {
     }
 }
 
+/// How one array fares under quantisation, from its own values (see [`Weights::quant_report`]).
+#[derive(Clone, Debug)]
+pub struct ArrayReport {
+    pub name: String,
+    pub rows: usize,
+    pub cols: usize,
+    pub max: f32,
+    pub rms: f32,
+    /// RMS of the int16 and the int8 error over the array's RMS.
+    pub int16_error: f32,
+    pub int8_error: f32,
+    /// A row's largest value over its RMS: the median row's and the worst row's.
+    pub row_peak_median: f32,
+    pub row_peak_max: f32,
+    /// The largest column maximum over the median one: well above 1 when a few columns
+    /// (inputs) carry much larger weights than the rest and set every row's scale.
+    pub column_outlier: f32,
+    /// The row with the largest int8 error relative to its own RMS, and that error.
+    pub worst_row: usize,
+    pub worst_row_error: f32,
+    /// The column with the largest int8 error relative to its own RMS, and that error.
+    pub worst_column: usize,
+    pub worst_column_error: f32,
+}
+
+fn rms(xs: impl Iterator<Item = f32>) -> f32 {
+    let (sum, n) = xs.fold((0.0f64, 0usize), |(s, n), x| {
+        (s + f64::from(x) * f64::from(x), n + 1)
+    });
+    if n == 0 {
+        0.0
+    } else {
+        (sum / n as f64).sqrt() as f32
+    }
+}
+
+fn median(mut xs: Vec<f32>) -> f32 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    xs.sort_by(f32::total_cmp);
+    xs[xs.len() / 2]
+}
+
+impl Weights {
+    /// Every array's quantisation statistics (see [`ArrayReport`]), in [`Weights::arrays`]
+    /// order.
+    pub fn quant_report(&self) -> Vec<ArrayReport> {
+        self.arrays()
+            .into_iter()
+            .map(|a| {
+                let (rows, cols) = (a.rows, a.cols);
+                let int16 = dequantise(a.data);
+                let (_, _, int8) = quantise_int8(a.data, cols);
+                let base = rms(a.data.iter().copied()).max(f32::MIN_POSITIVE);
+                let error = |q: &[f32]| rms(a.data.iter().zip(q).map(|(x, y)| x - y)) / base;
+                let row_rms: Vec<f32> = a
+                    .data
+                    .chunks(cols)
+                    .map(|r| rms(r.iter().copied()))
+                    .collect();
+                let peaks: Vec<f32> = a
+                    .data
+                    .chunks(cols)
+                    .zip(&row_rms)
+                    .map(|(r, &m)| {
+                        r.iter().fold(0.0f32, |p, &x| p.max(x.abs())) / m.max(f32::MIN_POSITIVE)
+                    })
+                    .collect();
+                let column_max: Vec<f32> = (0..cols)
+                    .map(|c| (0..rows).fold(0.0f32, |p, r| p.max(a.data[r * cols + c].abs())))
+                    .collect();
+                let top_column = column_max.iter().fold(0.0f32, |p, &x| p.max(x));
+                let (worst_row, worst_row_error) = a
+                    .data
+                    .chunks(cols)
+                    .zip(int8.chunks(cols))
+                    .zip(&row_rms)
+                    .map(|((r, q), &m)| {
+                        rms(r.iter().zip(q).map(|(x, y)| x - y)) / m.max(f32::MIN_POSITIVE)
+                    })
+                    .enumerate()
+                    .fold(
+                        (0, 0.0f32),
+                        |best, (i, e)| if e > best.1 { (i, e) } else { best },
+                    );
+                let (worst_column, worst_column_error) = (0..cols)
+                    .map(|c| {
+                        let column = (0..rows).map(|r| a.data[r * cols + c]);
+                        let error = (0..rows).map(|r| a.data[r * cols + c] - int8[r * cols + c]);
+                        rms(error) / rms(column).max(f32::MIN_POSITIVE)
+                    })
+                    .enumerate()
+                    .fold(
+                        (0, 0.0f32),
+                        |best, (i, e)| if e > best.1 { (i, e) } else { best },
+                    );
+                ArrayReport {
+                    name: a.name,
+                    rows,
+                    cols,
+                    max: a.data.iter().fold(0.0f32, |p, &x| p.max(x.abs())),
+                    rms: base,
+                    int16_error: error(&int16),
+                    int8_error: error(&int8),
+                    row_peak_median: median(peaks.clone()),
+                    row_peak_max: peaks.iter().fold(0.0f32, |p, &x| p.max(x)),
+                    column_outlier: top_column / median(column_max).max(f32::MIN_POSITIVE),
+                    worst_row,
+                    worst_row_error,
+                    worst_column,
+                    worst_column_error,
+                }
+            })
+            .collect()
+    }
+}
+
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Standard base64 with padding.

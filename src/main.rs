@@ -119,6 +119,11 @@ enum Command {
         /// follow.
         #[arg(long)]
         int8: bool,
+        /// Instead of exporting, print each weight array's quantisation statistics: its
+        /// magnitudes, the int16 and int8 errors relative to its RMS, how peaked its rows are,
+        /// and whether a few columns dominate.
+        #[arg(long, requires = "model")]
+        quant_report: bool,
         /// Extra FixedVec.hs shapes for hand-written code, on top of the model's, after `--`:
         /// `export --model m --out lib -- --int32 512 --rows 9:128`. Without --model,
         /// FixedVec.hs holds only these. Widths that a flag needs get their vector type too.
@@ -624,6 +629,7 @@ fn main() -> ExitCode {
             vec_extra,
             no_fixed_vec,
             int8,
+            quant_report,
             vec_flags,
         } => export(
             model.as_deref(),
@@ -641,6 +647,7 @@ fn main() -> ExitCode {
                 .collect(),
             !no_fixed_vec,
             int8,
+            quant_report,
         ),
         #[cfg(feature = "nn")]
         Command::Backends => {
@@ -1486,6 +1493,7 @@ fn export(
     vec_flags: Vec<String>,
     fixed_vec: bool,
     int8: bool,
+    quant_report: bool,
 ) -> Result<(), String> {
     use brut3::book::Book;
     use brut3::nn::export::{ExportOptions, VecSpec, Weights, write_all};
@@ -1507,6 +1515,41 @@ fn export(
                 weights.config_display(),
                 weights.parameters()
             );
+            if quant_report {
+                println!(
+                    "{:<20} {:>11} {:>9} {:>9} {:>9} {:>9} {:>8} {:>8} {:>8} {:>15} {:>15}",
+                    "array",
+                    "shape",
+                    "max",
+                    "rms",
+                    "int16 err",
+                    "int8 err",
+                    "peak med",
+                    "peak max",
+                    "col out",
+                    "worst row err",
+                    "worst col err"
+                );
+                for r in weights.quant_report() {
+                    println!(
+                        "{:<20} {:>11} {:>9.3e} {:>9.3e} {:>9.2e} {:>9.2e} {:>8.2} {:>8.2} {:>8.2} {:>9.2e} @{:<4} {:>9.2e} @{:<4}",
+                        r.name,
+                        format!("{}x{}", r.rows, r.cols),
+                        r.max,
+                        r.rms,
+                        r.int16_error,
+                        r.int8_error,
+                        r.row_peak_median,
+                        r.row_peak_max,
+                        r.column_outlier,
+                        r.worst_row_error,
+                        r.worst_row,
+                        r.worst_column_error,
+                        r.worst_column
+                    );
+                }
+                return Ok(());
+            }
             Some(weights)
         }
         None => None,
