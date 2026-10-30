@@ -109,6 +109,29 @@ impl SearchResult {
     }
 }
 
+/// A search tree's nodes and edges, held and allocated (see [`SearchTree::footprint`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Footprint {
+    pub nodes: usize,
+    pub edges: usize,
+    pub node_capacity: usize,
+    pub edge_capacity: usize,
+    pub node_size: usize,
+    pub edge_size: usize,
+}
+
+impl Footprint {
+    /// Bytes the nodes and edges in use take.
+    pub fn bytes(&self) -> usize {
+        self.nodes * self.node_size + self.edges * self.edge_size
+    }
+
+    /// Bytes allocated for nodes and edges, used or not.
+    pub fn allocated(&self) -> usize {
+        self.node_capacity * self.node_size + self.edge_capacity * self.edge_size
+    }
+}
+
 const NO_NODE: u32 = u32::MAX;
 
 /// A node of the search: its place in the tree, what is known of its position and its
@@ -447,6 +470,18 @@ impl<S: GameState> SearchTree<S> {
 
     pub fn completed(&self) -> u32 {
         self.completed
+    }
+
+    /// How much the tree holds and has allocated, for measuring layouts.
+    pub fn footprint(&self) -> Footprint {
+        Footprint {
+            nodes: self.nodes.len(),
+            edges: self.edges.len(),
+            node_capacity: self.nodes.capacity(),
+            edge_capacity: self.edges.capacity(),
+            node_size: std::mem::size_of::<Node>(),
+            edge_size: std::mem::size_of::<Edge<S::Move>>(),
+        }
     }
 
     /// Selects up to `max` leaves (never beyond the remaining budget) and appends their

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use brut3::agent::{Evaluations, RandomAgent, UtttAgent, heuristic};
 use brut3::game::{BitMove, BitState, GameState, Move, MoveSet, Symmetry, uniform_index};
-use brut3::mcts::{SearchTree, dirichlet};
+use brut3::mcts::{Footprint, SearchTree, dirichlet};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 /// Positions per pool.
@@ -16,9 +16,11 @@ const POOL: usize = 4096;
 /// Timed samples per benchmark; the median is reported.
 const SAMPLES: usize = 15;
 /// Wall time of one sample.
-const SAMPLE_TIME: Duration = Duration::from_millis(20);
+const SAMPLE_TIME: Duration = Duration::from_millis(5);
 /// Simulations per search in the `mcts/search` benchmarks.
-const SIMULATIONS: u32 = 10_000;
+const SIMULATIONS: u32 = 1_000;
+/// Simulations per move in the `mcts/game` benchmarks.
+const GAME_SIMULATIONS: u32 = 256;
 
 struct Harness {
     filters: Vec<String>,
@@ -39,7 +41,7 @@ impl Harness {
     /// `f` over one pass of `inputs`, so runs at different commits can be checked to compute
     /// the same thing.
     fn bench<T>(&self, name: &str, units: u64, inputs: &[T], mut f: impl FnMut(&T) -> u64) {
-        if !self.filters.is_empty() && !self.filters.iter().any(|w| name.contains(w.as_str())) {
+        if !self.selects(name) {
             return;
         }
         let checksum = inputs.iter().fold(0u64, |acc, x| acc.wrapping_add(f(x)));
@@ -65,12 +67,23 @@ impl Harness {
             .collect();
         per_unit.sort_by(f64::total_cmp);
         println!(
-            "{name:<46} {:>10.2} ns  [{:>9.2} .. {:>9.2}]  checksum {}",
+            "{name:<56} {:>10.2} ns  [{:>9.2} .. {:>9.2}]  checksum {}",
             per_unit[SAMPLES / 2],
             per_unit[0],
             per_unit[SAMPLES - 1],
             checksum as i64,
         );
+    }
+
+    fn selects(&self, name: &str) -> bool {
+        self.filters.is_empty() || self.filters.iter().any(|w| name.contains(w.as_str()))
+    }
+
+    /// Prints a measurement that is not a time (`text`, computed only if `name` is selected).
+    fn report(&self, name: &str, text: impl FnOnce() -> String) {
+        if self.selects(name) {
+            println!("{name:<56} {}", text());
+        }
     }
 }
 
@@ -141,6 +154,18 @@ fn search(
     evals: &mut Evaluations,
 ) -> u64 {
     let mut tree = SearchTree::new(*root, simulations, 1.4, 1.0);
+    drive(&mut tree, batch, priors, states, evals);
+    tree.result().best_move().map_or(0, |m| m.index() as u64)
+}
+
+/// Runs `tree`'s search to the end with fake leaf values (see [`search`]).
+fn drive(
+    tree: &mut SearchTree<BitState>,
+    batch: usize,
+    priors: Option<&[f32; Move::COUNT]>,
+    states: &mut Vec<BitState>,
+    evals: &mut Evaluations,
+) {
     while !tree.is_done() {
         states.clear();
         if tree.claim(batch, states) > 0 {
@@ -154,7 +179,39 @@ fn search(
             tree.resolve(evals, 0);
         }
     }
-    tree.result().best_move().map_or(0, |m| m.index() as u64)
+}
+
+/// A whole game from `root`, each side searching `simulations` per move in one tree reset
+/// between moves (as self-play and matches do) and playing its most visited move. Calls
+/// `each` with the tree after every search. Returns the simulations run and a checksum of the
+/// moves played.
+fn game(
+    root: &BitState,
+    simulations: u32,
+    batch: usize,
+    priors: Option<&[f32; Move::COUNT]>,
+    states: &mut Vec<BitState>,
+    evals: &mut Evaluations,
+    mut each: impl FnMut(&SearchTree<BitState>),
+) -> (u64, u64) {
+    let mut tree = SearchTree::new(*root, simulations, 1.4, 1.0);
+    let (mut sims, mut checksum) = (0u64, 0u64);
+    let mut state = *root;
+    loop {
+        drive(&mut tree, batch, priors, states, evals);
+        each(&tree);
+        sims += u64::from(tree.completed());
+        let Some(mv) = tree.result().best_move() else {
+            break;
+        };
+        checksum = checksum.wrapping_mul(31).wrapping_add(mv.index() as u64);
+        state.apply(BitMove::from(mv));
+        if state.outcome().is_some() {
+            break;
+        }
+        tree.reset(state, simulations, 1.4, 1.0);
+    }
+    (sims, checksum)
 }
 
 fn main() {
@@ -250,6 +307,8 @@ fn main() {
     });
 
     // --- Search, with fake leaf values: the tree's own cost per simulation ---
+    // Every pass is about 16k simulations (a few ms), so that the whole section runs well
+    // under a second.
     let roots = &p.all[..16];
     let mut row = [0.0f32; Move::COUNT];
     for (i, x) in row.iter_mut().enumerate() {
@@ -262,12 +321,46 @@ fn main() {
         (16, Some(&row), "prior rows, batch 16"),
     ] {
         h.bench(
-            &format!("mcts/search per sim, {label}"),
+            &format!("mcts/search 1k per sim, {label}"),
             SIMULATIONS as u64,
             roots,
             |s| search(s, SIMULATIONS, batch, priors, &mut states, &mut evals),
         );
     }
+    // A larger tree, which stays less in cache.
+    h.bench(
+        "mcts/search 10k per sim, prior rows, batch 16",
+        10 * SIMULATIONS as u64,
+        &roots[..2],
+        |s| search(s, 10 * SIMULATIONS, 16, Some(&row), &mut states, &mut evals),
+    );
+    // One tree reused across searches, as a game's moves reuse it.
+    let mut reused = SearchTree::new(roots[0], SIMULATIONS, 1.4, 1.0);
+    h.bench(
+        "mcts/search 1k per sim, prior rows, batch 16, reset tree",
+        SIMULATIONS as u64,
+        roots,
+        |s| {
+            reused.reset(*s, SIMULATIONS, 1.4, 1.0);
+            drive(&mut reused, 16, Some(&row), &mut states, &mut evals);
+            reused.result().best_move().map_or(0, |m| m.index() as u64)
+        },
+    );
+    // Whole games: proven positions near the end stop their searches early, so the unit is
+    // the mean number of simulations a game runs.
+    let game_roots = &roots[..2];
+    let game_sims: u64 = game_roots
+        .iter()
+        .map(|s| game(s, GAME_SIMULATIONS, 16, Some(&row), &mut states, &mut evals, |_| {}).0)
+        .sum();
+    h.bench(
+        &format!("mcts/game {GAME_SIMULATIONS} per move, per sim, batch 16"),
+        game_sims / game_roots.len() as u64,
+        game_roots,
+        |s| game(s, GAME_SIMULATIONS, 16, Some(&row), &mut states, &mut evals, |_| {}).1,
+    );
+    tree_memory(&h, roots, &row);
+
     let alphas = [0.3f32; 64];
     let mut noise_rng = SmallRng::seed_from_u64(5);
     h.bench("mcts/dirichlet(0.3, 81)", 1, &alphas, |a| {
@@ -276,6 +369,67 @@ fn main() {
 
     #[cfg(feature = "nn")]
     network_inputs(&h, &p);
+}
+
+/// The trees' size per simulation: what the nodes and edges in use take, and what is allocated
+/// for them. Fresh trees allocate by doubling; a reset tree keeps its buffers, so over a game
+/// the allocation is the largest search's (resized once, after the first).
+fn tree_memory(h: &Harness, roots: &[BitState], row: &[f32; Move::COUNT]) {
+    let (mut states, mut evals) = (Vec::new(), Evaluations::default());
+    let per_sim = |f: &Footprint, sims: u64| {
+        format!(
+            "{:>7.1} B/sim used  {:>7.1} B/sim allocated  ({} B nodes x {:.2}/sim, {} B edges x {:.2}/sim)",
+            f.bytes() as f64 / sims as f64,
+            f.allocated() as f64 / sims as f64,
+            f.node_size,
+            f.nodes as f64 / sims as f64,
+            f.edge_size,
+            f.edges as f64 / sims as f64,
+        )
+    };
+    for (sims, n_roots) in [(SIMULATIONS, 16), (10 * SIMULATIONS, 2)] {
+        let name = format!("mem/search {}k", sims / 1000);
+        h.report(&name, || {
+            let mut total = Footprint::default();
+            let mut completed = 0;
+            for root in &roots[..n_roots] {
+                let mut tree = SearchTree::new(*root, sims, 1.4, 1.0);
+                drive(&mut tree, 16, Some(row), &mut states, &mut evals);
+                let f = tree.footprint();
+                total = Footprint {
+                    nodes: total.nodes + f.nodes,
+                    edges: total.edges + f.edges,
+                    node_capacity: total.node_capacity + f.node_capacity,
+                    edge_capacity: total.edge_capacity + f.edge_capacity,
+                    ..f
+                };
+                completed += u64::from(tree.completed());
+            }
+            per_sim(&total, completed)
+        });
+    }
+    let name = format!("mem/game {GAME_SIMULATIONS} per move, peak");
+    h.report(&name, || {
+        // The largest search of each game and the allocation at the end of it.
+        let mut peak = Footprint::default();
+        for root in &roots[..2] {
+            game(
+                root,
+                GAME_SIMULATIONS,
+                16,
+                Some(row),
+                &mut states,
+                &mut evals,
+                |tree| {
+                    let f = tree.footprint();
+                    if f.allocated() > peak.allocated() {
+                        peak = f;
+                    }
+                },
+            );
+        }
+        per_sim(&peak, u64::from(GAME_SIMULATIONS))
+    });
 }
 
 /// Encoding positions into network inputs, which self-play does on the CPU for every leaf.
