@@ -110,6 +110,13 @@ pub trait Model: Module {
     fn encode(states: &[BitState], device: &Device) -> Self::Input;
 
     fn predict(&self, input: Self::Input) -> Prediction;
+
+    /// Trains the tables whose export arrays `int8` covers fake-quantised to the export's
+    /// int8 grid (quantisation-aware training; see [`super::nnue::Qat`]). Only the NNUE
+    /// models have such tables; the others ignore it.
+    fn set_qat(&mut self, int8: &super::export::Int8Arrays) {
+        let _ = int8;
+    }
 }
 
 /// Anything that turns positions into a [`Prediction`]: every [`Model`], and inference-only

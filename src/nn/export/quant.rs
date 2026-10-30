@@ -55,9 +55,9 @@ pub const INT8_STEPS_PER_OCTAVE: f32 = 8.0;
 
 /// Int8 quantisation of `rows` rows of `cols` values: the bytes as shipped (each row its
 /// exponent byte `e`, then its values as signed bytes), the base scale, and the values as the
-/// decoder gets them back. Row `r`'s scale is `base * 2^(-e / 8)` with the largest `e` whose
-/// scale still covers the row's largest value in 127 steps (so at least about 116 are used),
-/// and `e = 255` for a row of zeros.
+/// decoder gets them back. Row `r`'s scale is `base * 2^(-e / 8)`, `2^(k / 8)` for the smallest
+/// `k` that covers the row's largest value in 127 steps (so at least about 116 are used), the
+/// base being the largest row's scale; `e = 255` for a row of zeros.
 pub fn quantise_int8(data: &[f32], cols: usize) -> (Vec<u8>, f32, Vec<f32>) {
     quantise_int8_with(data, cols, None)
 }
@@ -75,18 +75,21 @@ pub fn quantise_int8_with(
     if let Some(u) = factor {
         assert_eq!(u.len(), cols * cols, "a factor for rows of {cols}");
     }
-    let max = data.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-    let base = if max > 0.0 { max / 127.0 } else { 1.0 };
+    // Each row's scale is 2^(k / 8) for the smallest k that covers its largest value in 127
+    // steps (an absolute ladder, as training fake-quantises: see nn::nnue::Qat); the base is
+    // the largest row's, and a row's exponent byte says how many rungs below it the row is.
+    let rung = |row: &[f32]| {
+        let need = row.iter().fold(0.0f32, |m, &x| m.max(x.abs())) / 127.0;
+        (need > 0.0).then(|| (need.log2() * INT8_STEPS_PER_OCTAVE).ceil() as i32)
+    };
+    let top = data.chunks(cols).filter_map(rung).max();
+    let base = top.map_or(1.0, |k| 2f32.powf(k as f32 / INT8_STEPS_PER_OCTAVE));
     let mut bytes = Vec::with_capacity(data.len() + data.len() / cols.max(1));
     let mut values = Vec::with_capacity(data.len());
     for row in data.chunks(cols) {
-        let need = row.iter().fold(0.0f32, |m, &x| m.max(x.abs())) / 127.0;
-        let e = if need > 0.0 {
-            ((base / need).log2() * INT8_STEPS_PER_OCTAVE)
-                .floor()
-                .clamp(0.0, 254.0) as u8
-        } else {
-            255
+        let e = match (rung(row), top) {
+            (Some(k), Some(top)) => (top - k).clamp(0, 254) as u8,
+            _ => 255,
         };
         let scale = int8_row_scale(base, e);
         bytes.push(e);
@@ -203,10 +206,13 @@ impl Weights {
 
     /// The weights after the round trip of the export's quantisation (int8 for the arrays
     /// `int8` covers, int16 for the others): what the Haskell evaluator computes with.
-    pub fn dequantised(&self, int8: &Int8Arrays) -> Self {
+    pub fn dequantised(&self, int8: &Int8Arrays, gptq: bool) -> Self {
         let factor = self.content_factor();
         self.map_arrays(|a| match int8.covers(&a.name) {
-            true => quantise_int8_with(a.data, a.cols, self.rounding(&a.name, &factor)).2,
+            true => {
+                let rounding = gptq.then(|| self.rounding(&a.name, &factor)).flatten();
+                quantise_int8_with(a.data, a.cols, rounding).2
+            }
             false => dequantise(a.data),
         })
     }
@@ -241,14 +247,14 @@ impl Weights {
     }
 
     /// Every array quantised, in [`Weights::arrays`] order.
-    pub fn quantised(&self, int8: &Int8Arrays) -> Vec<QuantisedArray> {
+    pub fn quantised(&self, int8: &Int8Arrays, gptq: bool) -> Vec<QuantisedArray> {
         let factor = self.content_factor();
         self.arrays()
             .into_iter()
             .map(|a| {
                 let (scale, bytes) = match int8.covers(&a.name) {
                     true => {
-                        let rounding = self.rounding(&a.name, &factor);
+                        let rounding = gptq.then(|| self.rounding(&a.name, &factor)).flatten();
                         let (bytes, base, _) = quantise_int8_with(a.data, a.cols, rounding);
                         (base, bytes)
                     }
@@ -453,7 +459,7 @@ mod tests {
             .with_d_hidden(4)
             .init(&device);
         let weights = Weights::from_model(&model);
-        let arrays = weights.quantised(&Int8Arrays::default());
+        let arrays = weights.quantised(&Int8Arrays::default(), true);
         let values: usize = arrays.iter().map(|a| a.rows * a.cols).sum();
         assert_eq!(values, weights.parameters());
         for a in &arrays {
@@ -468,7 +474,7 @@ mod tests {
             assert!((q as f32 * first.scale - w).abs() <= first.scale / 2.0 + 1e-9);
         }
         assert_eq!(
-            weights.dequantised(&Int8Arrays::default()).spec,
+            weights.dequantised(&Int8Arrays::default(), true).spec,
             weights.spec
         );
     }
@@ -519,7 +525,11 @@ mod tests {
         ];
         let (bytes, base, values) = quantise_int8(&data, 4);
         assert_eq!(bytes.len(), 3 * 5);
-        assert_eq!(base, 1.0 / 127.0);
+        // The largest row's scale: the ladder's rung at or just above 1 / 127.
+        assert!(
+            base >= 1.0 / 127.0 && base < 1.0 / 127.0 * 2f32.powf(0.125),
+            "{base}"
+        );
         for (r, row) in data.chunks(4).enumerate() {
             let e = bytes[r * 5];
             let scale = int8_row_scale(base, e);

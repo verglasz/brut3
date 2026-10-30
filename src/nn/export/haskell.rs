@@ -66,6 +66,10 @@ pub struct ExportOptions {
     /// [`quantise_int8`](super::quant::quantise_int8)) instead of int16: about half their
     /// text.
     pub int8: Int8Arrays,
+    /// Round the int8 content arrays GPTQ's way (see
+    /// [`quantise_int8_with`](super::quant::quantise_int8_with)) rather than to nearest. Off
+    /// for a model trained fake-quantised, which must be rounded as it was trained.
+    pub gptq: bool,
 }
 
 impl Default for ExportOptions {
@@ -80,6 +84,7 @@ impl Default for ExportOptions {
             vec_extra: None,
             fixed_vec: true,
             int8: Int8Arrays::default(),
+            gptq: true,
         }
     }
 }
@@ -151,7 +156,7 @@ pub fn write_all(
         Ok(())
     };
     if let Some(weights) = weights {
-        let rounded = weights.dequantised(&opts.int8);
+        let rounded = weights.dequantised(&opts.int8, opts.gptq);
         let names = codegen::Names::new(weights, opts.int8.clone());
         emit("Spec", spec_module(weights, &opts.prefix))?;
         let positions = reference_positions(opts.seed, opts.positions);
@@ -161,7 +166,7 @@ pub fn write_all(
             reference_module(&rounded, &positions, &opts.prefix),
         )?;
         let (text, stream_bytes, chunks, manifest_names) =
-            weights_module(weights, &opts.prefix, opts.chunk, &opts.int8);
+            weights_module(weights, &opts.prefix, opts.chunk, &opts.int8, opts.gptq);
         emit("Weights", text)?;
         emit(
             "Net",
@@ -238,6 +243,7 @@ pub fn weights_module(
     prefix: &str,
     chunk: usize,
     int8: &Int8Arrays,
+    gptq: bool,
 ) -> (String, usize, usize, Vec<String>) {
     // Pieces cut at a multiple of 4 characters decode on their own (int8 arrays are decoded
     // piece by piece).
@@ -245,7 +251,7 @@ pub fn weights_module(
         chunk % 4 == 0,
         "literal pieces of a multiple of 4 characters"
     );
-    let arrays = weights.quantised(int8);
+    let arrays = weights.quantised(int8, gptq);
     let bytes: usize = arrays.iter().map(|a| a.bytes.len()).sum();
     let mut s = String::with_capacity(bytes * 4 / 3 + 4096);
     // Not -O0: at -O0 every literal is an updatable CAF whose unpacked characters stay

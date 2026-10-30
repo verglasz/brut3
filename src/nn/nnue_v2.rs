@@ -38,6 +38,7 @@ use super::nnue::{
     GATES,
     NnueInput,
     NnueNet,
+    Qat,
     ReGlu,
     fold,
     nnue_input,
@@ -115,6 +116,7 @@ impl NnueV2Config {
             local_policy: e.local_policy,
             send_policy: e.send_policy,
             gates,
+            qat: Qat::default(),
         }
     }
 }
@@ -147,6 +149,8 @@ pub struct NnueV2 {
     pub send_policy: burn::nn::Embedding,
     /// `h -> GATES`, through a sigmoid in the heads.
     pub gates: Linear,
+    #[module(skip)]
+    qat: Qat,
 }
 
 impl NnueV2 {
@@ -224,6 +228,10 @@ impl NnueNet for NnueV2 {
         }
     }
 
+    fn qat(&self) -> &Qat {
+        &self.qat
+    }
+
     fn trunk(&self, acc: Tensor<2>) -> Tensor<2> {
         // Layer `i`'s branch, scaled by its ReZero scalar when there is one.
         let scaled = |i: usize, branch: Tensor<2>| match self.rezero.get(i) {
@@ -257,6 +265,10 @@ impl Model for NnueV2 {
 
     fn predict(&self, ids: NnueInput) -> Prediction {
         predict(self, ids)
+    }
+
+    fn set_qat(&mut self, int8: &crate::nn::export::Int8Arrays) {
+        self.qat = Qat::of(int8);
     }
 }
 

@@ -127,6 +127,10 @@ enum Command {
         /// `content,local,send` (the content table and the policy tables), the rest as int16.
         #[arg(long, value_delimiter = ',')]
         int8_only: Vec<String>,
+        /// Round the int8 content arrays to nearest instead of GPTQ's way: for a model trained
+        /// fake-quantised (`train --qat`), which must be rounded as it was trained.
+        #[arg(long)]
+        nearest_rounding: bool,
         /// Instead of exporting, print each weight array's quantisation statistics: its
         /// magnitudes, the int16 and int8 errors relative to its RMS, how peaked its rows are,
         /// and whether a few columns dominate.
@@ -524,6 +528,13 @@ struct TrainArgs {
     /// for none): sampling every step makes a step about six times slower.
     #[arg(long, default_value_t = brut3::nn::train_stats::DEFAULT_EVERY)]
     stats_every: usize,
+    /// Quantisation-aware training: the tables whose export arrays start with one of these
+    /// prefixes (as `export --int8-only` takes them, e.g. `content,local,send,mix,features,
+    /// forced`) train with their weights fake-quantised to the export's int8 grid, and the
+    /// validation measures the quantised network. Export the result with the same
+    /// `--int8-only` and `--nearest-rounding`.
+    #[arg(long, value_delimiter = ',')]
+    qat: Vec<String>,
     /// Fraction of the positions held out for validation.
     #[arg(long, default_value_t = 0.1)]
     validation_fraction: f32,
@@ -639,6 +650,7 @@ fn main() -> ExitCode {
             no_fixed_vec,
             int8,
             int8_only,
+            nearest_rounding,
             quant_report,
             vec_flags,
         } => export(
@@ -661,6 +673,7 @@ fn main() -> ExitCode {
                 true => brut3::nn::export::Int8Arrays::all(),
                 false => brut3::nn::export::Int8Arrays(int8_only),
             },
+            !nearest_rounding,
             quant_report,
         ),
         #[cfg(feature = "nn")]
@@ -1508,6 +1521,7 @@ fn export(
     vec_flags: Vec<String>,
     fixed_vec: bool,
     int8: brut3::nn::export::Int8Arrays,
+    gptq: bool,
     quant_report: bool,
 ) -> Result<(), String> {
     use brut3::book::Book;
@@ -1599,6 +1613,7 @@ fn export(
         vec_extra,
         fixed_vec,
         int8,
+        gptq,
         ..ExportOptions::default()
     };
     let report = write_all(weights.as_ref(), book.as_ref(), out, &opts)?;
@@ -1727,6 +1742,7 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         lr_min: args.lr_min,
         weight_decay: args.weight_decay,
         stats_every: args.stats_every,
+        qat: brut3::nn::export::Int8Arrays(args.qat.clone()),
         validation_fraction: args.validation_fraction,
         workers: args.workers,
         seed: args.seed,

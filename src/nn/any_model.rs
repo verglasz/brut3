@@ -284,6 +284,13 @@ impl AnyModel {
         with_model!(self, |m| m.num_params())
     }
 
+    /// Evaluates with the tables `int8` covers fake-quantised to the export's int8 grid (see
+    /// [`super::model::Model::set_qat`]).
+    pub fn set_qat(&mut self, int8: &super::export::Int8Arrays) {
+        use super::model::Model;
+        with_model!(self, |m| m.set_qat(int8))
+    }
+
     /// The model's quality over `samples` (see [`super::train::evaluate`]).
     pub fn evaluate(
         &self,

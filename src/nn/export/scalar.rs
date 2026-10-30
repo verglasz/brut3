@@ -310,6 +310,34 @@ mod tests {
         }
     }
 
+    /// A model trained fake-quantised computes what the export's int8 weights do: training and
+    /// export agree on every table's layout and grid.
+    #[test]
+    fn fake_quantised_tables_match_the_int8_export() {
+        use burn::module::Module;
+
+        use crate::nn::export::Int8Arrays;
+        use crate::nn::model::Model;
+
+        let _device = crate::nn::device_lock();
+        let device = BackendKind::preferred().device();
+        let tables = Int8Arrays(
+            ["content", "local", "send", "mix", "features", "forced"]
+                .map(String::from)
+                .to_vec(),
+        );
+        let mut model = NnueConfig::new()
+            .with_d_embed(16)
+            .with_d_acc(64)
+            .with_d_hidden(16)
+            .with_layers(2)
+            .init(&device)
+            .map(&mut Jitter);
+        let rounded = Weights::from_model(&model).dequantised(&tables, false);
+        model.set_qat(&tables);
+        assert_matches(&model, &rounded, 0, &device);
+    }
+
     fn count_parameters(model: &impl burn::module::Module) -> usize {
         model.num_params()
     }

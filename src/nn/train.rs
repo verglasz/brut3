@@ -754,6 +754,9 @@ pub struct TrainOptions {
     /// Training steps between two samples of the gradient and update statistics, 0 for none
     /// (see [`super::train_stats::set_every`]).
     pub stats_every: usize,
+    /// Tables trained fake-quantised to the export's int8 grid, by the export's array names
+    /// (see [`Model::set_qat`]); none by default.
+    pub qat: super::export::Int8Arrays,
 }
 
 impl Default for TrainOptions {
@@ -773,6 +776,7 @@ impl Default for TrainOptions {
             artifact_dir: PathBuf::from("artifacts/train"),
             tui: true,
             stats_every: super::train_stats::DEFAULT_EVERY,
+            qat: super::export::Int8Arrays::default(),
         }
     }
 }
@@ -942,7 +946,8 @@ pub fn train<M: Trainable>(
         .build(InMemDataset::new(valid_samples.clone()));
 
     super::train_stats::set_every(opts.stats_every);
-    let model = init(&ad_device);
+    let mut model = init(&ad_device);
+    model.set_qat(&opts.qat);
     let optim = AdamWConfig::new()
         .with_weight_decay(opts.weight_decay)
         .init();
@@ -993,6 +998,7 @@ pub fn train<M: Trainable>(
     }
     // The trained weights without autodiff, on `device`.
     let mut model = result.model.valid();
+    model.set_qat(&opts.qat);
 
     // The Learner returns the last epoch's model; prefer the epoch with the lowest validation
     // loss, whose checkpoint burn keeps, since large models overfit well before the end.
@@ -1008,6 +1014,7 @@ pub fn train<M: Trainable>(
             match init(device).try_load_file(&path) {
                 Ok(m) => {
                     model = m.valid();
+                    model.set_qat(&opts.qat);
                     best_epoch = best;
                 }
                 Err(e) => eprintln!("cannot load best checkpoint (epoch {best}): {e}"),

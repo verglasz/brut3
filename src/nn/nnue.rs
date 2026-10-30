@@ -353,6 +353,7 @@ impl NnueConfig {
             policy: e.policy,
             local_policy: e.local_policy,
             send_policy: e.send_policy,
+            qat: Qat::default(),
         }
     }
 }
@@ -428,6 +429,9 @@ pub const GATES: usize = 1 + 2 * BOARDS;
 pub trait NnueNet: Module {
     fn ends(&self) -> Ends<'_>;
 
+    /// The tables that train fake-quantised (see [`Qat`]).
+    fn qat(&self) -> &Qat;
+
     /// The hidden layers: from the rectified accumulator to the state the heads read.
     fn trunk(&self, acc: Tensor<2>) -> Tensor<2>;
 }
@@ -486,6 +490,8 @@ pub struct Nnue {
     pub local_policy: Embedding,
     /// `[CONTENTS, 1]`: the logit of sending the opponent to a board with this content.
     pub send_policy: Embedding,
+    #[module(skip)]
+    qat: Qat,
 }
 
 impl Nnue {
@@ -534,6 +540,10 @@ impl NnueNet for Nnue {
         }
     }
 
+    fn qat(&self) -> &Qat {
+        &self.qat
+    }
+
     fn trunk(&self, acc: Tensor<2>) -> Tensor<2> {
         let mut h = relu(self.hidden[0].forward(acc));
         for layer in &self.hidden[1..] {
@@ -556,17 +566,22 @@ impl Model for Nnue {
     fn predict(&self, ids: NnueInput) -> Prediction {
         predict(self, ids)
     }
+
+    fn set_qat(&mut self, int8: &crate::nn::export::Int8Arrays) {
+        self.qat = Qat::of(int8);
+    }
 }
 
 /// The accumulator before its ReLU: the board tokens through their matrices, the forced token
 /// through its own, the feature rows and the bias.
-fn accumulate(e: &Ends, ids: NnueInput) -> Tensor<2> {
+fn accumulate(e: &Ends, qat: &Qat, ids: NnueInput) -> Tensor<2> {
     let [n, _] = ids.dims();
     let [_, d_e] = e.content.weight.dims();
     let [_, d_acc] = e.features.weight.dims();
     let token_ids = ids.clone().slice([0..n, 0..TOKENS * IDS_PER_BOARD]);
     // Every token is the sum of its content row and its nine cell rows.
-    let tokens = lookup(e.content, token_ids)
+    let content = qat.rows(qat.content, e.content.weight.val());
+    let tokens = rows(content, token_ids)
         .reshape([n, TOKENS, IDS_PER_BOARD, d_e])
         .sum_dim(2)
         .reshape([n, TOKENS, d_e]);
@@ -575,10 +590,15 @@ fn accumulate(e: &Ends, ids: NnueInput) -> Tensor<2> {
         .slice([0..n, 0..BOARDS])
         .reshape([n, BOARDS * d_e]);
     let forced = tokens.slice([0..n, BOARDS..TOKENS]).reshape([n, d_e]);
-    let features = lookup(e.features, ids.slice([0..n, TOKENS * IDS_PER_BOARD..IDS]))
+    let features = qat.rows(qat.features, e.features.weight.val());
+    let features = rows(features, ids.slice([0..n, TOKENS * IDS_PER_BOARD..IDS]))
         .sum_dim(1)
         .reshape([n, d_acc]);
-    e.mix.forward(boards) + e.forced_mix.forward(forced) + features
+    let mix = qat.mix_weight(e.mix.weight.val(), d_e);
+    let bias = e.mix.bias.as_ref().expect("mix has a bias").val();
+    let bias = qat.vector(qat.mix_bias, bias);
+    let forced_mix = qat.forced_weight(e.forced_mix.weight.val());
+    boards.matmul(mix) + bias.unsqueeze() + forced.matmul(forced_mix) + features
 }
 
 /// The heads: the value from the hidden state `h` and the rectified accumulator `acc`, and the
@@ -633,17 +653,112 @@ pub fn predict<N: NnueNet>(net: &N, ids: NnueInput) -> Prediction {
         .reshape([n, BOARDS, IDS_PER_BOARD])
         .slice([0..n, 0..BOARDS, 0..1])
         .reshape([n, BOARDS]);
-    let e = net.ends();
-    let acc = relu(accumulate(&e, ids));
+    let (e, qat) = (net.ends(), net.qat());
+    let acc = relu(accumulate(&e, qat, ids));
     let h = net.trunk(acc.clone());
     heads(
         &e,
         h,
         acc,
         contents,
-        e.local_policy.weight.val(),
-        e.send_policy.weight.val(),
+        qat.rows(qat.local, e.local_policy.weight.val()),
+        qat.send_column(e.send_policy.weight.val()),
     )
+}
+
+/// Which of an NNUE's tables train fake-quantised (quantisation-aware training): their
+/// weights in the forward pass are what the export's int8 grid makes of them, as the export
+/// lays them out in rows (see [`crate::nn::export::Int8Arrays`]), while the gradient passes
+/// through the rounding as if it were the identity (the straight-through estimator), so the
+/// full-precision weights learn to do well once rounded. Covers the first layer's tables and
+/// matrices and the policy tables, by the export's array names; set by
+/// [`Model::set_qat`](super::model::Model::set_qat), off by default.
+#[derive(Clone, Debug, Default)]
+pub struct Qat {
+    pub content: bool,
+    pub mix: bool,
+    pub mix_bias: bool,
+    pub forced: bool,
+    pub features: bool,
+    pub local: bool,
+    pub send: bool,
+}
+
+impl Qat {
+    /// The tables whose export arrays `int8` covers.
+    pub fn of(int8: &crate::nn::export::Int8Arrays) -> Self {
+        Self {
+            content: int8.covers("content_open"),
+            mix: int8.covers("mix0_0"),
+            mix_bias: int8.covers("mix_bias"),
+            forced: int8.covers("forced_0"),
+            features: int8.covers("features_forced"),
+            local: int8.covers("local_open"),
+            send: int8.covers("send_open"),
+        }
+    }
+
+    /// `table` with each row on the int8 grid when `on`.
+    fn rows(&self, on: bool, table: Tensor<2>) -> Tensor<2> {
+        if on { fake_quantise(table, 1) } else { table }
+    }
+
+    /// A vector shipped as one row.
+    fn vector(&self, on: bool, v: Tensor<1>) -> Tensor<1> {
+        if !on {
+            return v;
+        }
+        let [d] = v.dims();
+        fake_quantise(v.reshape([1, d]), 1).reshape([d])
+    }
+
+    /// The mix's `[9 d_embed, d_acc]` weight: the export's rows are a board's slice of one
+    /// output, `d_embed` inputs.
+    fn mix_weight(&self, w: Tensor<2>, d_e: usize) -> Tensor<2> {
+        if !self.mix {
+            return w;
+        }
+        let [inputs, outputs] = w.dims();
+        let w = w.reshape([inputs / d_e, d_e, outputs]);
+        fake_quantise(w, 1).reshape([inputs, outputs])
+    }
+
+    /// The forced board's `[d_embed, d_acc]` slice: a row per output.
+    fn forced_weight(&self, w: Tensor<2>) -> Tensor<2> {
+        if self.forced { fake_quantise(w, 0) } else { w }
+    }
+
+    /// The send logits, `[CONTENTS, 1]`, shipped as two rows: the open contents and the
+    /// decided ones.
+    fn send_column(&self, w: Tensor<2>) -> Tensor<2> {
+        if !self.send {
+            return w;
+        }
+        let open = fake_quantise(w.clone().slice([0..OPEN_CONTENTS, 0..1]), 0);
+        let decided = fake_quantise(w.slice([OPEN_CONTENTS..CONTENTS, 0..1]), 0);
+        Tensor::cat(vec![open, decided], 0)
+    }
+}
+
+/// `w` on the export's int8 grid with the export's rows along `dim` (each row the values that
+/// share a scale): each row's scale is `2^(k / 8)` with the smallest `k` that covers its
+/// largest value in 127 steps, and the values round to the nearest step. The gradient goes
+/// straight through, as if `w` were returned (see [`Qat`]).
+fn fake_quantise<const D: usize>(w: Tensor<D>, dim: usize) -> Tensor<D> {
+    let need = w
+        .clone()
+        .abs()
+        .max_dim(dim)
+        .div_scalar(127.0)
+        .clamp_min(1e-30);
+    let steps = need
+        .log()
+        .div_scalar(std::f32::consts::LN_2)
+        .mul_scalar(8.0)
+        .ceil();
+    let scale = steps.mul_scalar(std::f32::consts::LN_2 / 8.0).exp();
+    let rounded = (w.clone() / scale.clone()).round().clamp(-127.0, 127.0) * scale;
+    w.clone() + (rounded - w).detach()
 }
 
 /// `net` for inference, with its first layer folded into one table of accumulator rows
