@@ -60,6 +60,9 @@ pub struct ExportOptions {
     pub vec_extra: Option<VecSpec>,
     /// Whether to write `<prefix>/FixedVec.hs` at all.
     pub fixed_vec: bool,
+    /// Ship the matrices and tables as int8 with a scale per row (see
+    /// [`Format`](super::quant::Format)) instead of int16: about half the text.
+    pub int8: bool,
 }
 
 impl Default for ExportOptions {
@@ -72,6 +75,7 @@ impl Default for ExportOptions {
             lookups: 40,
             vec_extra: None,
             fixed_vec: true,
+            int8: false,
         }
     }
 }
@@ -135,8 +139,8 @@ pub fn write_all(
         Ok(())
     };
     if let Some(weights) = weights {
-        let rounded = weights.dequantised();
-        let names = codegen::Names::new(weights);
+        let rounded = weights.dequantised(opts.int8);
+        let names = codegen::Names::new(weights, opts.int8);
         emit("Spec", spec_module(weights, &opts.prefix))?;
         let positions = reference_positions(opts.seed, opts.positions);
         // The reference holds what the shipped (int16-rounded) network computes.
@@ -145,7 +149,7 @@ pub fn write_all(
             reference_module(&rounded, &positions, &opts.prefix),
         )?;
         let (text, stream_bytes, chunks, manifest_names) =
-            weights_module(weights, &opts.prefix, opts.chunk);
+            weights_module(weights, &opts.prefix, opts.chunk, opts.int8);
         emit("Weights", text)?;
         emit(
             "Net",
@@ -173,7 +177,7 @@ pub fn write_all(
         (None, None) => None,
         (weights, extra) => {
             let mut spec = match weights {
-                Some(w) => codegen::vec_spec(&codegen::Names::new(w), &opts.prefix),
+                Some(w) => codegen::vec_spec(&codegen::Names::new(w, opts.int8), &opts.prefix),
                 None => VecSpec::new(&format!("{}.FixedVec", opts.prefix)),
             };
             if let Some(extra) = extra {
@@ -206,8 +210,15 @@ pub fn weights_module(
     weights: &Weights,
     prefix: &str,
     chunk: usize,
+    int8: bool,
 ) -> (String, usize, usize, Vec<String>) {
-    let arrays = weights.quantised();
+    // Pieces cut at a multiple of 4 characters decode on their own (int8 arrays are decoded
+    // piece by piece).
+    assert!(
+        chunk % 4 == 0,
+        "literal pieces of a multiple of 4 characters"
+    );
+    let arrays = weights.quantised(int8);
     let bytes: usize = arrays.iter().map(|a| a.bytes.len()).sum();
     let mut s = String::with_capacity(bytes * 4 / 3 + 4096);
     // Not -O0: at -O0 every literal is an updatable CAF whose unpacked characters stay
@@ -219,16 +230,25 @@ pub fn weights_module(
         "Array (arrayName, arrayRows, arrayCols, arrayScale, arrayText), arrays, and per array \
          weights_<array>_text with its literals weights_<array>_<k>",
     );
-    // Four base64 characters per three bytes of int16 values.
+    // Four base64 characters per three bytes.
     data_warning(
         &mut s,
-        &format!("the network's {} int16 weights", weights.parameters()),
-        weights.parameters() * 2 * 4 / 3,
+        &format!(
+            "the network's {} weights ({})",
+            weights.parameters(),
+            if int8 {
+                "int8 matrices and tables, int16 the rest"
+            } else {
+                "int16"
+            }
+        ),
+        bytes * 4 / 3,
     );
     s.push_str(
-        "-- | One weight array: rows * cols little-endian Int16 values, each worth q * scale,\n\
-         -- matrices one row per output, as base64 text (standard alphabet, padded) split into\n\
-         -- pieces to concatenate.\n\
+        "-- | One weight array: rows * cols little-endian Int16 values, each worth q * scale, or\n\
+         -- for an array followed by its rows' scales (`<name>_scales`) signed bytes, each worth\n\
+         -- q * its row's scale; matrices one row per output, as base64 text (standard alphabet,\n\
+         -- padded) split into pieces of a multiple of four characters.\n\
          data Array = Array\n\
          \x20 { arrayName :: String -- ^ the array's name, checked by the decoder\n\
          \x20 , arrayRows :: Int -- ^ rows: outputs of a matrix, ids of a table, 1 for a bias\n\

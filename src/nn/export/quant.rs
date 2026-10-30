@@ -1,8 +1,12 @@
-//! Int16 quantisation of the weights and their base64 text for `Gen/Weights.hs`.
+//! Quantisation of the weights and their base64 text for `Gen/Weights.hs`.
 //!
-//! Each array gets one scale, `max |w| / 32767`; the Haskell decoder multiplies the `Int16`
-//! back into `Float`. Every array of [`Weights::arrays`] is shipped on its own: row-major,
-//! little-endian `Int16`, base64-encoded with the standard alphabet and padding.
+//! Every array of [`Weights::arrays`] is shipped on its own, row-major, base64-encoded with
+//! the standard alphabet and padding, in one of two formats (see [`Format`]):
+//! - int16: little-endian `Int16` values with one scale for the array, `max |w| / 32767`;
+//! - int8, with `--int8`, for the matrices and tables ([`Format::of`]): one signed byte per
+//!   value, each row with its own scale, `max |row| / 127` (rounded up, so that no value
+//!   overflows), the scales shipped as an int16 array `<name>_scales` right after it. Half the
+//!   text of int16, and per-row scales keep the rows of small values precise.
 
 use super::weights::{Array, Weights};
 
@@ -30,8 +34,64 @@ fn dequantise(data: &[f32]) -> Vec<f32> {
     q.values.iter().map(|&v| v as f32 * q.scale).collect()
 }
 
-/// One array as the Haskell decoder sees it: name, shape, scale, and its values as
-/// little-endian `Int16` bytes.
+/// How an array ships.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    Int16,
+    /// Signed bytes with a scale per row.
+    Int8Rows,
+}
+
+impl Format {
+    /// The format of an array of `rows x cols` values: with `int8`, int8 for matrices and
+    /// tables (more than one row, at least eight values a row), int16 for biases and columns,
+    /// where per-row scales would cost as much as they save.
+    pub fn of(rows: usize, cols: usize, int8: bool) -> Format {
+        match int8 && rows > 1 && cols >= 8 {
+            true => Format::Int8Rows,
+            false => Format::Int16,
+        }
+    }
+}
+
+/// Int8 quantisation of `rows` rows of `cols` values: the values, each row's scale as
+/// shipped (an int16 array of its own), and that array's quantisation. Each row's scale is
+/// rounded up to the next one the int16 array can hold, so that no value exceeds 127 steps.
+pub fn quantise_rows(data: &[f32], cols: usize) -> (Vec<i8>, Vec<f32>, Quantised) {
+    let raw: Vec<f32> = data
+        .chunks(cols)
+        .map(|row| row.iter().fold(0.0f32, |m, &x| m.max(x.abs())) / 127.0)
+        .collect();
+    let top = raw.iter().fold(0.0f32, |m, &x| m.max(x));
+    let step = if top > 0.0 { top / Q_MAX } else { 1.0 };
+    let scale_values: Vec<i16> = raw
+        .iter()
+        .map(|&s| (s / step).ceil().clamp(0.0, Q_MAX) as i16)
+        .collect();
+    let scales: Vec<f32> = scale_values.iter().map(|&q| q as f32 * step).collect();
+    let values = data
+        .chunks(cols)
+        .zip(&scales)
+        .flat_map(|(row, &s)| {
+            row.iter().map(move |&x| {
+                if s > 0.0 {
+                    (x / s).round().clamp(-127.0, 127.0) as i8
+                } else {
+                    0
+                }
+            })
+        })
+        .collect();
+    let quantised_scales = Quantised {
+        values: scale_values,
+        scale: step,
+    };
+    (values, scales, quantised_scales)
+}
+
+/// One array as the Haskell decoder sees it: name, shape, scale, and its values as bytes:
+/// little-endian `Int16`, or for an int8 array signed bytes (its scale then unused, the rows'
+/// scales being the next array).
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuantisedArray {
     pub name: String,
@@ -68,26 +128,50 @@ impl Weights {
         out
     }
 
-    /// The weights after an int16 round trip: what the Haskell evaluator computes with.
-    pub fn dequantised(&self) -> Self {
-        self.map_arrays(|a| dequantise(a.data))
+    /// The weights after the round trip of the export's quantisation (int8 for the
+    /// matrices and tables with `int8`): what the Haskell evaluator computes with.
+    pub fn dequantised(&self, int8: bool) -> Self {
+        self.map_arrays(|a| match Format::of(a.rows, a.cols, int8) {
+            Format::Int16 => dequantise(a.data),
+            Format::Int8Rows => {
+                let (values, scales, _) = quantise_rows(a.data, a.cols);
+                values
+                    .chunks(a.cols)
+                    .zip(&scales)
+                    .flat_map(|(row, &s)| row.iter().map(move |&q| f32::from(q) * s))
+                    .collect()
+            }
+        })
     }
 
-    /// Every array quantised, in [`Weights::arrays`] order.
-    pub fn quantised(&self) -> Vec<QuantisedArray> {
-        self.arrays()
-            .into_iter()
-            .map(|a| {
-                let q = quantise(a.data);
-                QuantisedArray {
-                    name: a.name,
-                    rows: a.rows,
-                    cols: a.cols,
-                    scale: q.scale,
-                    bytes: q.values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    /// Every array quantised, in [`Weights::arrays`] order, each int8 array followed by its
+    /// rows' scales.
+    pub fn quantised(&self, int8: bool) -> Vec<QuantisedArray> {
+        let int16 = |name: String, rows, cols, q: Quantised| QuantisedArray {
+            name,
+            rows,
+            cols,
+            scale: q.scale,
+            bytes: q.values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        };
+        let mut out = Vec::new();
+        for a in self.arrays() {
+            match Format::of(a.rows, a.cols, int8) {
+                Format::Int16 => out.push(int16(a.name, a.rows, a.cols, quantise(a.data))),
+                Format::Int8Rows => {
+                    let (values, _, scales) = quantise_rows(a.data, a.cols);
+                    out.push(QuantisedArray {
+                        name: a.name.clone(),
+                        rows: a.rows,
+                        cols: a.cols,
+                        scale: 1.0,
+                        bytes: values.iter().map(|&v| v as u8).collect(),
+                    });
+                    out.push(int16(format!("{}_scales", a.name), a.rows, 1, scales));
                 }
-            })
-            .collect()
+            }
+        }
+        out
     }
 }
 
@@ -154,7 +238,7 @@ mod tests {
             .with_d_hidden(4)
             .init(&device);
         let weights = Weights::from_model(&model);
-        let arrays = weights.quantised();
+        let arrays = weights.quantised(false);
         let values: usize = arrays.iter().map(|a| a.rows * a.cols).sum();
         assert_eq!(values, weights.parameters());
         for a in &arrays {
@@ -168,7 +252,7 @@ mod tests {
             let q = i16::from_le_bytes([first.bytes[2 * i], first.bytes[2 * i + 1]]);
             assert!((q as f32 * first.scale - w).abs() <= first.scale / 2.0 + 1e-9);
         }
-        assert_eq!(weights.dequantised().spec, weights.spec);
+        assert_eq!(weights.dequantised(false).spec, weights.spec);
     }
 
     /// `map_arrays` writes every array back where `arrays` read it, for every layer kind and
@@ -206,6 +290,27 @@ mod tests {
                     a.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn int8_rows_round_trip_within_their_own_step() {
+        // Rows of very different magnitudes keep their own precision.
+        let data = [1.0f32, -0.5, 0.25, 0.0, 0.001, -0.002, 0.0005, 0.0];
+        let (values, scales, shipped) = quantise_rows(&data, 4);
+        assert_eq!(values[0], 127);
+        for (row, (q, &s)) in data.chunks(4).zip(values.chunks(4).zip(&scales)) {
+            assert!(s >= row.iter().fold(0.0f32, |m, &x| m.max(x.abs())) / 127.0);
+            for (&x, &v) in row.iter().zip(q) {
+                assert!(
+                    (x - f32::from(v) * s).abs() <= s / 2.0 + 1e-9,
+                    "{x} vs {v} x {s}"
+                );
+            }
+        }
+        // The scales are exactly what their int16 array decodes to.
+        for (&s, &q) in scales.iter().zip(&shipped.values) {
+            assert_eq!(s, q as f32 * shipped.scale);
         }
     }
 

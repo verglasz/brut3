@@ -114,6 +114,11 @@ enum Command {
         /// Do not write FixedVec.hs (keep a hand-generated one).
         #[arg(long)]
         no_fixed_vec: bool,
+        /// Ship the matrices and tables as int8 with a scale per row instead of int16: about
+        /// half the weights' text. The reported quantisation error and the reference values
+        /// follow.
+        #[arg(long)]
+        int8: bool,
         /// Extra FixedVec.hs shapes for hand-written code, on top of the model's, after `--`:
         /// `export --model m --out lib -- --int32 512 --rows 9:128`. Without --model,
         /// FixedVec.hs holds only these. Widths that a flag needs get their vector type too.
@@ -618,6 +623,7 @@ fn main() -> ExitCode {
             lookups,
             vec_extra,
             no_fixed_vec,
+            int8,
             vec_flags,
         } => export(
             model.as_deref(),
@@ -634,6 +640,7 @@ fn main() -> ExitCode {
                 .chain(vec_flags)
                 .collect(),
             !no_fixed_vec,
+            int8,
         ),
         #[cfg(feature = "nn")]
         Command::Backends => {
@@ -1478,6 +1485,7 @@ fn export(
     lookups: usize,
     vec_flags: Vec<String>,
     fixed_vec: bool,
+    int8: bool,
 ) -> Result<(), String> {
     use brut3::book::Book;
     use brut3::nn::export::{ExportOptions, VecSpec, Weights, write_all};
@@ -1531,6 +1539,7 @@ fn export(
         lookups,
         vec_extra,
         fixed_vec,
+        int8,
         ..ExportOptions::default()
     };
     let report = write_all(weights.as_ref(), book.as_ref(), out, &opts)?;

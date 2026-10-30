@@ -13,6 +13,7 @@
 use std::fmt::Write as _;
 
 use super::haskell::{bundle_body_begin, bundle_body_end, bundle_imports};
+use super::quant::Format;
 use super::vecgen::SPARSE_K;
 use super::vecgen::VecSpec;
 use super::weights::{Layer, Weights};
@@ -100,10 +101,12 @@ pub struct Names {
     pub trunk: Vec<Kind>,
     /// Whether the heads are gated.
     pub gated: bool,
+    /// Whether the matrices and tables ship as int8 (see [`Format`]).
+    pub int8: bool,
 }
 
 impl Names {
-    pub fn new(w: &Weights) -> Self {
+    pub fn new(w: &Weights, int8: bool) -> Self {
         assert!(
             w.d_acc % CHUNK == 0,
             "d_acc must be a multiple of {CHUNK} for the chunked export"
@@ -123,6 +126,7 @@ impl Names {
             h: w.d_hidden,
             trunk,
             gated: w.gates.is_some(),
+            int8,
         }
     }
 
@@ -243,10 +247,18 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
          -- `export --out <dir> -- {}`.\n",
         vec_spec(names, prefix).flags()
     );
-    let _ = writeln!(s, "import Decode (chunksOf, decodeFloats, decodeRowsWith)");
+    let _ = writeln!(
+        s,
+        "import Decode (chunksOf, {}decodeFloats, decodeRowsWith)",
+        if names.int8 { "decodeBytes, " } else { "" }
+    );
     let _ = writeln!(s, "import {prefix}.FixedVec");
     let _ = writeln!(s, "import {prefix}.Weights (Array (..), arrays)");
-    bundle_imports(&mut s, &[]);
+    let base_imports: &[&str] = match names.int8 {
+        true => &["import Data.Int (Int8)"],
+        false => &[],
+    };
+    bundle_imports(&mut s, base_imports);
     bundle_body_begin(
         &mut s,
         "VecE, VecA, VecH, FoldPiece, OpenClosed (ocOpen, ocFull, ocWonByUs, ocWonByThem), \
@@ -498,7 +510,12 @@ data OpenClosed a = OpenClosed
             .position(|n| n == name)
             .unwrap_or_else(|| panic!("{name} array"))
     };
-    let policy_index = position("policy");
+    // The rows of array `i`, `m` of width `n`, as a list: an int8 array with its scales in
+    // array `i + 1`, or an int16 one.
+    let rows_at = |m: usize, n: usize, i: usize| match Format::of(m, n, names.int8) {
+        Format::Int8Rows => format!("int8Rows {m} {n} fromListRest{n} a{i} a{}", i + 1),
+        Format::Int16 => format!("rows {m} {n} fromListRest{n} a{i}"),
+    };
     let _ = writeln!(
         s,
         "-- | The network, decoded from the weight arrays on first use."
@@ -517,6 +534,20 @@ data OpenClosed a = OpenClosed
         s,
         "      floats r c a = let a' = shaped r c a in decodeFloats (arrayName a') (r * c) (arrayScale a') (arrayText a')"
     );
+    if names.int8 {
+        let _ = writeln!(
+            s,
+            "      -- Signed bytes, each times its row's scale (the next array). The text's pieces are\n\
+             \x20     -- whole groups of four characters, so they decode one by one.\n\
+             \x20     int8Rows r c split a scales =\n\
+             \x20       let a' = shaped r c a\n\
+             \x20           values = [fromIntegral (fromIntegral w :: Int8) | piece <- arrayText a', w <- decodeBytes piece]\n\
+             \x20           go 0 [] = []\n\
+             \x20           go 0 _ = error (\"weights: \" ++ arrayName a' ++ \" has more values than rows * cols\")\n\
+             \x20           go n xs = case split xs of (v, rest) -> v `seq` (v : go (n - 1 :: Int) rest)\n\
+             \x20        in go r (zipWith (*) (concatMap (replicate c) (floats r 1 scales)) values)"
+        );
+    }
     let _ = writeln!(
         s,
         "      table name open decided = case decided of\n\
@@ -532,85 +563,73 @@ data OpenClosed a = OpenClosed
         vars_.join(", ")
     );
     // The policy rows are grouped per board.
+    let (policy_index, policy_bias) = (position("policy"), position("policy_bias"));
     let _ = writeln!(
         s,
-        "          let policyTables = map fromListRows{CELLS}_{h} (chunksOf {CELLS} (rows {MOVES} {h} fromListRest{h} a{policy_index}))"
+        "          let policyTables = map fromListRows{CELLS}_{h} (chunksOf {CELLS} ({}))",
+        rows_at(MOVES, h, policy_index)
     );
     let _ = writeln!(
         s,
-        "              policyBiases = map fromList{CELLS} (chunksOf {CELLS} (floats 1 {MOVES} a{}))",
-        policy_index + 1
+        "              policyBiases = map fromList{CELLS} (chunksOf {CELLS} (floats 1 {MOVES} a{policy_bias}))"
     );
-    let mut step = 0usize;
-    let mut next = || {
-        let i = step;
-        step += 1;
-        i
-    };
     if names.gated {
-        let gates = position("gates");
+        let (gates, gates_bias) = (position("gates"), position("gates_bias"));
         let _ = writeln!(
             s,
-            "              (valueGate, localGates, sendGates) = case rows {GATES} {h} fromListRest{h} a{gates} of\n\
+            "              (valueGate, localGates, sendGates) = case {} of\n\
              \x20               v : rest | (l, r) <- splitAt {CELLS} rest -> (v, l, r)\n\
              \x20               _ -> error \"net: array gates is not {GATES} rows\"\n\
-             \x20             (valueGateBias, localGatesBias, sendGatesBias) = case floats 1 {GATES} a{} of\n\
+             \x20             (valueGateBias, localGatesBias, sendGatesBias) = case floats 1 {GATES} a{gates_bias} of\n\
              \x20               v : rest | (l, r) <- splitAt {CELLS} rest -> (v, l, r)\n\
              \x20               _ -> error \"net: array gates_bias is not {GATES} values\"",
-            gates + 1
+            rows_at(GATES, h, gates)
         );
     }
     let _ = writeln!(s, "           in Net");
-    // Every array decodes straight into its field: array `i`, `m` rows of width `n`, as a
-    // RowsM_N or a list.
-    let matrix = |m: usize, n: usize, i: usize| {
-        format!("fromListRows{m}_{n} (rows {m} {n} fromListRest{n} a{i})")
+    // Every array decodes straight into its field, in order: `step` counts the arrays taken.
+    let step = std::cell::Cell::new(0usize);
+    let next = || step.replace(step.get() + 1);
+    // The next array's `m` rows of width `n` as a list (with its scales, if int8).
+    let list = |m: usize, n: usize| {
+        let i = next();
+        if Format::of(m, n, names.int8) == Format::Int8Rows {
+            next();
+        }
+        rows_at(m, n, i)
     };
-    let list = |m: usize, n: usize, i: usize| format!("rows {m} {n} fromListRest{n} a{i}");
-    let vector = |n: usize, i: usize| format!("fromList{n} (floats 1 {n} a{i})");
+    let matrix = |m: usize, n: usize| format!("fromListRows{m}_{n} ({})", list(m, n));
+    let vector = |n: usize| format!("fromList{n} (floats 1 {n} a{})", next());
     let mut inits = Vec::new();
-    let (open, decided) = (next(), next());
+    let open = list(OPEN_CONTENTS, e);
+    let decided = list(CONTENTS - OPEN_CONTENTS, e);
     inits.push(format!(
-        "netContent = table \"content\" ({}) ({})",
-        list(OPEN_CONTENTS, e, open),
-        list(CONTENTS - OPEN_CONTENTS, e, decided)
+        "netContent = table \"content\" ({open}) ({decided})"
     ));
-    inits.push(format!("netNoForced = {}", vector(e, next())));
-    inits.push(format!(
-        "netCells = {}",
-        list(CELL_PAD - CELL_BASE, e, next())
-    ));
-    inits.push(format!("netPad = {}", vector(e, next())));
+    inits.push(format!("netNoForced = {}", vector(e)));
+    inits.push(format!("netCells = {}", list(CELL_PAD - CELL_BASE, e)));
+    inits.push(format!("netPad = {}", vector(e)));
     // The first layer's slices in pieces of CHUNK rows.
-    let pieces = |next: &mut dyn FnMut() -> usize| {
-        let p: Vec<String> = (0..k).map(|_| matrix(CHUNK, e, next())).collect();
+    let pieces = || {
+        let p: Vec<String> = (0..k).map(|_| matrix(CHUNK, e)).collect();
         format!("[{}]", p.join(", "))
     };
-    let mix: Vec<String> = (0..BOARDS).map(|_| pieces(&mut next)).collect();
+    let mix: Vec<String> = (0..BOARDS).map(|_| pieces()).collect();
     inits.push(format!(
         "netMix =\n                    [ {}\n                    ]",
         mix.join("\n                    , ")
     ));
-    inits.push(format!("netMixBias = {}", vector(a, next())));
-    inits.push(format!("netForced = {}", pieces(&mut next)));
-    inits.push(format!(
-        "netForcedFeature = {}",
-        matrix(FORCED_FEATURES, a, next())
-    ));
+    inits.push(format!("netMixBias = {}", vector(a)));
+    inits.push(format!("netForced = {}", pieces()));
+    inits.push(format!("netForcedFeature = {}", matrix(FORCED_FEATURES, a)));
     for l in 0..LINES.len() {
-        inits.push(format!(
-            "netLineFeature{l} = {}",
-            matrix(LINE_STATES, a, next())
-        ));
+        inits.push(format!("netLineFeature{l} = {}", matrix(LINE_STATES, a)));
     }
     inits.push(format!(
         "netDecidedFeature = {}",
-        matrix(DECIDED_FEATURES, a, next())
+        matrix(DECIDED_FEATURES, a)
     ));
-    inits.push(format!(
-        "netMarksFeature = {}",
-        matrix(MARKS_FEATURES, a, next())
-    ));
+    inits.push(format!("netMarksFeature = {}", matrix(MARKS_FEATURES, a)));
     for (i, kind) in names.trunk.iter().enumerate() {
         let d_in = if i == 0 { a } else { h };
         let mut parts = Vec::new();
@@ -624,40 +643,26 @@ data OpenClosed a = OpenClosed
             _ => parts.push(("", h, d_in, true)),
         }
         for (name, m, n, bias) in parts {
-            inits.push(format!(
-                "netHidden{i}{name} = fromListRows{m}_{n} (rows {m} {n} fromListRest{n} a{})",
-                next()
-            ));
+            inits.push(format!("netHidden{i}{name} = {}", matrix(m, n)));
             if bias {
-                inits.push(format!(
-                    "netHidden{i}{name}Bias = fromList{m} (floats 1 {m} a{})",
-                    next()
-                ));
+                inits.push(format!("netHidden{i}{name}Bias = {}", vector(m)));
             }
         }
     }
-    inits.push(format!(
-        "netValue = fromListRows3_{h} (rows 3 {h} fromListRest{h} a{})",
-        next()
-    ));
-    inits.push(format!("netValueBias = fromList3 (floats 1 3 a{})", next()));
-    inits.push(format!(
-        "netSkip = fromListRows3_{a} (rows 3 {a} fromListRest{a} a{})",
-        next()
-    ));
-    assert_eq!(next(), policy_index, "policy array position");
-    assert_eq!(next(), policy_index + 1, "policy bias array position");
+    inits.push(format!("netValue = {}", matrix(3, h)));
+    inits.push(format!("netValueBias = {}", vector(3)));
+    inits.push(format!("netSkip = {}", matrix(3, a)));
+    // The policy arrays, decoded above.
+    assert_eq!(step.get(), policy_index, "policy array position");
+    let _ = list(MOVES, h);
+    assert_eq!(next(), policy_bias, "policy bias array position");
     for b in 0..BOARDS {
         inits.push(format!("netPolicy{b} = policyTables !! {b}"));
         inits.push(format!("netPolicyBias{b} = policyBiases !! {b}"));
     }
-    let local_rows =
-        |rows: usize, i: usize| format!("rows {rows} {CELLS} fromListRest{CELLS} a{i}");
-    inits.push(format!(
-        "netLocal = table \"local\" ({}) ({})",
-        local_rows(OPEN_CONTENTS, next()),
-        local_rows(CONTENTS - OPEN_CONTENTS, next())
-    ));
+    let open = list(OPEN_CONTENTS, CELLS);
+    let decided = list(CONTENTS - OPEN_CONTENTS, CELLS);
+    inits.push(format!("netLocal = table \"local\" ({open}) ({decided})"));
     inits.push(format!(
         "netSend = table \"send\" (floats {OPEN_CONTENTS} 1 a{}) (floats {} 1 a{})",
         next(),
@@ -665,8 +670,11 @@ data OpenClosed a = OpenClosed
         next()
     ));
     if names.gated {
-        // One row (and bias) for the value, then nine per board for each policy table.
-        let (rows_index, bias_index) = (next(), next());
+        // One row (and bias) for the value, then nine per board for each policy table,
+        // decoded above.
+        assert_eq!(step.get(), position("gates"), "gates array position");
+        let _ = list(GATES, h);
+        assert_eq!(next(), position("gates_bias"), "gates bias array position");
         inits.extend([
             "netValueGate = valueGate".to_string(),
             "netValueGateBias = valueGateBias".to_string(),
@@ -675,10 +683,8 @@ data OpenClosed a = OpenClosed
             format!("netSendGates = fromListRows{CELLS}_{h} sendGates"),
             format!("netSendGatesBias = fromList{CELLS} sendGatesBias"),
         ]);
-        assert_eq!(rows_index, position("gates"), "gates array position");
-        assert_eq!(bias_index, rows_index + 1, "gates bias array position");
     }
-    assert_eq!(step, manifest_names.len(), "one decode per array");
+    assert_eq!(step.get(), manifest_names.len(), "one decode per array");
     for (i, init) in inits.iter().enumerate() {
         let sep = if i == 0 { "{" } else { "," };
         let _ = writeln!(s, "                {sep} {init}");
