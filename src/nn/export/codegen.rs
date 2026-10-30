@@ -13,6 +13,7 @@
 use std::fmt::Write as _;
 
 use super::haskell::{bundle_body_begin, bundle_body_end, bundle_imports};
+use super::quant::Int8Arrays;
 use super::vecgen::SPARSE_K;
 use super::vecgen::VecSpec;
 use super::weights::{Layer, Weights};
@@ -100,12 +101,12 @@ pub struct Names {
     pub trunk: Vec<Kind>,
     /// Whether the heads are gated.
     pub gated: bool,
-    /// Whether the weights ship as int8 (see [`super::quant::quantise_int8`]).
-    pub int8: bool,
+    /// The arrays shipped as int8 (see [`super::quant::quantise_int8`]), the others int16.
+    pub int8: Int8Arrays,
 }
 
 impl Names {
-    pub fn new(w: &Weights, int8: bool) -> Self {
+    pub fn new(w: &Weights, int8: Int8Arrays) -> Self {
         assert!(
             w.d_acc % CHUNK == 0,
             "d_acc must be a multiple of {CHUNK} for the chunked export"
@@ -246,18 +247,21 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
          -- `export --out <dir> -- {}`.\n",
         vec_spec(names, prefix).flags()
     );
-    let _ = writeln!(
-        s,
-        "import Decode (chunksOf, {})",
-        if names.int8 {
-            "decodeBytes"
-        } else {
-            "decodeFloats, decodeRowsWith"
-        }
-    );
+    // Which decoders the arrays need: int8 for those names.int8 covers, int16 for the rest.
+    let int8_at = |i: usize| names.int8.covers(&manifest_names[i]);
+    let any_int8 = (0..manifest_names.len()).any(int8_at);
+    let any_int16 = !(0..manifest_names.len()).all(int8_at);
+    let mut decoders = vec!["chunksOf"];
+    if any_int8 {
+        decoders.push("decodeBytes");
+    }
+    if any_int16 {
+        decoders.extend(["decodeFloats", "decodeRowsWith"]);
+    }
+    let _ = writeln!(s, "import Decode ({})", decoders.join(", "));
     let _ = writeln!(s, "import {prefix}.FixedVec");
     let _ = writeln!(s, "import {prefix}.Weights (Array (..), arrays)");
-    let base_imports: &[&str] = match names.int8 {
+    let base_imports: &[&str] = match any_int8 {
         true => &["import Data.Int (Int8)"],
         false => &[],
     };
@@ -514,11 +518,11 @@ data OpenClosed a = OpenClosed
             .unwrap_or_else(|| panic!("{name} array"))
     };
     // Array `i` as `m` rows of width `n` (a list), or as its `m * n` values.
-    let rows_at = |m: usize, n: usize, i: usize| match names.int8 {
+    let rows_at = |m: usize, n: usize, i: usize| match int8_at(i) {
         true => format!("int8Rows {m} {n} fromListRest{n} a{i}"),
         false => format!("rows {m} {n} fromListRest{n} a{i}"),
     };
-    let floats_at = |m: usize, n: usize, i: usize| match names.int8 {
+    let floats_at = |m: usize, n: usize, i: usize| match int8_at(i) {
         true => format!("int8Values {m} {n} a{i}"),
         false => format!("floats {m} {n} a{i}"),
     };
@@ -532,7 +536,7 @@ data OpenClosed a = OpenClosed
         s,
         "  let shaped r c a = if arrayRows a == r && arrayCols a == c then a else error (\"weights: \" ++ arrayName a ++ \" is not \" ++ show r ++ \"x\" ++ show c)"
     );
-    if names.int8 {
+    if any_int8 {
         let _ = writeln!(
             s,
             "      -- Each row an exponent byte e, then its values as signed bytes, each worth the\n\
@@ -553,7 +557,8 @@ data OpenClosed a = OpenClosed
              \x20           go n xs = case split xs of (v, rest) -> v `seq` (v : go (n - 1 :: Int) rest)\n\
              \x20        in go r (int8Values r c a)"
         );
-    } else {
+    }
+    if any_int16 {
         let _ = writeln!(
             s,
             "      rows r c split a = let a' = shaped r c a in decodeRowsWith (arrayName a') r c (arrayScale a') split (arrayText a')"

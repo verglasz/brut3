@@ -13,7 +13,7 @@ use rand::{Rng, SeedableRng};
 
 use super::Weights;
 use super::codegen;
-use super::quant::base64;
+use super::quant::{Int8Arrays, base64};
 use super::vecgen::VecSpec;
 use crate::book::Book;
 use crate::game::{BitState, GameState, LINES, Move};
@@ -60,9 +60,10 @@ pub struct ExportOptions {
     pub vec_extra: Option<VecSpec>,
     /// Whether to write `<prefix>/FixedVec.hs` at all.
     pub fixed_vec: bool,
-    /// Ship every array as int8 with a scale per row (see
-    /// [`quantise_int8`](super::quant::quantise_int8)) instead of int16: about half the text.
-    pub int8: bool,
+    /// The arrays shipped as int8 with a scale per row (see
+    /// [`quantise_int8`](super::quant::quantise_int8)) instead of int16: about half their
+    /// text.
+    pub int8: Int8Arrays,
 }
 
 impl Default for ExportOptions {
@@ -75,7 +76,7 @@ impl Default for ExportOptions {
             lookups: 40,
             vec_extra: None,
             fixed_vec: true,
-            int8: false,
+            int8: Int8Arrays::default(),
         }
     }
 }
@@ -139,8 +140,8 @@ pub fn write_all(
         Ok(())
     };
     if let Some(weights) = weights {
-        let rounded = weights.dequantised(opts.int8);
-        let names = codegen::Names::new(weights, opts.int8);
+        let rounded = weights.dequantised(&opts.int8);
+        let names = codegen::Names::new(weights, opts.int8.clone());
         emit("Spec", spec_module(weights, &opts.prefix))?;
         let positions = reference_positions(opts.seed, opts.positions);
         // The reference holds what the shipped (int16-rounded) network computes.
@@ -149,7 +150,7 @@ pub fn write_all(
             reference_module(&rounded, &positions, &opts.prefix),
         )?;
         let (text, stream_bytes, chunks, manifest_names) =
-            weights_module(weights, &opts.prefix, opts.chunk, opts.int8);
+            weights_module(weights, &opts.prefix, opts.chunk, &opts.int8);
         emit("Weights", text)?;
         emit(
             "Net",
@@ -177,7 +178,9 @@ pub fn write_all(
         (None, None) => None,
         (weights, extra) => {
             let mut spec = match weights {
-                Some(w) => codegen::vec_spec(&codegen::Names::new(w, opts.int8), &opts.prefix),
+                Some(w) => {
+                    codegen::vec_spec(&codegen::Names::new(w, opts.int8.clone()), &opts.prefix)
+                }
                 None => VecSpec::new(&format!("{}.FixedVec", opts.prefix)),
             };
             if let Some(extra) = extra {
@@ -210,7 +213,7 @@ pub fn weights_module(
     weights: &Weights,
     prefix: &str,
     chunk: usize,
-    int8: bool,
+    int8: &Int8Arrays,
 ) -> (String, usize, usize, Vec<String>) {
     // Pieces cut at a multiple of 4 characters decode on their own (int8 arrays are decoded
     // piece by piece).
@@ -236,7 +239,10 @@ pub fn weights_module(
         &format!(
             "the network's {} weights ({})",
             weights.parameters(),
-            if int8 { "int8" } else { "int16" }
+            match int8.0.is_empty() {
+                true => "int16",
+                false => "int8 and int16",
+            }
         ),
         bytes * 4 / 3,
     );

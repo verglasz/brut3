@@ -33,6 +33,23 @@ fn dequantise(data: &[f32]) -> Vec<f32> {
     q.values.iter().map(|&v| v as f32 * q.scale).collect()
 }
 
+/// Which arrays an export ships as int8 (see [`quantise_int8`]), the others as int16: those
+/// whose name starts with one of the prefixes (`""` takes every array).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Int8Arrays(pub Vec<String>);
+
+impl Int8Arrays {
+    pub fn all() -> Self {
+        Self(vec![String::new()])
+    }
+
+    pub fn covers(&self, name: &str) -> bool {
+        self.0
+            .iter()
+            .any(|prefix| name.starts_with(prefix.as_str()))
+    }
+}
+
 /// The int8 rows' scales step by this factor's inverse: `2^(1/8)`, about 9%.
 pub const INT8_STEPS_PER_OCTAVE: f32 = 8.0;
 
@@ -110,21 +127,21 @@ impl Weights {
         out
     }
 
-    /// The weights after the round trip of the export's quantisation (int16, or int8 with
-    /// `int8`): what the Haskell evaluator computes with.
-    pub fn dequantised(&self, int8: bool) -> Self {
-        self.map_arrays(|a| match int8 {
+    /// The weights after the round trip of the export's quantisation (int8 for the arrays
+    /// `int8` covers, int16 for the others): what the Haskell evaluator computes with.
+    pub fn dequantised(&self, int8: &Int8Arrays) -> Self {
+        self.map_arrays(|a| match int8.covers(&a.name) {
             true => quantise_int8(a.data, a.cols).2,
             false => dequantise(a.data),
         })
     }
 
     /// Every array quantised, in [`Weights::arrays`] order.
-    pub fn quantised(&self, int8: bool) -> Vec<QuantisedArray> {
+    pub fn quantised(&self, int8: &Int8Arrays) -> Vec<QuantisedArray> {
         self.arrays()
             .into_iter()
             .map(|a| {
-                let (scale, bytes) = match int8 {
+                let (scale, bytes) = match int8.covers(&a.name) {
                     true => {
                         let (bytes, base, _) = quantise_int8(a.data, a.cols);
                         (base, bytes)
@@ -330,7 +347,7 @@ mod tests {
             .with_d_hidden(4)
             .init(&device);
         let weights = Weights::from_model(&model);
-        let arrays = weights.quantised(false);
+        let arrays = weights.quantised(&Int8Arrays::default());
         let values: usize = arrays.iter().map(|a| a.rows * a.cols).sum();
         assert_eq!(values, weights.parameters());
         for a in &arrays {
@@ -344,7 +361,10 @@ mod tests {
             let q = i16::from_le_bytes([first.bytes[2 * i], first.bytes[2 * i + 1]]);
             assert!((q as f32 * first.scale - w).abs() <= first.scale / 2.0 + 1e-9);
         }
-        assert_eq!(weights.dequantised(false).spec, weights.spec);
+        assert_eq!(
+            weights.dequantised(&Int8Arrays::default()).spec,
+            weights.spec
+        );
     }
 
     /// `map_arrays` writes every array back where `arrays` read it, for every layer kind and

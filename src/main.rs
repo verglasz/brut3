@@ -117,8 +117,12 @@ enum Command {
         /// Ship every weight array as int8 with a scale per row instead of int16: about half
         /// the weights' text. The reported quantisation error and the reference values
         /// follow.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "int8_only")]
         int8: bool,
+        /// Ship only the arrays whose names start with one of these prefixes as int8, e.g.
+        /// `content,local,send` (the content table and the policy tables), the rest as int16.
+        #[arg(long, value_delimiter = ',')]
+        int8_only: Vec<String>,
         /// Instead of exporting, print each weight array's quantisation statistics: its
         /// magnitudes, the int16 and int8 errors relative to its RMS, how peaked its rows are,
         /// and whether a few columns dominate.
@@ -629,6 +633,7 @@ fn main() -> ExitCode {
             vec_extra,
             no_fixed_vec,
             int8,
+            int8_only,
             quant_report,
             vec_flags,
         } => export(
@@ -646,7 +651,10 @@ fn main() -> ExitCode {
                 .chain(vec_flags)
                 .collect(),
             !no_fixed_vec,
-            int8,
+            match int8 {
+                true => brut3::nn::export::Int8Arrays::all(),
+                false => brut3::nn::export::Int8Arrays(int8_only),
+            },
             quant_report,
         ),
         #[cfg(feature = "nn")]
@@ -1492,7 +1500,7 @@ fn export(
     lookups: usize,
     vec_flags: Vec<String>,
     fixed_vec: bool,
-    int8: bool,
+    int8: brut3::nn::export::Int8Arrays,
     quant_report: bool,
 ) -> Result<(), String> {
     use brut3::book::Book;
@@ -1596,7 +1604,7 @@ fn export(
     }
     if weights.is_some() {
         eprintln!(
-            "int16 weights: {} bytes in {} literals; quantisation error over the reference positions: \
+            "weights: {} bytes in {} literals; quantisation error over the reference positions: \
              wdl {:.2e}, value {:.2e}, policy {:.2e}",
             report.stream_bytes,
             report.chunks,
