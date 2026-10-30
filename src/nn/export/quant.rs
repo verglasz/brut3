@@ -229,8 +229,8 @@ impl Weights {
     /// from 0.012 / 0.015 / 0.016 for win/draw/loss, value and policy to 0.016 / 0.016 /
     /// 0.016, against 0.021 / 0.022 / 0.016 rounding to nearest.)
     ///
-    /// A low-rank table's `content_low` rows reach the tokens through `proj` (`P`), so theirs
-    /// is from `P H Pᵀ`; the second factor, for models that have one.
+    /// A low-rank table's `content_low` rows are a token's first `rank` coordinates, so theirs
+    /// is from `H`'s top-left `rank x rank` block; the second factor, for models that have one.
     fn content_factors(&self) -> (Vec<f64>, Option<Vec<f64>>) {
         let n = self.d_embed;
         let mut h = vec![0.0f64; n * n];
@@ -246,19 +246,12 @@ impl Weights {
             }
         }
         let low = self.content_factors.as_ref().map(|f| {
-            let (r, p) = (f.proj.rows, &f.proj);
-            let mut low = vec![0.0f64; r * r];
-            for a in 0..r {
-                for b in 0..r {
-                    let mut sum = 0.0;
-                    for i in 0..n {
-                        let hp: f64 = (0..n).map(|j| h[i * n + j] * f64::from(p.row(b)[j])).sum();
-                        sum += f64::from(p.row(a)[i]) * hp;
-                    }
-                    low[a * r + b] = sum;
-                }
-            }
-            gptq_factor(&low, r)
+            let r = f.low.cols;
+            let block: Vec<f64> = (0..r)
+                .flat_map(|a| (0..r).map(move |b| (a, b)))
+                .map(|(a, b)| h[a * n + b])
+                .collect();
+            gptq_factor(&block, r)
         });
         (gptq_factor(&h, n), low)
     }

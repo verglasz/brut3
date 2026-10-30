@@ -416,7 +416,7 @@ pub fn shipped_token_table(e: &Ends, piece: impl Fn(Tensor<2>) -> Tensor<2>) -> 
     };
     let table = Tensor::cat(
         vec![
-            piece(low.low.weight.val()).matmul(piece(low.proj.weight.val())),
+            padded(piece(low.low.weight.val()), d),
             cut(OPEN_CONTENTS..CONTENTS),
             cut(NO_FORCED..NO_FORCED + 1),
             cut(CELL_BASE..CELL_PAD),
@@ -609,42 +609,54 @@ impl EndLayers {
     }
 }
 
-/// A content table of low rank: the open contents' rows as `low · proj`, `[OPEN_CONTENTS,
-/// rank] x [rank, d_embed]`, while the other rows (decided contents, no forced board, cells,
-/// padding) stay full in the model's `content` embedding, which then starts at
-/// `OPEN_CONTENTS` (see [`content_rows`]).
+/// A content table of low rank: the open contents' rows are `[OPEN_CONTENTS, rank]`, in the
+/// first `rank` of a token's `d_embed` coordinates (the others zero), while the other rows
+/// (decided contents, no forced board, cells, padding) stay full in the model's `content`
+/// embedding, which then starts at `OPEN_CONTENTS` (see [`content_rows`]). A projection to
+/// `d_embed` would add nothing: tokens reach the network only through linear maps, which
+/// absorb any invertible change of the token's coordinates.
 #[derive(Module, Debug)]
 pub struct LowRankContent {
     pub low: Embedding,
-    pub proj: Linear,
 }
 
 impl LowRankContent {
-    /// With rows of about the scale of the full table's initial ones (std 0.02).
+    /// With rows of the full table's initial scale (std 0.02).
     pub fn new(rank: usize, d_embed: usize, device: &Device) -> Self {
-        // A default-initialised `proj` entry has variance about 1 / (3 rank), so a product
-        // entry has about std / sqrt(3).
+        assert!(rank <= d_embed, "content rank {rank} above d_embed {d_embed}");
         Self {
             low: EmbeddingConfig::new(OPEN_CONTENTS, rank)
                 .with_initializer(Initializer::Normal {
                     mean: 0.0,
-                    std: 0.02 * 3f64.sqrt(),
+                    std: 0.02,
                 })
-                .init(device),
-            proj: LinearConfig::new(rank, d_embed)
-                .with_bias(false)
                 .init(device),
         }
     }
 }
 
+/// `rows` (`[m, rank]`) zero-padded to `[m, d]`.
+fn padded(rows: Tensor<2>, d: usize) -> Tensor<2> {
+    let [m, rank] = rows.dims();
+    match rank == d {
+        true => rows,
+        false => {
+            let zeros = Tensor::zeros([m, d - rank], &rows.device());
+            Tensor::cat(vec![rows, zeros], 1)
+        }
+    }
+}
+
 /// The content embedding's `[CONTENT_ROWS, d_embed]` rows: the embedding itself, or with a
-/// low-rank content table the open contents' products then the embedding's other rows.
+/// low-rank content table the open contents' rows padded, then the embedding's other rows.
 pub fn content_rows(e: &Ends) -> Tensor<2> {
     let table = e.content.weight.val();
     match e.content_low {
         None => table,
-        Some(l) => Tensor::cat(vec![l.low.weight.val().matmul(l.proj.weight.val()), table], 0),
+        Some(l) => {
+            let [_, d] = table.dims();
+            Tensor::cat(vec![padded(l.low.weight.val(), d), table], 0)
+        }
     }
 }
 

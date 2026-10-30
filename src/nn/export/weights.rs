@@ -225,10 +225,9 @@ pub struct Weights {
 /// [`crate::nn::nnue::LowRankContent`]): what the export ships for it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContentFactors {
-    /// `[OPEN_CONTENTS, rank]`: the open contents' rows at low rank.
+    /// `[OPEN_CONTENTS, rank]`: the open contents' rows at low rank, a token's first `rank`
+    /// coordinates (the others zero).
     pub low: Matrix,
-    /// `[rank, d_embed]`: their shared projection; an open content's row is `low · proj`.
-    pub proj: Matrix,
     /// `[CONTENT_ROWS - OPEN_CONTENTS, d_embed]`: the embedding's other rows, in its order:
     /// the three decided contents, no forced board, the 27 cell rows, the padding row.
     pub rest: Matrix,
@@ -241,16 +240,13 @@ impl ContentFactors {
     /// its nine cell rows and its eight line rows; a decided content's, and no forced
     /// board's, row plus the padding row nine times.
     pub fn tokens(&self) -> Matrix {
-        let d = self.proj.cols;
+        let d = self.rest.cols;
         let rest = |id: usize| self.rest.row(id - OPEN_CONTENTS);
         let mut data = Vec::with_capacity((CONTENTS + 1) * d);
         for code in open_content_codes() {
             let mut token = vec![0f32; d];
-            for (j, &x) in self.low.row(data.len() / d).iter().enumerate() {
-                for (t, &p) in token.iter_mut().zip(self.proj.row(j)) {
-                    *t += x * p;
-                }
-            }
+            let low = self.low.row(data.len() / d);
+            token[..low.len()].copy_from_slice(low);
             let cell = |i: usize| code / 3usize.pow(i as u32) % 3;
             for i in 0..CELLS {
                 for (t, &c) in token.iter_mut().zip(rest(CELL_BASE + 3 * i + cell(i))) {
@@ -301,7 +297,6 @@ impl Shared {
         let mix_t = mix.weight.transposed(); // [9 * d_embed, d_acc] again
         let content_factors = e.content_low.map(|l| ContentFactors {
             low: Matrix::from_tensor(l.low.weight.val()),
-            proj: Matrix::from_tensor(l.proj.weight.val()),
             rest: Matrix::from_tensor(e.content.weight.val()),
             lines: e.lines.map(|lines| Matrix::from_tensor(lines.weight.val())),
         });
@@ -443,9 +438,8 @@ impl Weights {
         };
         shape(&self.content, CONTENTS + 1, e, "content");
         if let Some(f) = &self.content_factors {
-            let rank = f.proj.rows;
-            shape(&f.low, OPEN_CONTENTS, rank, "content_low");
-            shape(&f.proj, rank, e, "content_proj");
+            assert!(f.low.cols <= e, "content rank above d_embed");
+            shape(&f.low, OPEN_CONTENTS, f.low.cols, "content_low");
             shape(&f.rest, CONTENT_ROWS - OPEN_CONTENTS, e, "content rest");
             if let Some(lines) = &f.lines {
                 shape(lines, LINE_ROWS, e, "content_lines");
@@ -531,7 +525,7 @@ impl Weights {
     /// splits a long list: the per-content tables into `_open` (the open contents) and
     /// `_decided` (the three decided kinds), the token table also into its no-forced row; a
     /// low-rank content table ships its tensors instead (see [`ContentFactors`]):
-    /// `content_low`, `content_proj`, the embedding's decided, no-forced, cell and padding
+    /// `content_low`, the embedding's decided, no-forced, cell and padding
     /// rows, and `content_lines` if there are line rows; the first layer's slices into pieces of [`CHUNK`] rows
     /// (`mix{k}_{p}`, `forced_{p}`); the feature rows into their four tables, one per line.
     /// A hidden layer's arrays are `hidden{i}` and `hidden{i}_bias`, or for a gated one
@@ -585,7 +579,6 @@ impl Weights {
                 };
                 let mut out = vec![
                     m("content_low", &f.low),
-                    m("content_proj", &f.proj),
                     rest("content_decided", decided.clone()),
                     rest("content_no_forced", NO_FORCED..NO_FORCED + 1),
                     rest("content_cells", CELL_BASE..CELL_PAD),
@@ -642,7 +635,7 @@ impl Weights {
         let mut out = match &mut self.content_factors {
             None => vec![&mut self.content.data],
             Some(f) => {
-                let mut out = vec![&mut f.low.data, &mut f.proj.data, &mut f.rest.data];
+                let mut out = vec![&mut f.low.data, &mut f.rest.data];
                 out.extend(f.lines.as_mut().map(|l| &mut l.data));
                 out
             }
@@ -702,7 +695,6 @@ impl Weights {
             }
             (Some(f), Some(low)) => {
                 set(&mut low.low.weight, tensor(&f.low));
-                set(&mut low.proj.weight, tensor(&f.proj));
                 set(&mut t.content.weight, tensor(&f.rest));
                 if let (Some(lines), Some(rows)) = (t.lines, &f.lines) {
                     set(&mut lines.weight, tensor(rows));

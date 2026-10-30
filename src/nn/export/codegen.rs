@@ -116,7 +116,7 @@ impl Names {
             "d_acc must be a multiple of {CHUNK} for the chunked export"
         );
         let trunk: Vec<Kind> = w.trunk.iter().map(Kind::of).collect();
-        let rank = w.content_factors.as_ref().map(|f| f.proj.rows);
+        let rank = w.content_factors.as_ref().map(|f| f.low.cols);
         let mut widths = vec![("d_hidden", w.d_hidden)];
         widths.extend(w.d_ff().map(|d| ("the ReGLU width", d)));
         widths.extend(rank.map(|r| ("the content rank", r)));
@@ -351,14 +351,9 @@ data OpenClosed a = OpenClosed
                     "netContentLow".into(),
                     "[VecR]".into(),
                     format!(
-                        "the open contents' rows at rank {r}, ids 0..{}: content c's row is sum_j (low c)_j * proj_j",
+                        "the open contents' rows at rank {r}, ids 0..{}: content c's row is its low row in the first {r} coordinates, the others zero",
                         OPEN_CONTENTS - 1
                     ),
-                ),
-                (
-                    "netContentProj".into(),
-                    "[VecE]".into(),
-                    format!("the {r} rows proj_j of the shared projection"),
                 ),
                 (
                     "netContentDecided".into(),
@@ -694,7 +689,6 @@ data OpenClosed a = OpenClosed
         }
         Some(r) => {
             inits.push(format!("netContentLow = {}", list(OPEN_CONTENTS, r)));
-            inits.push(format!("netContentProj = {}", list(r, e)));
             inits.push(format!(
                 "netContentDecided = {}",
                 list(CONTENTS - OPEN_CONTENTS, e)
@@ -1078,6 +1072,7 @@ tokenOf n ids = case ids of
 "#
         );
     };
+    let pad = e - r;
     let lines = match names.content_lines {
         true => {
             let small: Vec<String> = LINES
@@ -1100,7 +1095,7 @@ tokenOf n ids = case ids of
     };
     format!(
         r#"-- | A board token from its {IDS_PER_BOARD} ids, from the low-rank content table's tensors as
--- the model computes it: the content's row (an open content's low row times the projection),
+-- the model computes it: the content's row (an open content's low row, zero-padded),
 -- its nine cell rows or the padding row nine times, and an open content's line rows (slow:
 -- for tests, not for the search).
 tokenOf :: Net -> [Int] -> VecE
@@ -1110,7 +1105,7 @@ tokenOf n ids = case ids of
   where
     contentRow i
       | i < openContents =
-          foldl add{e} (replicate{e} 0) (zipWith scale{e} (toList{r} (netContentLow n !! i)) (netContentProj n))
+          fromList{e} (toList{r} (netContentLow n !! i) ++ replicate {pad} 0)
       | i < noForced = netContentDecided n !! (i - openContents)
       | i == noForced = netNoForced n
       | otherwise = error ("tokenOf: " ++ show i ++ " is not a content id")
