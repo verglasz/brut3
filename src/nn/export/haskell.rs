@@ -96,6 +96,12 @@ pub struct Report {
     pub wdl_error: f32,
     pub value_error: f32,
     pub policy_error: f32,
+    /// The same deviations' root mean square: over every win/draw/loss probability, every
+    /// position's value and every legal move's probability. Steadier than the largest, which
+    /// one position decides, for comparing quantisations.
+    pub wdl_rms: f32,
+    pub value_rms: f32,
+    pub policy_rms: f32,
     /// The book export, if one was written.
     pub book: Option<super::book::BookStats>,
 }
@@ -159,19 +165,30 @@ pub fn write_all(
         emit("SelfTest", codegen::selftest_module(&names, &opts.prefix))?;
         report.stream_bytes = stream_bytes;
         report.chunks = chunks;
+        // Sums of squared deviations and their counts, for the root mean squares.
+        let mut squares = [(0.0f64, 0usize); 3];
+        let mut add = |k: usize, d: f32| {
+            squares[k].0 += f64::from(d) * f64::from(d);
+            squares[k].1 += 1;
+        };
         for (_, state) in &positions {
             let exact = weights.evaluate(state);
             let other = rounded.evaluate(state);
             for (a, b) in exact.wdl.iter().zip(&other.wdl) {
                 report.wdl_error = report.wdl_error.max((a - b).abs());
+                add(0, a - b);
             }
-            report.value_error = report
-                .value_error
-                .max((exact.value() - other.value()).abs());
+            let value = exact.value() - other.value();
+            report.value_error = report.value_error.max(value.abs());
+            add(1, value);
             for (a, b) in exact.policy.iter().zip(&other.policy) {
                 report.policy_error = report.policy_error.max((a.2 - b.2).abs());
+                add(2, a.2 - b.2);
             }
         }
+        let rms = |(sum, n): (f64, usize)| (sum / n.max(1) as f64).sqrt() as f32;
+        (report.wdl_rms, report.value_rms, report.policy_rms) =
+            (rms(squares[0]), rms(squares[1]), rms(squares[2]));
     }
     // FixedVec: the network's shapes, plus the extra ones for hand-written code.
     let vec_spec = match (weights, &opts.vec_extra) {

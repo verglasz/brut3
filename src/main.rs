@@ -1604,13 +1604,16 @@ fn export(
     }
     if weights.is_some() {
         eprintln!(
-            "weights: {} bytes in {} literals; quantisation error over the reference positions: \
-             wdl {:.2e}, value {:.2e}, policy {:.2e}",
+            "weights: {} bytes in {} literals; quantisation error over the reference positions \
+             (largest / rms): wdl {:.2e} / {:.2e}, value {:.2e} / {:.2e}, policy {:.2e} / {:.2e}",
             report.stream_bytes,
             report.chunks,
             report.wdl_error,
+            report.wdl_rms,
             report.value_error,
-            report.policy_error
+            report.value_rms,
+            report.policy_error,
+            report.policy_rms
         );
     }
     if let Some(flags) = &report.vec_flags {
