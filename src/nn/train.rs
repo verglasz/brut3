@@ -9,7 +9,7 @@ use burn::data::dataset::{Dataset as BurnDataset, DatasetError, InMemDataset};
 use burn::lr_scheduler::cosine::CosineAnnealingLrSchedulerConfig;
 use burn::optim::AdamWConfig;
 use burn::prelude::*;
-use burn::tensor::activation::{log_softmax, softmax};
+use burn::tensor::activation::log_softmax;
 use burn::train::logger::{EvaluationProgressLogger, TrainingProgressLogger};
 use burn::train::metric::{AccuracyMetric, LossMetric, MetricDefinition};
 use burn::train::renderer::{
@@ -31,7 +31,16 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use super::linear::LinearNet;
-use super::model::{MOVES, Model, Verdict, expected_value, legal_mask, most_likely, predict_host};
+use super::model::{
+    MOVES,
+    Model,
+    Prediction,
+    Verdict,
+    expected_value,
+    legal_mask,
+    most_likely,
+    predict_host,
+};
 use super::train_stats::{LossPartMetric, LossParts, LrMetric, StatMetric};
 use crate::agent::{AgentSpec, UtttAgent};
 use crate::game::{BitState, GameState, Move, Outcome, Symmetry};
@@ -49,6 +58,12 @@ pub enum Augment {
     /// sees the data once and the symmetries over the epochs, in the memory of one copy.
     /// Right for datasets of millions of positions.
     Random,
+    /// Every sample through all eight symmetries in one step: the loss is taken on the
+    /// eight images' log-probabilities averaged (mapped back to the sample's frame), plus
+    /// [`TrainOptions::consistency`] times how far each image strays from that average, so
+    /// that the model learns to give every image the same answer. Eight times the work per
+    /// step; validation is averaged the same way.
+    Average,
 }
 
 impl std::str::FromStr for Augment {
@@ -59,7 +74,10 @@ impl std::str::FromStr for Augment {
             "none" => Ok(Self::None),
             "all" => Ok(Self::All),
             "random" => Ok(Self::Random),
-            other => Err(format!("augmentation {other:?} is not none, all or random")),
+            "average" => Ok(Self::Average),
+            other => Err(format!(
+                "augmentation {other:?} is not none, all, random or average"
+            )),
         }
     }
 }
@@ -511,6 +529,15 @@ pub struct Batch<M: Model> {
     pub policy: Tensor<2>,
     /// `[batch, MOVES]` legal moves.
     pub legal: Tensor<2, Bool>,
+    /// Symmetric images per sample in `input` (see [`Augment::Average`]): `1`, or `8` with
+    /// the images in [`Symmetry::ALL`] order, each covering the whole batch. The targets are
+    /// the samples' own, once.
+    pub images: usize,
+    /// With images, `[images, 1, MOVES]`: where image `g` puts each move of the sample's
+    /// frame (`back[g][m]` is the index of `g` applied to move `m`).
+    pub image_moves: Option<Tensor<3, Int>>,
+    /// Weight of the images' disagreement with their average in the loss.
+    pub consistency: f32,
 }
 
 impl<M: Model> std::fmt::Debug for Batch<M> {
@@ -537,6 +564,9 @@ impl<M: Model> Clone for Batch<M> {
             search_value_weight: self.search_value_weight,
             policy: self.policy.clone(),
             legal: self.legal.clone(),
+            images: self.images,
+            image_moves: self.image_moves.clone(),
+            consistency: self.consistency,
         }
     }
 }
@@ -548,6 +578,9 @@ pub struct ModelBatcher<M> {
     pub outcome_weight: f32,
     pub search_value_weight: f32,
     pub random_symmetry: bool,
+    /// Every sample through all eight symmetries, with this consistency weight
+    /// ([`Augment::Average`]).
+    pub averaging: Option<f32>,
     _model: PhantomData<fn() -> M>,
 }
 
@@ -557,8 +590,16 @@ impl<M> ModelBatcher<M> {
             outcome_weight,
             search_value_weight,
             random_symmetry,
+            averaging: None,
             _model: PhantomData,
         }
+    }
+
+    /// Batches every sample through all eight symmetries, the images' disagreement weighted
+    /// by `consistency` ([`Augment::Average`]).
+    pub fn averaging(mut self, consistency: f32) -> Self {
+        self.averaging = Some(consistency);
+        self
     }
 }
 
@@ -570,11 +611,14 @@ impl<M> Default for ModelBatcher<M> {
 
 impl<M> Clone for ModelBatcher<M> {
     fn clone(&self) -> Self {
-        Self::new(
-            self.outcome_weight,
-            self.search_value_weight,
-            self.random_symmetry,
-        )
+        Self {
+            averaging: self.averaging,
+            ..Self::new(
+                self.outcome_weight,
+                self.search_value_weight,
+                self.random_symmetry,
+            )
+        }
     }
 }
 
@@ -611,8 +655,29 @@ impl<M: Model> Batcher<Sample, Batch<M>> for ModelBatcher<M> {
             .map(|s| s.verdict_class().index() as i32)
             .collect();
         let values: Vec<f32> = items.iter().map(Sample::value_target).collect();
+        let (input, images, image_moves) = match self.averaging {
+            None => (M::encode(&states, device), 1, None),
+            Some(_) => {
+                let images: Vec<BitState> = Symmetry::ALL
+                    .iter()
+                    .flat_map(|&g| states.iter().map(move |s| s.transform(g)))
+                    .collect();
+                let moves: Vec<i32> = Symmetry::ALL
+                    .iter()
+                    .flat_map(|&g| {
+                        (0..MOVES).map(move |m| g.apply_move(Move::from_index(m)).index() as i32)
+                    })
+                    .collect();
+                let k = Symmetry::ALL.len();
+                (
+                    M::encode(&images, device),
+                    k,
+                    Some(Tensor::from_data(TensorData::new(moves, [k, 1, MOVES]), device)),
+                )
+            }
+        };
         Batch {
-            input: M::encode(&states, device),
+            input,
             wdl: Tensor::from_data(TensorData::new(wdl, [n, 3]), device),
             wdl_mask: Tensor::from_data(TensorData::new(wdl_mask, [n, 1]), device),
             verdicts: Tensor::from_data(TensorData::new(verdicts, [n]), device),
@@ -621,6 +686,9 @@ impl<M: Model> Batcher<Sample, Batch<M>> for ModelBatcher<M> {
             search_value_weight: self.search_value_weight,
             policy: Tensor::from_data(TensorData::new(policy, [n, MOVES]), device),
             legal: legal_mask(&states, device),
+            images,
+            image_moves,
+            consistency: self.averaging.unwrap_or(0.0),
         }
     }
 }
@@ -632,19 +700,65 @@ pub use super::train_stats::StepOutput;
 /// of the expected value (`p_win - p_loss`) against the scalar value target, and the
 /// cross-entropy between the target move distribution and the legal-masked policy. The
 /// output holds the summed loss, the `[batch, 3]` verdict logits and the `[batch]` verdict
-/// targets, which burn's loss and accuracy metrics read, and the three terms unweighted (see
-/// [`LossParts`](super::train_stats::LossParts)).
+/// targets, which burn's loss and accuracy metrics read, and the terms unweighted (see
+/// [`LossParts`](super::train_stats::LossParts)). With symmetric images
+/// ([`Augment::Average`]) the outputs are the images' averaged log-probabilities, and their
+/// disagreement with the average is one more term.
 pub fn forward_step<M: Model>(model: &M, batch: Batch<M>) -> (ClassificationOutput, LossParts) {
     let prediction = model.predict(batch.input);
     let n = batch.verdicts.dims()[0];
+    // Win/draw/loss and legal move log-probabilities in the samples' frame, and the images'
+    // disagreement with them.
+    let (wdl_logs, policy_logs, consistency) = match batch.image_moves {
+        None => (
+            log_softmax(prediction.wdl.clone(), 1),
+            prediction.policy_log_probabilities(batch.legal.clone()),
+            Tensor::zeros([1], &batch.wdl.device()),
+        ),
+        Some(image_moves) => {
+            let k = batch.images;
+            // Each image's move logits back in the sample's frame: the logit of move m is
+            // the image's logit of g applied to m.
+            let back = image_moves.expand([k, n, MOVES]).reshape([k * n, MOVES]);
+            let legal = batch
+                .legal
+                .clone()
+                .unsqueeze_dim::<3>(0)
+                .expand([k, n, MOVES])
+                .reshape([k * n, MOVES]);
+            let images = Prediction {
+                wdl: prediction.wdl,
+                policy: prediction.policy.gather(1, back),
+            };
+            let wdl_images = log_softmax(images.wdl.clone(), 1).reshape([k, n, 3]);
+            let policy_images = images.policy_log_probabilities(legal).reshape([k, n, MOVES]);
+            // The images' log-probabilities averaged, renormalised: their logits averaged.
+            let wdl_logs = log_softmax(wdl_images.clone().mean_dim(0).reshape([n, 3]), 1);
+            let policy_logs =
+                log_softmax(policy_images.clone().mean_dim(0).reshape([n, MOVES]), 1);
+            // KL(average ‖ image), over the images and samples, illegal moves left out.
+            let legal_f = batch.legal.clone().float();
+            let kl = |mean: Tensor<2>, images: Tensor<3>, mask: Option<Tensor<2>>| {
+                let [_, w] = mean.dims();
+                let p = mean.clone().exp().unsqueeze_dim::<3>(0).expand([k, n, w]);
+                let mut terms = p * (mean.unsqueeze_dim::<3>(0).expand([k, n, w]) - images);
+                if let Some(mask) = mask {
+                    terms = terms * mask.unsqueeze_dim::<3>(0).expand([k, n, w]);
+                }
+                terms.sum_dim(2).mean()
+            };
+            let consistency = kl(wdl_logs.clone(), wdl_images, None)
+                + kl(policy_logs.clone(), policy_images, Some(legal_f));
+            (wdl_logs, policy_logs, consistency)
+        }
+    };
     // Averaged over the positions that have a win/draw/loss target, so that the term keeps
     // its weight when only some of a batch carry one.
     let labelled = batch.wdl_mask.clone().sum().clamp_min(1.0);
-    let wdl_loss = (-(log_softmax(prediction.wdl.clone(), 1) * batch.wdl).sum_dim(1)
-        * batch.wdl_mask)
+    let wdl_loss = (-(wdl_logs.clone() * batch.wdl).sum_dim(1) * batch.wdl_mask)
         .sum()
         .div(labelled);
-    let probabilities = softmax(prediction.wdl.clone(), 1);
+    let probabilities = wdl_logs.clone().exp();
     let expected = probabilities.clone().slice([0..n, 0..1]) - probabilities.slice([0..n, 2..3]);
     let value_loss = (expected - batch.values).powf_scalar(2.0).mean();
     // The targets' own entropy, the least the policy's cross-entropy can be (0 ln 0 = 0).
@@ -652,19 +766,22 @@ pub fn forward_step<M: Model>(model: &M, batch: Batch<M>) -> (ClassificationOutp
         .sum_dim(1)
         .mean()
         .detach();
-    let policy_loss = -(prediction.policy_log_probabilities(batch.legal) * batch.policy)
-        .sum_dim(1)
-        .mean();
+    let policy_loss = -(policy_logs * batch.policy).sum_dim(1).mean();
     let loss = wdl_loss.clone().mul_scalar(batch.outcome_weight)
         + value_loss.clone().mul_scalar(batch.search_value_weight)
-        + policy_loss.clone();
+        + policy_loss.clone()
+        + consistency.clone().mul_scalar(batch.consistency);
     let policy_kl = policy_loss.clone() - target_entropy;
     let parts = LossParts::new(
-        Tensor::cat(vec![wdl_loss, value_loss, policy_loss, policy_kl], 0).detach(),
+        Tensor::cat(
+            vec![wdl_loss, value_loss, policy_loss, policy_kl, consistency],
+            0,
+        )
+        .detach(),
         n,
     );
     (
-        ClassificationOutput::new(loss, prediction.wdl, batch.verdicts),
+        ClassificationOutput::new(loss, wdl_logs, batch.verdicts),
         parts,
     )
 }
@@ -735,8 +852,12 @@ pub struct TrainOptions {
     pub weight_decay: f32,
     /// Fraction of positions held out for validation.
     pub validation_fraction: f32,
-    /// Symmetry augmentation of the training split. Validation is never augmented.
+    /// Symmetry augmentation of the training split. Validation is never augmented, except
+    /// that [`Augment::Average`] averages it the same way.
     pub augment: Augment,
+    /// With [`Augment::Average`], the weight of the symmetric images' disagreement with
+    /// their average (the "Symmetry KL" metric) in the loss.
+    pub consistency: f32,
     /// Weight of the win/draw/loss cross-entropy in the loss; `0` with a search-value weight
     /// trains the value head purely on scalar values (distillation).
     pub outcome_weight: f32,
@@ -769,6 +890,7 @@ impl Default for TrainOptions {
             weight_decay: 1e-4,
             validation_fraction: 0.1,
             augment: Augment::All,
+            consistency: 1.0,
             outcome_weight: 1.0,
             search_value_weight: 0.5,
             workers: 0,
@@ -910,7 +1032,7 @@ pub fn train<M: Trainable>(
     let (train_data, valid_data) = data.split(opts.validation_fraction, opts.seed);
     let train_positions = match opts.augment {
         Augment::All => train_data.len() * Symmetry::ALL.len(),
-        Augment::None | Augment::Random => train_data.len(),
+        Augment::None | Augment::Random | Augment::Average => train_data.len(),
     };
     let report_base = TrainReport {
         train_positions,
@@ -920,11 +1042,15 @@ pub fn train<M: Trainable>(
     };
     let batch = opts.batch_size.max(1);
     let steps_per_epoch = train_positions.div_ceil(batch);
-    let batcher = ModelBatcher::<M>::new(
+    let averaging = |b: ModelBatcher<M>| match opts.augment {
+        Augment::Average => b.averaging(opts.consistency),
+        _ => b,
+    };
+    let batcher = averaging(ModelBatcher::<M>::new(
         opts.outcome_weight,
         opts.search_value_weight,
         opts.augment == Augment::Random,
-    );
+    ));
     let loader_train = DataLoaderBuilder::<Sample, Batch<M>>::new(batcher)
         .batch_size(batch)
         .shuffle(opts.seed)
@@ -932,13 +1058,16 @@ pub fn train<M: Trainable>(
         .set_device(ad_device.clone());
     let loader_train = match opts.augment {
         Augment::All => loader_train.build(Augmented::new(train_data)),
-        Augment::None | Augment::Random => {
+        Augment::None | Augment::Random | Augment::Average => {
             loader_train.build(InMemDataset::new(train_data.samples))
         }
     };
     let valid_samples = valid_data.samples;
-    let valid_batcher =
-        ModelBatcher::<M>::new(opts.outcome_weight, opts.search_value_weight, false);
+    let valid_batcher = averaging(ModelBatcher::<M>::new(
+        opts.outcome_weight,
+        opts.search_value_weight,
+        false,
+    ));
     let loader_valid = DataLoaderBuilder::<Sample, Batch<M>>::new(valid_batcher)
         .batch_size(1024)
         .num_workers(opts.workers())
@@ -1522,6 +1651,33 @@ pub(crate) mod tests {
             assert!(s.policy.iter().all(|(mv, _)| s.state.is_legal(*mv)));
             assert!(s.wdl.is_some() && s.search_value.is_some());
         }
+    }
+
+    /// The averaged step's policy loss is the one [`evaluate_symmetries`] computes on the host
+    /// from the images' averaged log-probabilities, so the images' moves are mapped back
+    /// right; the plain step's is [`evaluate`]'s; and a model that is not symmetric pays for
+    /// its images' disagreement.
+    #[test]
+    fn averaged_step_matches_the_host_average_over_symmetries() {
+        let _lock = crate::nn::device_lock();
+        let device = BackendKind::preferred().device();
+        let model = LinearNetConfig::default().init(&device);
+        let samples = synthetic_dataset(64, 3).samples;
+        let loss_of = |batcher: ModelBatcher<LinearNet>| {
+            let (out, _) = forward_step(&model, batcher.batch(samples.clone(), &device));
+            out.loss.into_data().try_to_vec::<f32>().unwrap()[0]
+        };
+        // Only the policy term: the outcome and value weights are zero.
+        let plain = loss_of(ModelBatcher::new(0.0, 0.0, false));
+        let expected = evaluate(&model, &device, &samples).policy_loss;
+        assert!((plain - expected).abs() < 1e-3, "{plain} vs {expected}");
+        let averaged = loss_of(ModelBatcher::new(0.0, 0.0, false).averaging(0.0));
+        let expected = evaluate_symmetries(&model, &device, &samples)
+            .mean_logits
+            .policy_loss;
+        assert!((averaged - expected).abs() < 1e-3, "{averaged} vs {expected}");
+        let consistent = loss_of(ModelBatcher::new(0.0, 0.0, false).averaging(1.0));
+        assert!(consistent > averaged + 1e-4, "{consistent} vs {averaged}");
     }
 
     #[test]

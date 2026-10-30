@@ -259,9 +259,15 @@ pub struct LossParts {
 
 impl LossParts {
     /// The metrics' names, in the order of the values.
-    pub const NAMES: [&str; 4] = ["WDL loss", "Value loss", "Policy loss", "Policy KL"];
+    pub const NAMES: [&str; 5] = [
+        "WDL loss",
+        "Value loss",
+        "Policy loss",
+        "Policy KL",
+        "Symmetry KL",
+    ];
 
-    /// `values` are `[4]`, in [`LossParts::NAMES`] order, over a step of `n` positions.
+    /// `values` are `[5]`, in [`LossParts::NAMES`] order, over a step of `n` positions.
     pub fn new(values: Tensor<1>, n: usize) -> Self {
         Self {
             values,

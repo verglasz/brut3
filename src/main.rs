@@ -593,9 +593,17 @@ struct TrainArgs {
     #[arg(long)]
     no_tui: bool,
     /// Symmetry augmentation: `all` (eight copies, for small datasets), `random` (one random
-    /// symmetry per sample per epoch, for large ones) or `none`.
+    /// symmetry per sample per epoch, for large ones), `average` (every sample through all
+    /// eight symmetries in one step, the loss on their averaged outputs plus --consistency
+    /// times their disagreement; eight times the work per step) or `none`.
     #[arg(long, default_value = "all")]
     augment: String,
+    /// With `--augment average`: weight of the symmetric images' disagreement with their
+    /// average (KL, the "Symmetry KL" metric) in the loss. 0 trains the average alone, which
+    /// leaves single images free to disagree; larger makes any one image answer as the
+    /// average does.
+    #[arg(long, default_value_t = 1.0)]
+    consistency: f32,
     /// Weight of the outcome cross-entropy in the loss (0 with --search-value-weight is
     /// distillation: the value head learns the generating search's values only).
     #[arg(long, default_value_t = 1.0)]
@@ -1883,6 +1891,7 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         artifact_dir: args.artifact_dir.clone(),
         tui: !args.no_tui,
         augment: args.augment.parse()?,
+        consistency: args.consistency,
         outcome_weight: args.outcome_weight,
         search_value_weight: args.search_value_weight,
     };
