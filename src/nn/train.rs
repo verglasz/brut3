@@ -733,10 +733,16 @@ pub fn forward_step<M: Model>(model: &M, batch: Batch<M>) -> (ClassificationOutp
             };
             let wdl_images = log_softmax(images.wdl.clone(), 1).reshape([k, n, 3]);
             let policy_images = images.policy_log_probabilities(legal).reshape([k, n, MOVES]);
-            // The images' log-probabilities averaged, renormalised: their logits averaged.
-            let wdl_logs = log_softmax(wdl_images.clone().mean_dim(0).reshape([n, 3]), 1);
-            let policy_logs =
-                log_softmax(policy_images.clone().mean_dim(0).reshape([n, MOVES]), 1);
+            // The images' log-probabilities averaged, renormalised: their logits averaged. The
+            // mean is over the rows of a [k, n * w] view: on burn 0.22's CUDA backend the
+            // gradient of `mean_dim(0)` on the [k, n, w] tensor itself is wrong whenever n is
+            // even (wgpu, cpu-mlir and flex get it right), which broke this training.
+            let image_mean = |images: Tensor<3>| {
+                let [_, _, w] = images.dims();
+                images.reshape([k, n * w]).mean_dim(0).reshape([n, w])
+            };
+            let wdl_logs = log_softmax(image_mean(wdl_images.clone()), 1);
+            let policy_logs = log_softmax(image_mean(policy_images.clone()), 1);
             // KL(average ‖ image), over the images and samples, illegal moves left out. Its
             // gradient on image g's logits is (p_g - q) / 8, pulling each image toward the
             // average; the average's cross-entropy gives (q - y) / 8, so at weight 1 the sum is
@@ -1695,6 +1701,40 @@ pub(crate) mod tests {
         assert!(consistent > averaged + 1e-4, "{consistent} vs {averaged}");
         let each = host.each.policy_loss;
         assert!((consistent - each).abs() < 1e-3, "{consistent} vs {each}");
+    }
+
+    /// At consistency 1 the averaged step's gradient is the images' own losses' (the
+    /// `Augment::All` objective): one plain gradient step on either gives the same model.
+    #[test]
+    fn averaged_step_has_the_gradient_of_the_images_one_by_one() {
+        use burn::optim::{GradientsParams, Optimizer, SgdConfig};
+
+        let _lock = crate::nn::device_lock();
+        let device = BackendKind::preferred().device();
+        let ad = device.clone().autodiff();
+        let model = LinearNetConfig::default().init(&ad);
+        let samples = synthetic_dataset(64, 3).samples;
+        // No value term: its squared error is the one part that does not decompose.
+        let batcher = || ModelBatcher::<LinearNet>::new(1.0, 0.0, false);
+        let step = |loss: Tensor<1>| {
+            let grads = GradientsParams::from_grads(loss.backward(), &model);
+            SgdConfig::new().init().step(1.0, model.clone(), grads).valid()
+        };
+        let (out, _) = forward_step(&model, batcher().averaging(1.0).batch(samples.clone(), &ad));
+        let averaged = step(out.loss);
+        let losses: Vec<Tensor<1>> = Symmetry::ALL
+            .iter()
+            .map(|&g| {
+                let images: Vec<Sample> = samples.iter().map(|s| s.transform(g)).collect();
+                forward_step(&model, batcher().batch(images, &ad)).0.loss
+            })
+            .collect();
+        let one_by_one = step(Tensor::cat(losses, 0).mean());
+        let states: Vec<BitState> = samples.iter().map(|s| s.state).collect();
+        let a = crate::nn::model::predict_logits(&averaged, &states, &device);
+        let b = crate::nn::model::predict_logits(&one_by_one, &states, &device);
+        let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        assert!(worst < 1e-3, "logits after the two steps differ by up to {worst}");
     }
 
     #[test]
