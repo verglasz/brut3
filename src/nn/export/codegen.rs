@@ -21,8 +21,6 @@ use crate::game::LINES;
 use crate::nn::model::MOVES;
 use crate::nn::nnue::{
     BOARDS,
-    CELL_BASE,
-    CELL_PAD,
     CELLS,
     CONTENTS,
     DECIDED_BASE,
@@ -307,16 +305,12 @@ data OpenClosed a = OpenClosed
     );
 
     // The record.
-    let content_ids = format!("content rows, ids 0..{}", CONTENTS - 1);
-    let no_forced_id =
-        format!("the forced token's content row when the move is free, id {NO_FORCED} (noForced)");
-    let cell_ids = format!(
-        "{} cell rows, ids {CELL_BASE}..{}, at 3 * cell + v (v: 0 empty, 1 mine, 2 theirs)",
-        CELL_PAD - CELL_BASE,
-        CELL_PAD - 1
+    let content_ids = format!(
+        "the board token of each content, ids 0..{}: the content's row with its cell (and line) rows folded in",
+        CONTENTS - 1
     );
-    let pad_id = format!(
-        "the cell padding row, id {CELL_PAD} (cellPad): a decided board's or no-forced token adds it nine times instead of cell rows"
+    let no_forced_id = format!(
+        "the forced token when the move is free, id {NO_FORCED} (noForced), with its padding folded in"
     );
     let _ = writeln!(
         s,
@@ -326,8 +320,6 @@ data OpenClosed a = OpenClosed
     let mut fields: Vec<(String, String, String)> = vec![
         ("netContent".into(), "(OpenClosed VecE)".into(), content_ids),
         ("netNoForced".into(), "VecE".into(), no_forced_id),
-        ("netCells".into(), "[VecE]".into(), cell_ids),
-        ("netPad".into(), "VecE".into(), pad_id),
         (
             "netMix".into(),
             "[[FoldPiece]]".into(),
@@ -623,8 +615,6 @@ data OpenClosed a = OpenClosed
         "netContent = table \"content\" ({open}) ({decided})"
     ));
     inits.push(format!("netNoForced = {}", vector(e)));
-    inits.push(format!("netCells = {}", list(CELL_PAD - CELL_BASE, e)));
-    inits.push(format!("netPad = {}", vector(e)));
     // The first layer's slices in pieces of CHUNK rows.
     let pieces = || {
         let p: Vec<String> = (0..k).map(|_| matrix(CHUNK, e)).collect();
@@ -1002,20 +992,14 @@ byId t i
   | i == wonByThem = ocWonByThem t
   | otherwise = error ("byId: " ++ show i ++ " is not a content id")
 
--- | Row i of the content array in the training numbering: a content, the no-forced row, a
--- cell row or the padding row.
-contentRow :: Net -> Int -> VecE
-contentRow n i
-  | i < noForced = byId (netContent n) i
-  | i == noForced = netNoForced n
-  | i < cellPad = netCells n !! (i - cellBase)
-  | i == cellPad = netPad n
-  | otherwise = error ("contentRow: " ++ show i ++ " is not a content row")
-
--- | A board token from its {IDS_PER_BOARD} ids, looking the rows up in the content lists
--- (slow: for tests and for building a table, not for the search).
+-- | A board token from its {IDS_PER_BOARD} ids: the token row of its first (content) id, the
+-- cell ids being folded into it (slow: for tests, not for the search).
 tokenOf :: Net -> [Int] -> VecE
-tokenOf n ids = foldl1 add{e} (map (contentRow n) ids)
+tokenOf n ids = case ids of
+  (i : _)
+    | i < noForced -> byId (netContent n) i
+    | i == noForced -> netNoForced n
+  _ -> error ("tokenOf: " ++ show (take 1 ids) ++ " is not a content id")
 {{-# NOINLINE tokenOf #-}}
 
 -- | The eleven global feature ids of a position's ids as the local indices the
@@ -1122,7 +1106,7 @@ bench iters = do
         putStrLn ("bench: " ++ show (fromIntegral (t1 - t0) / 1000 / fromIntegral iters :: Double) ++ " us per evaluation, " ++ label ++ " hidden layers (checksum " ++ show total ++ ")")
   -- Decode everything first: the strict fields of Net force a list-valued table only to its
   -- first element, so without this most of the decoding would land inside the timed loop.
-  let walkLists = sum (map (index{e} 0) (ocOpen (netContent n) ++ netCells n)) + sum (ocOpen (netSend n)) + sum (map (index9 0) (ocOpen (netLocal n))) + sum [index{e} 0 (sel{CHUNK}_{e} 0 p) | ps <- netForced n : netMix n, p <- ps]
+  let walkLists = sum (map (index{e} 0) (ocOpen (netContent n))) + sum (ocOpen (netSend n)) + sum (map (index9 0) (ocOpen (netLocal n))) + sum [index{e} 0 (sel{CHUNK}_{e} 0 p) | ps <- netForced n : netMix n, p <- ps]
       walkRefs = sum [index3 0 wdl + index{a} 0 acc + index{h} 0 hid | r <- refs, let (acc, hid, wdl) = evalIds n (refIds r)]
       -- The columns are built once, outside the timed loop, as the engine keeps them.
       walkCols = sum [index{h} 0 (sparseHiddenOf n cols acc) | r <- refs, let (acc, _, _) = evalIds n (refIds r)]

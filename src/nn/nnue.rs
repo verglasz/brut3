@@ -334,6 +334,21 @@ pub fn load_tolerating<M: Module + Clone>(
     }
 }
 
+/// Every board token by compact content id, then "no forced board"'s (`[CONTENTS + 1,
+/// d_embed]`): its content row (see [`content_table`]) plus its nine cell rows, or nine
+/// padding rows for a decided board and "no forced board". A token is a function of its
+/// content, so the model reads the tokens from this table, and the export ships it.
+pub fn token_table(e: &Ends) -> Tensor<2> {
+    let table = content_table(e);
+    let device = table.device();
+    let [_, d] = table.dims();
+    let ids = Tensor::<2, Int>::from_data(
+        TensorData::new(token_ids().to_vec(), [CONTENTS + 1, IDS_PER_BOARD]),
+        &device,
+    );
+    rows(table, ids).sum_dim(1).reshape([CONTENTS + 1, d])
+}
+
 /// One board token's ids: the content, then the nine cell rows for an open board or padding
 /// for a decided one (whose cells must not matter, so that a row is a function of the
 /// compact content alone).
@@ -693,13 +708,14 @@ fn accumulate(e: &Ends, qat: &Qat, ids: NnueInput) -> Tensor<2> {
     let [n, _] = ids.dims();
     let [_, d_e] = e.content.weight.dims();
     let [_, d_acc] = e.features.weight.dims();
-    let token_ids = ids.clone().slice([0..n, 0..TOKENS * IDS_PER_BOARD]);
-    // Every token is the sum of its content row and its nine cell rows.
-    let content = qat.rows(qat.content, content_table(e));
-    let tokens = rows(content, token_ids)
-        .reshape([n, TOKENS, IDS_PER_BOARD, d_e])
-        .sum_dim(2)
-        .reshape([n, TOKENS, d_e]);
+    // A token is its content's row of the token table: the first of its ids.
+    let contents = ids
+        .clone()
+        .slice([0..n, 0..TOKENS * IDS_PER_BOARD])
+        .reshape([n, TOKENS, IDS_PER_BOARD])
+        .slice([0..n, 0..TOKENS, 0..1])
+        .reshape([n, TOKENS]);
+    let tokens = rows(qat.rows(qat.content, token_table(e)), contents);
     let boards = tokens
         .clone()
         .slice([0..n, 0..BOARDS])
@@ -882,14 +898,8 @@ pub fn fold<N: NnueNet + Clone>(net: &N) -> FoldedNnue<N> {
     let e = net.ends();
     let device = e.content.weight.device();
     let [_, d_e] = e.content.weight.dims();
-    let ids = Tensor::<2, Int>::from_data(
-        TensorData::new(token_ids(), [CONTENTS + 1, IDS_PER_BOARD]),
-        &device,
-    );
     // The token of every content (rows 0..CONTENTS) and of "no forced board" (the last).
-    let tokens = rows(content_table(&e), ids)
-        .sum_dim(1)
-        .reshape([CONTENTS + 1, d_e]);
+    let tokens = token_table(&e);
     // Spread over the raw codes; codes no game reaches get zero rows (and so zero products),
     // never read.
     let (to_compact, reachable) = raw_contents();
@@ -928,7 +938,13 @@ pub fn fold<N: NnueNet + Clone>(net: &N) -> FoldedNnue<N> {
 
 /// The token ids of every compact content in order, then of "no forced board": rows of
 /// [`IDS_PER_BOARD`] ids as [`write_token`] writes them for a board holding that content.
-fn token_ids() -> Vec<i32> {
+/// Computed once.
+fn token_ids() -> &'static [i32] {
+    static IDS: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
+    IDS.get_or_init(token_ids_uncached)
+}
+
+fn token_ids_uncached() -> Vec<i32> {
     let mut ids = vec![0i32; (CONTENTS + 1) * IDS_PER_BOARD];
     let row = |c: usize| c * IDS_PER_BOARD..(c + 1) * IDS_PER_BOARD;
     // Open contents from their raw codes; a decided content's cells are padding anyway.

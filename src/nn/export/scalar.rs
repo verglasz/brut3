@@ -92,15 +92,10 @@ impl Layer {
 }
 
 impl Weights {
-    /// A board token: the sum of its content row and its nine cell (or padding) rows.
+    /// A board token from its ids: its content's row of the token table, in which the cell
+    /// (and line) rows are folded.
     pub fn token(&self, ids: &[i32]) -> Vec<f32> {
-        let mut token = vec![0.0; self.d_embed];
-        for &id in ids {
-            for (t, e) in token.iter_mut().zip(self.content.row(id as usize)) {
-                *t += e;
-            }
-        }
-        token
+        self.content.row(ids[0] as usize).to_vec()
     }
 
     /// The folded first-layer row of a token at board `k` (`BOARDS` for the forced token):
@@ -299,11 +294,7 @@ mod tests {
             nnue.with_lines(Some(true)),
         ] {
             let model = config.init(&device).map(&mut Jitter);
-            // The line table folds into the content rows.
-            let folded = match config.lines {
-                Some(true) => crate::nn::nnue::LINE_ROWS * config.d_embed,
-                _ => 0,
-            };
+            let folded = cell_rows(config.lines == Some(true)) * config.d_embed;
             assert_matches(&model, &Weights::from_model(&model), folded, &device);
         }
         let v2 = NnueV2Config::new()
@@ -315,7 +306,8 @@ mod tests {
         for config in [v2.clone(), v2.with_reglu(Some(24))] {
             let model = config.init(&device).map(&mut Jitter);
             // Two ReZero scalars: the first layer's and the third's.
-            assert_matches(&model, &Weights::from_v2(&model), 2, &device);
+            let folded = 2 + cell_rows(false) * config.d_embed;
+            assert_matches(&model, &Weights::from_v2(&model), folded, &device);
         }
     }
 
@@ -344,7 +336,14 @@ mod tests {
             .map(&mut Jitter);
         let rounded = Weights::from_model(&model).dequantised(&tables, false);
         model.set_qat(&tables);
-        assert_matches(&model, &rounded, 0, &device);
+        assert_matches(&model, &rounded, cell_rows(false) * 16, &device);
+    }
+
+    /// The embedding rows the export folds into the token rows instead of shipping: the cell
+    /// and padding rows, and the line table if there is one.
+    fn cell_rows(lines: bool) -> usize {
+        use crate::nn::nnue::{CONTENT_ROWS, LINE_ROWS, NO_FORCED};
+        CONTENT_ROWS - (NO_FORCED + 1) + if lines { LINE_ROWS } else { 0 }
     }
 
     fn count_parameters(model: &impl burn::module::Module) -> usize {

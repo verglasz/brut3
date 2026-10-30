@@ -465,8 +465,9 @@ pub fn spec_module(weights: &Weights, prefix: &str) -> String {
             ],
         ),
         (
-            "Rows of the content table: the contents, the no-forced row, cell rows \
-             (cellBase + cell * 3 + v, v = 0 empty, 1 mine, 2 theirs) and the padding row.",
+            "Training ids of a token: the contents, the no-forced row, cell rows \
+             (cellBase + cell * 3 + v, v = 0 empty, 1 mine, 2 theirs) and the padding row. \
+             The export folds the cells into the token rows; only contents and noForced ship.",
             vec![
                 ("noForced", NO_FORCED),
                 ("cellBase", CELL_BASE),

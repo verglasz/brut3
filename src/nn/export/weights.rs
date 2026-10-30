@@ -16,10 +16,7 @@ use crate::nn::AnyModel;
 use crate::nn::model::MOVES;
 use crate::nn::nnue::{
     BOARDS,
-    CELL_BASE,
-    CELL_PAD,
     CELLS,
-    CONTENT_ROWS,
     CONTENTS,
     DECIDED_BASE,
     Ends,
@@ -185,7 +182,9 @@ pub struct Weights {
     pub d_embed: usize,
     pub d_acc: usize,
     pub d_hidden: usize,
-    /// `[CONTENT_ROWS, d_embed]`: the content embedding, cell rows and padding.
+    /// `[CONTENTS + 1, d_embed]`: every board token by compact content id, then the token of
+    /// "no forced board": each content's row with its cell rows (and small-board line rows)
+    /// added (see [`crate::nn::nnue::token_table`]).
     pub content: Matrix,
     /// Nine `[d_acc, d_embed]` matrices: board `k`'s slice of the first layer, transposed.
     pub mix: Vec<Matrix>,
@@ -233,8 +232,8 @@ impl Shared {
         let mix = Dense::from_linear(e.mix);
         let mix_t = mix.weight.transposed(); // [9 * d_embed, d_acc] again
         Self {
-            // With small-board line features, their rows folded into the contents'.
-            content: Matrix::from_tensor(crate::nn::nnue::content_table(e)),
+            // Whole tokens: each content's row with its cell (and line) rows folded in.
+            content: Matrix::from_tensor(crate::nn::nnue::token_table(e)),
             mix: (0..BOARDS)
                 .map(|k| mix_t.rows(k * d_embed..(k + 1) * d_embed).transposed())
                 .collect(),
@@ -359,7 +358,7 @@ impl Weights {
             shape(&d.weight, rows, cols, name);
             assert_eq!(d.bias.len(), rows, "{name} bias");
         };
-        shape(&self.content, CONTENT_ROWS, e, "content");
+        shape(&self.content, CONTENTS + 1, e, "content");
         assert_eq!(self.mix.len(), BOARDS);
         for (k, m) in self.mix.iter().enumerate() {
             shape(m, a, e, &format!("mix[{k}]"));
@@ -483,8 +482,6 @@ impl Weights {
             part("content_open", &self.content, open.clone()),
             part("content_decided", &self.content, decided.clone()),
             part("content_no_forced", &self.content, NO_FORCED..NO_FORCED + 1),
-            part("content_cells", &self.content, CELL_BASE..CELL_PAD),
-            part("content_pad", &self.content, CELL_PAD..CONTENT_ROWS),
         ];
         for (k, w) in self.mix.iter().enumerate() {
             out.extend(pieces(&format!("mix{k}"), w));
