@@ -540,8 +540,10 @@ struct TrainArgs {
     #[arg(long, default_value_t = 0.3)]
     dirichlet_alpha: f32,
     /// Model to train: `linear`; `board-transformer`, `cell-transformer`, `board-v2` or
-    /// `cell-v2` followed by `[d_model] [layers] [heads]`; or `nnue` followed by
-    /// `[d_embed] [d_acc] [d_hidden] [layers]`.
+    /// `cell-v2` followed by `[d_model] [layers] [heads]`; `nnue` followed by
+    /// `[d_embed] [d_acc] [d_hidden] [layers] [reglu D_FF] [lines]`; or `nnue-v2` likewise
+    /// (at least 2 layers), optionally with `rezero` and `rank R` (the open contents' rows
+    /// at rank R), e.g. `nnue-v2 64 512 256 4 reglu 256 rank 32`.
     #[arg(long, default_value = "linear")]
     model: String,
     /// Continue training from this saved model (path stem of its `.bpk`/`.json`); its shape
