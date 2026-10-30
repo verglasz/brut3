@@ -605,9 +605,11 @@ struct TrainArgs {
     #[arg(long, default_value = "all")]
     augment: String,
     /// With `--augment average`: weight of the symmetric images' disagreement with their
-    /// average (KL, the "Symmetry KL" metric) in the loss. 0 trains the average alone, which
-    /// leaves single images free to disagree; larger makes any one image answer as the
-    /// average does.
+    /// average (KL to the average as a fixed target, weighted per head like its loss; the
+    /// "Symmetry KL" metric) in the loss. 1 gives exactly the gradients of `--augment all`
+    /// (the images' own losses); below 1 trains the average more and leaves single images
+    /// freer to disagree (an ensemble, evaluated eight times); above 1 makes any one image
+    /// answer as the average does.
     #[arg(long, default_value_t = 1.0)]
     consistency: f32,
     /// Weight of the outcome cross-entropy in the loss (0 with --search-value-weight is

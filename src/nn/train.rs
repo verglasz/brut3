@@ -709,10 +709,11 @@ pub fn forward_step<M: Model>(model: &M, batch: Batch<M>) -> (ClassificationOutp
     let n = batch.verdicts.dims()[0];
     // Win/draw/loss and legal move log-probabilities in the samples' frame, and the images'
     // disagreement with them.
-    let (wdl_logs, policy_logs, consistency) = match batch.image_moves {
+    let (wdl_logs, policy_logs, wdl_kl, policy_kl_images) = match batch.image_moves {
         None => (
             log_softmax(prediction.wdl.clone(), 1),
             prediction.policy_log_probabilities(batch.legal.clone()),
+            Tensor::zeros([1], &batch.wdl.device()),
             Tensor::zeros([1], &batch.wdl.device()),
         ),
         Some(image_moves) => {
@@ -736,20 +737,29 @@ pub fn forward_step<M: Model>(model: &M, batch: Batch<M>) -> (ClassificationOutp
             let wdl_logs = log_softmax(wdl_images.clone().mean_dim(0).reshape([n, 3]), 1);
             let policy_logs =
                 log_softmax(policy_images.clone().mean_dim(0).reshape([n, MOVES]), 1);
-            // KL(average ‖ image), over the images and samples, illegal moves left out.
+            // KL(average ‖ image), over the images and samples, illegal moves left out. Its
+            // gradient on image g's logits is (p_g - q) / 8, pulling each image toward the
+            // average; the average's cross-entropy gives (q - y) / 8, so at weight 1 the sum is
+            // (p_g - y) / 8: the images trained one by one, as `Augment::All` does. The mean KL
+            // is -log Z, Z the normaliser of the images' geometric mean, and that mean is the
+            // q minimising it, so no gradient flows through q anyway: detaching it only saves
+            // the backward pass the work.
             let legal_f = batch.legal.clone().float();
             let kl = |mean: Tensor<2>, images: Tensor<3>, mask: Option<Tensor<2>>| {
                 let [_, w] = mean.dims();
-                let p = mean.clone().exp().unsqueeze_dim::<3>(0).expand([k, n, w]);
-                let mut terms = p * (mean.unsqueeze_dim::<3>(0).expand([k, n, w]) - images);
+                let mean = mean.detach().unsqueeze_dim::<3>(0).expand([k, n, w]);
+                let mut terms = mean.clone().exp() * (mean - images);
                 if let Some(mask) = mask {
                     terms = terms * mask.unsqueeze_dim::<3>(0).expand([k, n, w]);
                 }
                 terms.sum_dim(2).mean()
             };
-            let consistency = kl(wdl_logs.clone(), wdl_images, None)
-                + kl(policy_logs.clone(), policy_images, Some(legal_f));
-            (wdl_logs, policy_logs, consistency)
+            (
+                wdl_logs.clone(),
+                policy_logs.clone(),
+                kl(wdl_logs, wdl_images, None),
+                kl(policy_logs, policy_images, Some(legal_f)),
+            )
         }
     };
     // Averaged over the positions that have a win/draw/loss target, so that the term keeps
@@ -767,10 +777,14 @@ pub fn forward_step<M: Model>(model: &M, batch: Batch<M>) -> (ClassificationOutp
         .mean()
         .detach();
     let policy_loss = -(policy_logs * batch.policy).sum_dim(1).mean();
+    // Each head's disagreement weighted as its cross-entropy is, so that at consistency 1 the
+    // loss is the images' own losses averaged (but for the value's squared error).
+    let consistency = wdl_kl.clone() + policy_kl_images.clone();
     let loss = wdl_loss.clone().mul_scalar(batch.outcome_weight)
         + value_loss.clone().mul_scalar(batch.search_value_weight)
         + policy_loss.clone()
-        + consistency.clone().mul_scalar(batch.consistency);
+        + (wdl_kl.mul_scalar(batch.outcome_weight) + policy_kl_images)
+            .mul_scalar(batch.consistency);
     let policy_kl = policy_loss.clone() - target_entropy;
     let parts = LossParts::new(
         Tensor::cat(
@@ -1656,7 +1670,7 @@ pub(crate) mod tests {
     /// The averaged step's policy loss is the one [`evaluate_symmetries`] computes on the host
     /// from the images' averaged log-probabilities, so the images' moves are mapped back
     /// right; the plain step's is [`evaluate`]'s; and a model that is not symmetric pays for
-    /// its images' disagreement.
+    /// its images' disagreement, at consistency 1 exactly what the images' own losses add.
     #[test]
     fn averaged_step_matches_the_host_average_over_symmetries() {
         let _lock = crate::nn::device_lock();
@@ -1671,13 +1685,16 @@ pub(crate) mod tests {
         let plain = loss_of(ModelBatcher::new(0.0, 0.0, false));
         let expected = evaluate(&model, &device, &samples).policy_loss;
         assert!((plain - expected).abs() < 1e-3, "{plain} vs {expected}");
+        let host = evaluate_symmetries(&model, &device, &samples);
         let averaged = loss_of(ModelBatcher::new(0.0, 0.0, false).averaging(0.0));
-        let expected = evaluate_symmetries(&model, &device, &samples)
-            .mean_logits
-            .policy_loss;
+        let expected = host.mean_logits.policy_loss;
         assert!((averaged - expected).abs() < 1e-3, "{averaged} vs {expected}");
+        // At consistency 1, the average's loss plus the images' disagreement is the images'
+        // own losses averaged.
         let consistent = loss_of(ModelBatcher::new(0.0, 0.0, false).averaging(1.0));
         assert!(consistent > averaged + 1e-4, "{consistent} vs {averaged}");
+        let each = host.each.policy_loss;
+        assert!((consistent - each).abs() < 1e-3, "{consistent} vs {each}");
     }
 
     #[test]
