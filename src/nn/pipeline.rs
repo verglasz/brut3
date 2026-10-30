@@ -518,12 +518,14 @@ pub fn run_loop(
             train_report.best_epoch
         ));
         log(format!(
-            "  validation loss terms: wdl {:.4} (baseline {:.4}), value {:.4}, policy {:.4} (baseline {:.4})",
+            "  validation loss terms: wdl {:.4} (baseline {:.4}), value {:.4}, policy {:.4} (baseline {:.4}; target entropy {:.4}, KL {:.4})",
             train_report.validation.wdl_loss,
             train_report.baseline.wdl_loss,
             train_report.validation.value_mse,
             train_report.validation.policy_loss,
-            train_report.baseline.policy_loss
+            train_report.baseline.policy_loss,
+            train_report.validation.policy_entropy,
+            train_report.validation.policy_loss - train_report.validation.policy_entropy
         ));
 
         let searcher = |path: &Path| AgentSpec::MctsNn {

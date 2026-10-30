@@ -229,7 +229,17 @@ impl Dataset {
             policy_accuracy: self.baseline_policy_accuracy(),
             wdl_loss: self.baseline_wdl_loss(),
             policy_loss: self.baseline_policy_loss(),
+            policy_entropy: self.policy_entropy(),
         }
+    }
+
+    /// Mean entropy of the target move distributions (see [`Evaluation::policy_entropy`]).
+    pub fn policy_entropy(&self) -> f32 {
+        if self.is_empty() {
+            return 0.0;
+        }
+        let total: f64 = self.samples.iter().map(|s| target_entropy(&s.policy)).sum();
+        (total / self.len() as f64) as f32
     }
 
     /// Cross-entropy of always predicting the mean win/draw/loss target, over the samples that
@@ -637,14 +647,20 @@ pub fn forward_step<M: Model>(model: &M, batch: Batch<M>) -> (ClassificationOutp
     let probabilities = softmax(prediction.wdl.clone(), 1);
     let expected = probabilities.clone().slice([0..n, 0..1]) - probabilities.slice([0..n, 2..3]);
     let value_loss = (expected - batch.values).powf_scalar(2.0).mean();
+    // The targets' own entropy, the least the policy's cross-entropy can be (0 ln 0 = 0).
+    let target_entropy = -(batch.policy.clone() * batch.policy.clone().clamp_min(1e-12).log())
+        .sum_dim(1)
+        .mean()
+        .detach();
     let policy_loss = -(prediction.policy_log_probabilities(batch.legal) * batch.policy)
         .sum_dim(1)
         .mean();
     let loss = wdl_loss.clone().mul_scalar(batch.outcome_weight)
         + value_loss.clone().mul_scalar(batch.search_value_weight)
         + policy_loss.clone();
+    let policy_kl = policy_loss.clone() - target_entropy;
     let parts = LossParts::new(
-        Tensor::cat(vec![wdl_loss, value_loss, policy_loss], 0).detach(),
+        Tensor::cat(vec![wdl_loss, value_loss, policy_loss, policy_kl], 0).detach(),
         n,
     );
     (
@@ -788,6 +804,9 @@ pub struct Evaluation {
     /// Cross-entropy of the policy over the legal moves against the target distribution: the
     /// loss's policy term.
     pub policy_loss: f32,
+    /// Mean entropy of the target move distributions: the least `policy_loss` can be, so that
+    /// `policy_loss - policy_entropy` is the KL divergence left to learn.
+    pub policy_entropy: f32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1084,7 +1103,7 @@ pub fn evaluate<M: Model>(model: &M, device: &Device, samples: &[Sample]) -> Eva
     let mut verdict_total = 0usize;
     let mut policy_hits = 0usize;
     let mut value_err = 0.0f64;
-    let (mut wdl_loss, mut policy_loss) = (0.0f64, 0.0f64);
+    let (mut wdl_loss, mut policy_loss, mut policy_entropy) = (0.0f64, 0.0f64, 0.0f64);
     let mut states = Vec::new();
     for chunk in samples.chunks(1024) {
         states.clear();
@@ -1102,6 +1121,7 @@ pub fn evaluate<M: Model>(model: &M, device: &Device, samples: &[Sample]) -> Eva
             }
             policy_hits += usize::from(best_moves[i] == s.best_move());
             value_err += (expected_value(p) - s.value_target()).powi(2) as f64;
+            policy_entropy += target_entropy(&s.policy);
             let moves = &prediction.policy[i];
             policy_loss -= s
                 .policy
@@ -1124,7 +1144,17 @@ pub fn evaluate<M: Model>(model: &M, device: &Device, samples: &[Sample]) -> Eva
         policy_accuracy: policy_hits as f32 / n as f32,
         wdl_loss: (wdl_loss / verdict_total.max(1) as f64) as f32,
         policy_loss: (policy_loss / n as f64) as f32,
+        policy_entropy: (policy_entropy / n as f64) as f32,
     }
+}
+
+/// `-sum p ln p` of a move distribution.
+fn target_entropy(policy: &[(Move, f32)]) -> f64 {
+    -policy
+        .iter()
+        .filter(|&&(_, p)| p > 0.0)
+        .map(|&(_, p)| f64::from(p) * f64::from(p).ln())
+        .sum::<f64>()
 }
 
 /// `-sum_k target_k ln p_k`, with the probabilities floored to keep it finite.

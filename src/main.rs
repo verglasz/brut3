@@ -1271,21 +1271,37 @@ fn evaluate_models(
         valid.len(),
         valid.games()
     );
+    let baseline = valid.baseline();
     println!(
-        "{:>8} {:>8} {:>8} {:>8} {:>8}  model",
-        "verdict", "policy", "wdl", "value", "policy"
+        "policy target entropy (the least the policy loss can be): {:.4}",
+        baseline.policy_entropy
     );
     println!(
-        "{:>8} {:>8} {:>8} {:>8} {:>8}",
-        "acc", "acc", "loss", "mse", "loss"
+        "{:>8} {:>8} {:>8} {:>8} {:>8} {:>8}  model",
+        "verdict", "policy", "wdl", "value", "policy", "policy"
     );
+    println!(
+        "{:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "acc", "acc", "loss", "mse", "loss", "KL"
+    );
+    // Without win/draw/loss targets (search values only) those columns have nothing to show.
+    let has_wdl = valid.samples.iter().any(|s| s.wdl.is_some());
     let row = |e: &brut3::nn::Evaluation, name: &str| {
+        let wdl = |x: f32| match has_wdl {
+            true => format!("{x:>8.4}"),
+            false => format!("{:>8}", "-"),
+        };
         println!(
-            "{:>8.4} {:>8.4} {:>8.4} {:>8.4} {:>8.4}  {name}",
-            e.verdict_accuracy, e.policy_accuracy, e.wdl_loss, e.value_mse, e.policy_loss
+            "{} {:>8.4} {} {:>8.4} {:>8.4} {:>8.4}  {name}",
+            wdl(e.verdict_accuracy),
+            e.policy_accuracy,
+            wdl(e.wdl_loss),
+            e.value_mse,
+            e.policy_loss,
+            e.policy_loss - e.policy_entropy
         );
     };
-    row(&valid.baseline(), "(baseline)");
+    row(&baseline, "(baseline)");
     for path in models {
         let model = AnyModel::load(path, &device)?;
         row(
@@ -1664,12 +1680,14 @@ fn train(args: &TrainArgs) -> Result<(), String> {
         report.baseline.policy_accuracy
     );
     println!(
-        "  validation loss terms: wdl {:.4} (baseline {:.4}), value {:.4}, policy {:.4} (baseline {:.4})",
+        "  validation loss terms: wdl {:.4} (baseline {:.4}), value {:.4}, policy {:.4} (baseline {:.4}; target entropy {:.4}, KL {:.4})",
         report.validation.wdl_loss,
         report.baseline.wdl_loss,
         report.validation.value_mse,
         report.validation.policy_loss,
-        report.baseline.policy_loss
+        report.baseline.policy_loss,
+        report.validation.policy_entropy,
+        report.validation.policy_loss - report.validation.policy_entropy
     );
 
     if let Some(dir) = args.out.parent().filter(|d| !d.as_os_str().is_empty()) {

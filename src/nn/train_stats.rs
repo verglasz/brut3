@@ -247,8 +247,9 @@ impl ItemLazy for StepOutput {
 }
 
 /// The terms of a step's loss before their weights: the win/draw/loss cross-entropy (over the
-/// positions with a target), the value's squared error and the policy's cross-entropy, on the
-/// device until a metric reads them.
+/// positions with a target), the value's squared error and the policy's cross-entropy, and the
+/// last less its targets' entropy (the KL divergence left to learn), on the device until a
+/// metric reads them.
 pub struct LossParts {
     values: Tensor<1>,
     /// Positions in the step.
@@ -258,9 +259,9 @@ pub struct LossParts {
 
 impl LossParts {
     /// The metrics' names, in the order of the values.
-    pub const NAMES: [&str; 3] = ["WDL loss", "Value loss", "Policy loss"];
+    pub const NAMES: [&str; 4] = ["WDL loss", "Value loss", "Policy loss", "Policy KL"];
 
-    /// `values` are `[3]`, in [`LossParts::NAMES`] order, over a step of `n` positions.
+    /// `values` are `[4]`, in [`LossParts::NAMES`] order, over a step of `n` positions.
     pub fn new(values: Tensor<1>, n: usize) -> Self {
         Self {
             values,
