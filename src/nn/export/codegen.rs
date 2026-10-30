@@ -31,6 +31,7 @@ use crate::nn::nnue::{
     GATES,
     IDS_PER_BOARD,
     LINE_BASE,
+    LINE_ROWS,
     LINE_STATES,
     NO_FORCED,
     OPEN_CONTENTS,
@@ -101,6 +102,11 @@ pub struct Names {
     pub gated: bool,
     /// The arrays shipped as int8 (see [`super::quant::quantise_int8`]), the others int16.
     pub int8: Int8Arrays,
+    /// A low-rank content table's rank: its tensors ship as they are (see
+    /// [`super::weights::ContentFactors`]) in place of the tokens.
+    pub rank: Option<usize>,
+    /// Whether that table has small-board line rows, shipped too.
+    pub content_lines: bool,
 }
 
 impl Names {
@@ -110,8 +116,10 @@ impl Names {
             "d_acc must be a multiple of {CHUNK} for the chunked export"
         );
         let trunk: Vec<Kind> = w.trunk.iter().map(Kind::of).collect();
+        let rank = w.content_factors.as_ref().map(|f| f.proj.rows);
         let mut widths = vec![("d_hidden", w.d_hidden)];
         widths.extend(w.d_ff().map(|d| ("the ReGLU width", d)));
+        widths.extend(rank.map(|r| ("the content rank", r)));
         for (what, n) in widths {
             assert!(
                 n <= CHUNK || n % NEST == 0,
@@ -125,6 +133,11 @@ impl Names {
             trunk,
             gated: w.gates.is_some(),
             int8,
+            rank,
+            content_lines: w
+                .content_factors
+                .as_ref()
+                .is_some_and(|f| f.lines.is_some()),
         }
     }
 
@@ -190,8 +203,12 @@ pub fn vec_spec(names: &Names, prefix: &str) -> VecSpec {
     spec.floats
         .extend([3, CELLS, CHUNK, names.e, names.a, names.h]);
     spec.floats.extend(names.ff_widths());
+    spec.floats.extend(names.rank);
     spec.nest.insert(names.a, (names.a / NEST, NEST));
-    for n in std::iter::once(names.h).chain(names.ff_widths()) {
+    for n in std::iter::once(names.h)
+        .chain(names.ff_widths())
+        .chain(names.rank)
+    {
         if n > CHUNK {
             spec.nest.insert(n, (n / NEST, NEST));
         }
@@ -264,19 +281,24 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
         false => &[],
     };
     bundle_imports(&mut s, base_imports);
-    bundle_body_begin(
-        &mut s,
-        "VecE, VecA, VecH, FoldPiece, OpenClosed (ocOpen, ocFull, ocWonByUs, ocWonByThem), \
+    let exports = format!(
+        "VecE, {}VecA, VecH, FoldPiece, OpenClosed (ocOpen, ocFull, ocWonByUs, ocWonByThem), \
          Net (every field starts with net), net, genZeroChunk, genZero3, \
          foldRow, lineFeature, accumulateRows, genZeroH, hiddenOf, HiddenColumns (constructor \
          HiddenColumns), hiddenColumns, sparseHiddenOf, genSigmoid or genOnes9, wdlOf, \
          PolicyGates (pgLocal, pgSend), policyGates, policyLogits",
+        if names.rank.is_some() { "VecR, " } else { "" }
     );
+    bundle_body_begin(&mut s, &exports);
     let _ = writeln!(
         s,
         "-- | A content-table row and a board token (width dEmbed)."
     );
     let _ = writeln!(s, "type VecE = {}", Names::vec(e));
+    if let Some(r) = names.rank {
+        let _ = writeln!(s, "-- | An open content's row of the low-rank content table (width {r}).");
+        let _ = writeln!(s, "type VecR = {}", Names::vec(r));
+    }
     let _ = writeln!(
         s,
         "-- | The accumulator and a folded first-layer row (width dAcc)."
@@ -317,9 +339,61 @@ data OpenClosed a = OpenClosed
         "-- | The weights, laid out for the evaluation: first layer, features, hidden, heads."
     );
     let _ = writeln!(s, "data Net = Net");
-    let mut fields: Vec<(String, String, String)> = vec![
-        ("netContent".into(), "(OpenClosed VecE)".into(), content_ids),
-        ("netNoForced".into(), "VecE".into(), no_forced_id),
+    let mut fields: Vec<(String, String, String)> = match names.rank {
+        None => vec![
+            ("netContent".into(), "(OpenClosed VecE)".into(), content_ids),
+            ("netNoForced".into(), "VecE".into(), no_forced_id),
+        ],
+        // The low-rank table's tensors as they are.
+        Some(r) => {
+            let mut f: Vec<(String, String, String)> = vec![
+                (
+                    "netContentLow".into(),
+                    "[VecR]".into(),
+                    format!(
+                        "the open contents' rows at rank {r}, ids 0..{}: content c's row is sum_j (low c)_j * proj_j",
+                        OPEN_CONTENTS - 1
+                    ),
+                ),
+                (
+                    "netContentProj".into(),
+                    "[VecE]".into(),
+                    format!("the {r} rows proj_j of the shared projection"),
+                ),
+                (
+                    "netContentDecided".into(),
+                    "[VecE]".into(),
+                    format!(
+                        "the decided contents' rows, ids {FULL} fullId, {WON_BY_ME} wonByMe, {WON_BY_THEM} wonByThem, without padding"
+                    ),
+                ),
+                (
+                    "netNoForced".into(),
+                    "VecE".into(),
+                    format!("the row of no forced board, id {NO_FORCED} (noForced), without padding"),
+                ),
+                (
+                    "netCells".into(),
+                    "[VecE]".into(),
+                    "the 27 cell rows, at 3 * cell + v (v: 0 empty, 1 mine, 2 theirs)".into(),
+                ),
+                (
+                    "netPad".into(),
+                    "VecE".into(),
+                    "the padding row: a decided board's and no forced board's token add it nine times in place of cell rows".into(),
+                ),
+            ];
+            if names.content_lines {
+                f.push((
+                    "netContentLines".into(),
+                    "[VecE]".into(),
+                    "the small-board line rows, at 27 * line + 9 a + 3 b + c for the line's cells' values (lines as in Spec); an open board's token adds its eight".into(),
+                ));
+            }
+            f
+        }
+    };
+    fields.extend([
         (
             "netMix".into(),
             "[[FoldPiece]]".into(),
@@ -340,7 +414,7 @@ data OpenClosed a = OpenClosed
             Names::rows(FORCED_FEATURES, a),
             "feature rows by forced board (9 = free)".into(),
         ),
-    ];
+    ]);
     for l in 0..LINES.len() {
         fields.push((
             format!("netLineFeature{l}"),
@@ -609,12 +683,30 @@ data OpenClosed a = OpenClosed
     let matrix = |m: usize, n: usize| format!("fromListRows{m}_{n} ({})", list(m, n));
     let vector = |n: usize| format!("fromList{n} ({})", floats_at(1, n, next()));
     let mut inits = Vec::new();
-    let open = list(OPEN_CONTENTS, e);
-    let decided = list(CONTENTS - OPEN_CONTENTS, e);
-    inits.push(format!(
-        "netContent = table \"content\" ({open}) ({decided})"
-    ));
-    inits.push(format!("netNoForced = {}", vector(e)));
+    match names.rank {
+        None => {
+            let open = list(OPEN_CONTENTS, e);
+            let decided = list(CONTENTS - OPEN_CONTENTS, e);
+            inits.push(format!(
+                "netContent = table \"content\" ({open}) ({decided})"
+            ));
+            inits.push(format!("netNoForced = {}", vector(e)));
+        }
+        Some(r) => {
+            inits.push(format!("netContentLow = {}", list(OPEN_CONTENTS, r)));
+            inits.push(format!("netContentProj = {}", list(r, e)));
+            inits.push(format!(
+                "netContentDecided = {}",
+                list(CONTENTS - OPEN_CONTENTS, e)
+            ));
+            inits.push(format!("netNoForced = {}", vector(e)));
+            inits.push(format!("netCells = {}", list(3 * CELLS, e)));
+            inits.push(format!("netPad = {}", vector(e)));
+            if names.content_lines {
+                inits.push(format!("netContentLines = {}", list(LINE_ROWS, e)));
+            }
+        }
+    }
     // The first layer's slices in pieces of CHUNK rows.
     let pieces = || {
         let p: Vec<String> = (0..k).map(|_| matrix(CHUNK, e)).collect();
@@ -968,6 +1060,68 @@ fn hs_strings(items: &[String]) -> String {
 }
 
 /// `SelfTest.hs`: evaluates the reference positions from their ids and compares.
+/// The self-test's `tokenOf`: a board token from its ids, read from the token table, or built
+/// from a low-rank content table's tensors.
+fn token_of(names: &Names) -> String {
+    let e = names.e;
+    let Some(r) = names.rank else {
+        return format!(
+            r#"-- | A board token from its {IDS_PER_BOARD} ids: the token row of its first (content) id, the
+-- cell ids being folded into it (slow: for tests, not for the search).
+tokenOf :: Net -> [Int] -> VecE
+tokenOf n ids = case ids of
+  (i : _)
+    | i < noForced -> byId (netContent n) i
+    | i == noForced -> netNoForced n
+  _ -> error ("tokenOf: " ++ show (take 1 ids) ++ " is not a content id")
+{{-# NOINLINE tokenOf #-}}
+"#
+        );
+    };
+    let lines = match names.content_lines {
+        true => {
+            let small: Vec<String> = LINES
+                .iter()
+                .map(|l| format!("[{}, {}, {}]", l[0], l[1], l[2]))
+                .collect();
+            format!(
+                r#"    lineRows i cellIds
+      | i < openContents =
+          let v k = (cellIds !! k - cellBase) `mod` 3
+           in [netContentLines n !! (27 * l + 9 * v a + 3 * v b + v c) | (l, [a, b, c]) <- zip [0 ..] smallLines]
+      | otherwise = []
+    smallLines = [{}] :: [[Int]]
+"#,
+                small.join(", ")
+            )
+        }
+        false => "    lineRows _ _ = []
+".to_string(),
+    };
+    format!(
+        r#"-- | A board token from its {IDS_PER_BOARD} ids, from the low-rank content table's tensors as
+-- the model computes it: the content's row (an open content's low row times the projection),
+-- its nine cell rows or the padding row nine times, and an open content's line rows (slow:
+-- for tests, not for the search).
+tokenOf :: Net -> [Int] -> VecE
+tokenOf n ids = case ids of
+  (i : cellIds) -> foldl add{e} (contentRow i) (map cellRow cellIds ++ lineRows i cellIds)
+  [] -> error "tokenOf: no ids"
+  where
+    contentRow i
+      | i < openContents =
+          foldl add{e} (replicate{e} 0) (zipWith scale{e} (toList{r} (netContentLow n !! i)) (netContentProj n))
+      | i < noForced = netContentDecided n !! (i - openContents)
+      | i == noForced = netNoForced n
+      | otherwise = error ("tokenOf: " ++ show i ++ " is not a content id")
+    cellRow c
+      | c == cellPad = netPad n
+      | otherwise = netCells n !! (c - cellBase)
+{lines}{{-# NOINLINE tokenOf #-}}
+"#
+    )
+}
+
 pub fn selftest_module(names: &Names, prefix: &str) -> String {
     let (e, a, h) = (names.e, names.a, names.h);
     let mut s = String::new();
@@ -992,16 +1146,7 @@ byId t i
   | i == wonByThem = ocWonByThem t
   | otherwise = error ("byId: " ++ show i ++ " is not a content id")
 
--- | A board token from its {IDS_PER_BOARD} ids: the token row of its first (content) id, the
--- cell ids being folded into it (slow: for tests, not for the search).
-tokenOf :: Net -> [Int] -> VecE
-tokenOf n ids = case ids of
-  (i : _)
-    | i < noForced -> byId (netContent n) i
-    | i == noForced -> netNoForced n
-  _ -> error ("tokenOf: " ++ show (take 1 ids) ++ " is not a content id")
-{{-# NOINLINE tokenOf #-}}
-
+{token_of}
 -- | The eleven global feature ids of a position's ids as the local indices the
 -- feature tables take: forced board, the eight line codes, decided boards, open marks.
 localFeatures :: [Int] -> (Int, [Int], Int, Int)
@@ -1106,7 +1251,7 @@ bench iters = do
         putStrLn ("bench: " ++ show (fromIntegral (t1 - t0) / 1000 / fromIntegral iters :: Double) ++ " us per evaluation, " ++ label ++ " hidden layers (checksum " ++ show total ++ ")")
   -- Decode everything first: the strict fields of Net force a list-valued table only to its
   -- first element, so without this most of the decoding would land inside the timed loop.
-  let walkLists = sum (map (index{e} 0) (ocOpen (netContent n))) + sum (ocOpen (netSend n)) + sum (map (index9 0) (ocOpen (netLocal n))) + sum [index{e} 0 (sel{CHUNK}_{e} 0 p) | ps <- netForced n : netMix n, p <- ps]
+  let walkLists = {walk_content} + sum (ocOpen (netSend n)) + sum (map (index9 0) (ocOpen (netLocal n))) + sum [index{e} 0 (sel{CHUNK}_{e} 0 p) | ps <- netForced n : netMix n, p <- ps]
       walkRefs = sum [index3 0 wdl + index{a} 0 acc + index{h} 0 hid | r <- refs, let (acc, hid, wdl) = evalIds n (refIds r)]
       -- The columns are built once, outside the timed loop, as the engine keeps them.
       walkCols = sum [index{h} 0 (sparseHiddenOf n cols acc) | r <- refs, let (acc, _, _) = evalIds n (refIds r)]
@@ -1114,6 +1259,11 @@ bench iters = do
   time "dense" (hiddenOf n) warm
   time "sparse" (sparseHiddenOf n cols) warm
 "#,
+        token_of = token_of(names),
+        walk_content = match names.rank {
+            None => format!("sum (map (index{e} 0) (ocOpen (netContent n)))"),
+            Some(r) => format!("sum (map (index{r} 0) (netContentLow n))"),
+        },
         last_content = CONTENTS - 1
     );
     s.push_str(&text);

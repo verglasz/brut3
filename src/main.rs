@@ -59,11 +59,15 @@ enum Command {
         /// Backend to evaluate on (default: fastest compiled in).
         #[arg(long)]
         backend: Option<String>,
-        /// Evaluate the models with the tables whose export arrays start with one of these
-        /// prefixes on the export's int8 grid (as `export --int8-only` with
-        /// `--nearest-rounding` ships them), to compare networks as they would be exported.
+        /// Evaluate the models as `export --int8-only` ships them: the arrays starting with
+        /// one of these prefixes (tables and first layer only) quantised to int8 and back
+        /// exactly as the export writes them, the others to int16.
         #[arg(long, value_delimiter = ',')]
         int8_only: Vec<String>,
+        /// With --int8-only, round the content arrays to nearest instead of GPTQ's way, as
+        /// `export --nearest-rounding` does.
+        #[arg(long)]
+        nearest_rounding: bool,
         /// Also evaluate each NNUE with its open content rows replaced by their best rank-r
         /// approximation, for each of these ranks (e.g. `16,32,48`): how much of the table a
         /// low-rank one could keep without retraining.
@@ -694,6 +698,7 @@ fn main() -> ExitCode {
             seed,
             backend,
             int8_only,
+            nearest_rounding,
             content_rank,
             symmetries,
             models,
@@ -703,6 +708,7 @@ fn main() -> ExitCode {
             seed,
             backend.as_deref(),
             &brut3::nn::export::Int8Arrays(int8_only),
+            !nearest_rounding,
             &content_rank,
             symmetries,
             &models,
@@ -1414,6 +1420,7 @@ fn evaluate_models(
     seed: u64,
     backend: Option<&str>,
     int8: &brut3::nn::export::Int8Arrays,
+    gptq: bool,
     content_ranks: &[usize],
     symmetries: bool,
     models: &[std::path::PathBuf],
@@ -1463,11 +1470,20 @@ fn evaluate_models(
     };
     row(&baseline, "(baseline)");
     if !int8.0.is_empty() {
-        println!("(tables {} on the int8 grid)", int8.0.join(","));
+        println!(
+            "(arrays {} int8{}, the others int16, as exported)",
+            int8.0.join(","),
+            if gptq { ", content by GPTQ" } else { "" }
+        );
     }
+    // The model as the export ships it, when int8 arrays are asked for.
+    let exported = |model: &mut AnyModel| match int8.0.is_empty() {
+        true => Ok(()),
+        false => model.as_exported(int8, gptq),
+    };
     for path in models {
         let mut model = AnyModel::load(path, &device)?;
-        model.set_qat(int8);
+        exported(&mut model)?;
         row(
             &model.evaluate(&device, &valid.samples),
             &path.display().to_string(),
@@ -1486,8 +1502,8 @@ fn evaluate_models(
         }
         for &rank in content_ranks {
             let mut truncated = AnyModel::load(path, &device)?;
-            truncated.set_qat(int8);
             truncated.truncate_content(rank)?;
+            exported(&mut truncated)?;
             row(
                 &truncated.evaluate(&device, &valid.samples),
                 &format!("{} (content rank {rank})", path.display()),

@@ -256,6 +256,13 @@ pub fn nnue_ids(state: &BitState, out: &mut [i32; IDS]) {
 /// boards read it: a decided board's row, and "no forced board"'s, are their own already.
 pub const LINE_ROWS: usize = LINES.len() * 27;
 
+/// The raw code of every open content, by compact id.
+pub fn open_content_codes() -> Vec<usize> {
+    (0..RAW_CONTENTS)
+        .filter(|&code| compact_id(code).is_some_and(|c| c < OPEN_CONTENTS))
+        .collect()
+}
+
 /// For every open content, its eight line rows.
 fn content_lines() -> &'static [i32] {
     static TABLE: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
@@ -280,8 +287,12 @@ fn content_lines() -> &'static [i32] {
 /// so they fold into its row: the inputs, the folded tables and the export (which ships this
 /// table) are the same with or without them.
 pub fn content_table(e: &Ends) -> Tensor<2> {
-    let table = content_rows(e);
-    let Some(lines) = e.lines else {
+    with_lines(content_rows(e), e.lines.map(|l| l.weight.val()))
+}
+
+/// `table` (`[CONTENT_ROWS, d_embed]`) with each open content's eight `lines` rows added.
+fn with_lines(table: Tensor<2>, lines: Option<Tensor<2>>) -> Tensor<2> {
+    let Some(lines) = lines else {
         return table;
     };
     let device = table.device();
@@ -290,9 +301,7 @@ pub fn content_table(e: &Ends) -> Tensor<2> {
         TensorData::new(content_lines().to_vec(), [OPEN_CONTENTS, LINES.len()]),
         &device,
     );
-    let sums = rows(lines.weight.val(), ids)
-        .sum_dim(1)
-        .reshape([OPEN_CONTENTS, d]);
+    let sums = rows(lines, ids).sum_dim(1).reshape([OPEN_CONTENTS, d]);
     let rest = Tensor::zeros([rows_n - OPEN_CONTENTS, d], &device);
     table + Tensor::cat(vec![sums, rest], 0)
 }
@@ -376,7 +385,51 @@ pub fn load_tolerating<M: Module + Clone>(
 /// padding rows for a decided board and "no forced board". A token is a function of its
 /// content, so the model reads the tokens from this table, and the export ships it.
 pub fn token_table(e: &Ends) -> Tensor<2> {
-    let table = content_table(e);
+    tokens_of(content_table(e))
+}
+
+/// The token table from the content tensors as the export cuts them into arrays, each array
+/// passed through `piece` (the int8 grid's fake quantisation): the tokens' open, decided and
+/// no-forced rows; or a low-rank table's `low` and `proj`, the embedding's decided,
+/// no-forced, cell and padding rows, and the line rows.
+pub fn shipped_token_table(e: &Ends, piece: impl Fn(Tensor<2>) -> Tensor<2>) -> Tensor<2> {
+    let Some(low) = e.content_low else {
+        let tokens = token_table(e);
+        let [_, d] = tokens.dims();
+        let cut = |r: std::ops::Range<usize>| piece(tokens.clone().slice([r, 0..d]));
+        return Tensor::cat(
+            vec![
+                cut(0..OPEN_CONTENTS),
+                cut(OPEN_CONTENTS..CONTENTS),
+                cut(NO_FORCED..NO_FORCED + 1),
+            ],
+            0,
+        );
+    };
+    let rest = e.content.weight.val();
+    let [_, d] = rest.dims();
+    let cut = |r: std::ops::Range<usize>| {
+        piece(
+            rest.clone()
+                .slice([r.start - OPEN_CONTENTS..r.end - OPEN_CONTENTS, 0..d]),
+        )
+    };
+    let table = Tensor::cat(
+        vec![
+            piece(low.low.weight.val()).matmul(piece(low.proj.weight.val())),
+            cut(OPEN_CONTENTS..CONTENTS),
+            cut(NO_FORCED..NO_FORCED + 1),
+            cut(CELL_BASE..CELL_PAD),
+            cut(CELL_PAD..CELL_PAD + 1),
+        ],
+        0,
+    );
+    tokens_of(with_lines(table, e.lines.map(|l| piece(l.weight.val()))))
+}
+
+/// Every token from a `[CONTENT_ROWS, d_embed]` table of content (with their line rows), cell
+/// and padding rows: see [`token_table`].
+fn tokens_of(table: Tensor<2>) -> Tensor<2> {
     let device = table.device();
     let [_, d] = table.dims();
     let ids = Tensor::<2, Int>::from_data(
@@ -595,6 +648,19 @@ pub fn content_rows(e: &Ends) -> Tensor<2> {
     }
 }
 
+/// An NNUE model's tables and first layer, mutably borrowed: what the export ships as int8,
+/// written back by [`crate::nn::export::Weights::write_tables`].
+pub struct TablesMut<'a> {
+    pub content: &'a mut Embedding,
+    pub content_low: Option<&'a mut LowRankContent>,
+    pub mix: &'a mut Linear,
+    pub forced_mix: &'a mut Linear,
+    pub features: &'a mut Embedding,
+    pub local_policy: &'a mut Embedding,
+    pub send_policy: &'a mut Embedding,
+    pub lines: Option<&'a mut Embedding>,
+}
+
 /// An NNUE model's layers around its hidden ones, borrowed (see [`EndLayers`]).
 pub struct Ends<'a> {
     /// The content embedding: every content row, or with `content_low` the rows from
@@ -627,6 +693,9 @@ pub const GATES: usize = 1 + 2 * BOARDS;
 /// own, which is all the prediction, the folding and [`FoldedNnue`] need.
 pub trait NnueNet: Module {
     fn ends(&self) -> Ends<'_>;
+
+    /// The tables and the first layer, to write into (see [`TablesMut`]).
+    fn tables_mut(&mut self) -> TablesMut<'_>;
 
     /// The tables that train fake-quantised (see [`Qat`]).
     fn qat(&self) -> &Qat;
@@ -755,6 +824,19 @@ impl NnueNet for Nnue {
         &self.qat
     }
 
+    fn tables_mut(&mut self) -> TablesMut<'_> {
+        TablesMut {
+            content: &mut self.content,
+            content_low: None,
+            mix: &mut self.mix,
+            forced_mix: &mut self.forced_mix,
+            features: &mut self.features,
+            local_policy: &mut self.local_policy,
+            send_policy: &mut self.send_policy,
+            lines: self.lines.as_mut(),
+        }
+    }
+
     fn trunk(&self, acc: Tensor<2>) -> Tensor<2> {
         let mut h = relu(self.hidden[0].forward(acc));
         for layer in &self.hidden[1..] {
@@ -799,7 +881,7 @@ fn accumulate(e: &Ends, qat: &Qat, ids: NnueInput) -> Tensor<2> {
             .reshape([n, TOKENS, IDS_PER_BOARD])
             .slice([0..n, 0..TOKENS, 0..1])
             .reshape([n, TOKENS]);
-        rows(qat.rows(true, token_table(e)), contents)
+        rows(shipped_token_table(e, |t| fake_quantise(t, 1)), contents)
     } else {
         // The same sums, over only the rows this batch reads: content row plus cell rows,
         // plus the line rows.
@@ -918,7 +1000,8 @@ impl Qat {
     /// The tables whose export arrays `int8` covers.
     pub fn of(int8: &crate::nn::export::Int8Arrays) -> Self {
         Self {
-            content: int8.covers("content_open"),
+            // The tokens, or a low-rank table's tensors (see [`shipped_token_table`]).
+            content: int8.covers("content_open") || int8.covers("content_low"),
             mix: int8.covers("mix0_0"),
             mix_bias: int8.covers("mix_bias"),
             forced: int8.covers("forced_0"),

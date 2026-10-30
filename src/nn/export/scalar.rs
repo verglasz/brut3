@@ -314,13 +314,13 @@ mod tests {
             v2.with_content_rank(Some(8)),
         ] {
             let model = config.init(&device).map(&mut Jitter);
-            // Two ReZero scalars: the first layer's and the third's.
-            let mut folded = (2 + cell_rows(false) * config.d_embed) as isize;
-            // A low-rank content table ships as its full product.
-            if let Some(rank) = config.content_rank {
-                let (open, d) = (crate::nn::nnue::OPEN_CONTENTS as isize, config.d_embed as isize);
-                folded += open * rank as isize + rank as isize * d - open * d;
-            }
+            // Two ReZero scalars: the first layer's and the third's; and the cell and padding
+            // rows folded into the tokens, unless a low-rank content table ships its tensors
+            // as they are.
+            let folded = match config.content_rank {
+                None => 2 + cell_rows(false) * config.d_embed,
+                Some(_) => 2,
+            } as isize;
             assert_matches(&model, &Weights::from_v2(&model), folded, &device);
         }
     }
@@ -351,6 +351,71 @@ mod tests {
         let rounded = Weights::from_model(&model).dequantised(&tables, false);
         model.set_qat(&tables);
         assert_matches(&model, &rounded, (cell_rows(false) * 16) as isize, &device);
+        // A low-rank content table trains with its own tensors on the grid, as they ship.
+        let mut model = NnueV2Config::new()
+            .with_d_embed(16)
+            .with_d_acc(64)
+            .with_d_hidden(16)
+            .with_layers(2)
+            .with_content_rank(Some(8))
+            .with_lines(Some(true))
+            .init(&device)
+            .map(&mut Jitter);
+        let rounded = Weights::from_v2(&model).dequantised(&tables, false);
+        model.set_qat(&tables);
+        assert_matches(&model, &rounded, 0, &device);
+    }
+
+    /// A model with the export's quantised arrays written back computes what the export
+    /// ships (the scalar evaluator on those arrays), for every kind of content table: the
+    /// round trip `evaluate --int8-only` evaluates.
+    #[test]
+    fn written_back_tables_evaluate_as_exported() {
+        use burn::module::Module;
+
+        use crate::nn::export::Int8Arrays;
+        use crate::nn::nnue::NnueNet;
+
+        let _device = crate::nn::device_lock();
+        let device = BackendKind::preferred().device();
+        let tables = Int8Arrays(
+            ["content", "local", "send", "mix", "features", "forced"]
+                .map(String::from)
+                .to_vec(),
+        );
+        let nnue = NnueConfig::new()
+            .with_d_embed(16)
+            .with_d_acc(64)
+            .with_d_hidden(16)
+            .with_layers(2);
+        for config in [nnue.clone(), nnue.with_lines(Some(true))] {
+            let model = config.init(&device).map(&mut Jitter);
+            let shipped = Weights::from_model(&model).dequantised(&tables, true);
+            let mut written = model.clone();
+            shipped.write_tables(written.tables_mut());
+            let folded = cell_rows(config.lines == Some(true)) * config.d_embed;
+            assert_matches(&written, &shipped, folded as isize, &device);
+        }
+        let v2 = NnueV2Config::new()
+            .with_d_embed(16)
+            .with_d_acc(64)
+            .with_d_hidden(16)
+            .with_layers(3);
+        for config in [
+            v2.clone(),
+            v2.clone().with_content_rank(Some(8)),
+            v2.with_content_rank(Some(8)).with_lines(Some(true)),
+        ] {
+            let model = config.init(&device).map(&mut Jitter);
+            let shipped = Weights::from_v2(&model).dequantised(&tables, true);
+            let mut written = model.clone();
+            shipped.write_tables(written.tables_mut());
+            let folded = match config.content_rank {
+                None => cell_rows(false) * config.d_embed,
+                Some(_) => 0,
+            };
+            assert_matches(&written, &shipped, folded as isize, &device);
+        }
     }
 
     /// The embedding rows the export folds into the token rows instead of shipping: the cell

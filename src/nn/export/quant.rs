@@ -201,13 +201,17 @@ impl Weights {
             rest = tail;
         }
         assert!(rest.is_empty(), "every array mapped");
+        // A low-rank content table's tokens follow its mapped tensors.
+        if let Some(f) = &out.content_factors {
+            out.content = f.tokens();
+        }
         out
     }
 
     /// The weights after the round trip of the export's quantisation (int8 for the arrays
     /// `int8` covers, int16 for the others): what the Haskell evaluator computes with.
     pub fn dequantised(&self, int8: &Int8Arrays, gptq: bool) -> Self {
-        let factor = self.content_factor();
+        let factor = self.content_factors();
         self.map_arrays(|a| match int8.covers(&a.name) {
             true => {
                 let rounding = gptq.then(|| self.rounding(&a.name, &factor)).flatten();
@@ -224,7 +228,10 @@ impl Weights {
     /// measured no better: the largest output deviations over 256 reference positions went
     /// from 0.012 / 0.015 / 0.016 for win/draw/loss, value and policy to 0.016 / 0.016 /
     /// 0.016, against 0.021 / 0.022 / 0.016 rounding to nearest.)
-    fn content_factor(&self) -> Vec<f64> {
+    ///
+    /// A low-rank table's `content_low` rows reach the tokens through `proj` (`P`), so theirs
+    /// is from `P H Pᵀ`; the second factor, for models that have one.
+    fn content_factors(&self) -> (Vec<f64>, Option<Vec<f64>>) {
         let n = self.d_embed;
         let mut h = vec![0.0f64; n * n];
         for w in self.mix.iter().chain(std::iter::once(&self.forced)) {
@@ -238,17 +245,39 @@ impl Weights {
                 }
             }
         }
-        gptq_factor(&h, n)
+        let low = self.content_factors.as_ref().map(|f| {
+            let (r, p) = (f.proj.rows, &f.proj);
+            let mut low = vec![0.0f64; r * r];
+            for a in 0..r {
+                for b in 0..r {
+                    let mut sum = 0.0;
+                    for i in 0..n {
+                        let hp: f64 = (0..n).map(|j| h[i * n + j] * f64::from(p.row(b)[j])).sum();
+                        sum += f64::from(p.row(a)[i]) * hp;
+                    }
+                    low[a * r + b] = sum;
+                }
+            }
+            gptq_factor(&low, r)
+        });
+        (gptq_factor(&h, n), low)
     }
 
     /// How array `name` is rounded to int8: GPTQ's way for the content arrays.
-    fn rounding<'f>(&self, name: &str, content: &'f [f64]) -> Option<&'f [f64]> {
-        name.starts_with("content").then_some(content)
+    fn rounding<'f>(
+        &self,
+        name: &str,
+        (content, low): &'f (Vec<f64>, Option<Vec<f64>>),
+    ) -> Option<&'f [f64]> {
+        match name {
+            "content_low" => low.as_deref(),
+            _ => name.starts_with("content").then_some(content.as_slice()),
+        }
     }
 
     /// Every array quantised, in [`Weights::arrays`] order.
     pub fn quantised(&self, int8: &Int8Arrays, gptq: bool) -> Vec<QuantisedArray> {
-        let factor = self.content_factor();
+        let factor = self.content_factors();
         self.arrays()
             .into_iter()
             .map(|a| {

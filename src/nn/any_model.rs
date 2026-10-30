@@ -389,6 +389,39 @@ impl AnyModel {
         with_model!(self, |m| super::train::evaluate(m, device, samples))
     }
 
+    /// Puts the model's tables and first layer through the export's quantisation, as the
+    /// export writes them: int8 for the arrays `int8` covers (GPTQ's rounding for the content
+    /// arrays with `gptq`), int16 for the others. The model then evaluates as exported, up to
+    /// the int16 rounding of the trunk and heads, which keep their values. Errors for kinds
+    /// without an export, and when `int8` covers a trunk or head array.
+    pub fn as_exported(
+        &mut self,
+        int8: &super::export::Int8Arrays,
+        gptq: bool,
+    ) -> Result<(), String> {
+        use super::export::Weights;
+        use super::nnue::NnueNet;
+
+        let weights = Weights::from_any(self)?;
+        if let Some(a) = weights
+            .arrays()
+            .iter()
+            .find(|a| int8.covers(&a.name) && !Weights::is_table(&a.name))
+        {
+            return Err(format!(
+                "int8 evaluation covers tables and the first layer, not array {}",
+                a.name
+            ));
+        }
+        let shipped = weights.dequantised(int8, gptq);
+        match self {
+            AnyModel::Nnue(m) => shipped.write_tables(m.tables_mut()),
+            AnyModel::NnueV2(m) => shipped.write_tables(m.tables_mut()),
+            _ => unreachable!("Weights::from_any takes NNUEs only"),
+        }
+        Ok(())
+    }
+
     /// How far the model is from respecting the board's symmetries over `samples` (see
     /// [`super::train::evaluate_symmetries`]).
     pub fn evaluate_symmetries(

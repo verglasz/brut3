@@ -40,9 +40,10 @@ use super::nnue::{
     LowRankContent,
     NnueInput,
     NnueNet,
+    OPEN_CONTENTS,
     Qat,
     ReGlu,
-    OPEN_CONTENTS,
+    TablesMut,
     fold,
     load_tolerating,
     nnue_input,
@@ -258,6 +259,19 @@ impl NnueNet for NnueV2 {
 
     fn qat(&self) -> &Qat {
         &self.qat
+    }
+
+    fn tables_mut(&mut self) -> TablesMut<'_> {
+        TablesMut {
+            content: &mut self.content,
+            content_low: self.content_low.as_mut(),
+            mix: &mut self.mix,
+            forced_mix: &mut self.forced_mix,
+            features: &mut self.features,
+            local_policy: &mut self.local_policy,
+            send_policy: &mut self.send_policy,
+            lines: self.lines.as_mut(),
+        }
     }
 
     fn trunk(&self, acc: Tensor<2>) -> Tensor<2> {

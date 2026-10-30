@@ -16,7 +16,10 @@ use crate::nn::AnyModel;
 use crate::nn::model::MOVES;
 use crate::nn::nnue::{
     BOARDS,
+    CELL_BASE,
+    CELL_PAD,
     CELLS,
+    CONTENT_ROWS,
     CONTENTS,
     DECIDED_BASE,
     Ends,
@@ -25,6 +28,7 @@ use crate::nn::nnue::{
     GATES,
     IDS_PER_BOARD,
     LINE_BASE,
+    LINE_ROWS,
     LINE_STATES,
     NO_FORCED,
     Nnue,
@@ -32,6 +36,8 @@ use crate::nn::nnue::{
     OPEN_CONTENTS,
     OPEN_MARKS_BASE,
     ReGlu,
+    TablesMut,
+    open_content_codes,
 };
 use crate::nn::nnue_v2::NnueV2;
 
@@ -184,8 +190,11 @@ pub struct Weights {
     pub d_hidden: usize,
     /// `[CONTENTS + 1, d_embed]`: every board token by compact content id, then the token of
     /// "no forced board": each content's row with its cell rows (and small-board line rows)
-    /// added (see [`crate::nn::nnue::token_table`]).
+    /// added (see [`crate::nn::nnue::token_table`]). With `content_factors` these are
+    /// computed from them and not shipped.
     pub content: Matrix,
+    /// A low-rank content table's tensors, shipped as they are in place of the tokens.
+    pub content_factors: Option<ContentFactors>,
     /// Nine `[d_acc, d_embed]` matrices: board `k`'s slice of the first layer, transposed.
     pub mix: Vec<Matrix>,
     /// `[d_acc]`: the first layer's bias.
@@ -212,9 +221,68 @@ pub struct Weights {
     pub gates: Option<Dense>,
 }
 
+/// A low-rank content table as the model holds it (see
+/// [`crate::nn::nnue::LowRankContent`]): what the export ships for it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContentFactors {
+    /// `[OPEN_CONTENTS, rank]`: the open contents' rows at low rank.
+    pub low: Matrix,
+    /// `[rank, d_embed]`: their shared projection; an open content's row is `low · proj`.
+    pub proj: Matrix,
+    /// `[CONTENT_ROWS - OPEN_CONTENTS, d_embed]`: the embedding's other rows, in its order:
+    /// the three decided contents, no forced board, the 27 cell rows, the padding row.
+    pub rest: Matrix,
+    /// `[LINE_ROWS, d_embed]`: the small-board line rows, for models that have them.
+    pub lines: Option<Matrix>,
+}
+
+impl ContentFactors {
+    /// Every token, as [`crate::nn::nnue::token_table`] makes them: an open content's row plus
+    /// its nine cell rows and its eight line rows; a decided content's, and no forced
+    /// board's, row plus the padding row nine times.
+    pub fn tokens(&self) -> Matrix {
+        let d = self.proj.cols;
+        let rest = |id: usize| self.rest.row(id - OPEN_CONTENTS);
+        let mut data = Vec::with_capacity((CONTENTS + 1) * d);
+        for code in open_content_codes() {
+            let mut token = vec![0f32; d];
+            for (j, &x) in self.low.row(data.len() / d).iter().enumerate() {
+                for (t, &p) in token.iter_mut().zip(self.proj.row(j)) {
+                    *t += x * p;
+                }
+            }
+            let cell = |i: usize| code / 3usize.pow(i as u32) % 3;
+            for i in 0..CELLS {
+                for (t, &c) in token.iter_mut().zip(rest(CELL_BASE + 3 * i + cell(i))) {
+                    *t += c;
+                }
+            }
+            if let Some(lines) = &self.lines {
+                for (l, line) in LINES.iter().enumerate() {
+                    let state = 9 * cell(line[0]) + 3 * cell(line[1]) + cell(line[2]);
+                    for (t, &x) in token.iter_mut().zip(lines.row(l * 27 + state)) {
+                        *t += x;
+                    }
+                }
+            }
+            data.extend(token);
+        }
+        for id in OPEN_CONTENTS..=NO_FORCED {
+            data.extend(
+                rest(id)
+                    .iter()
+                    .zip(rest(CELL_PAD))
+                    .map(|(&x, &pad)| x + CELLS as f32 * pad),
+            );
+        }
+        Matrix::new(CONTENTS + 1, d, data)
+    }
+}
+
 /// The layers every NNUE model has around its trunk, from the model's [`Ends`].
 struct Shared {
     content: Matrix,
+    content_factors: Option<ContentFactors>,
     mix: Vec<Matrix>,
     mix_bias: Vec<f32>,
     forced: Matrix,
@@ -231,9 +299,20 @@ impl Shared {
         let [_, d_embed] = e.content.weight.dims();
         let mix = Dense::from_linear(e.mix);
         let mix_t = mix.weight.transposed(); // [9 * d_embed, d_acc] again
+        let content_factors = e.content_low.map(|l| ContentFactors {
+            low: Matrix::from_tensor(l.low.weight.val()),
+            proj: Matrix::from_tensor(l.proj.weight.val()),
+            rest: Matrix::from_tensor(e.content.weight.val()),
+            lines: e.lines.map(|lines| Matrix::from_tensor(lines.weight.val())),
+        });
         Self {
-            // Whole tokens: each content's row with its cell (and line) rows folded in.
-            content: Matrix::from_tensor(crate::nn::nnue::token_table(e)),
+            // Whole tokens: each content's row with its cell (and line) rows folded in;
+            // computed on the host from a low-rank table's factors, as after quantising them.
+            content: match &content_factors {
+                Some(f) => f.tokens(),
+                None => Matrix::from_tensor(crate::nn::nnue::token_table(e)),
+            },
+            content_factors,
             mix: (0..BOARDS)
                 .map(|k| mix_t.rows(k * d_embed..(k + 1) * d_embed).transposed())
                 .collect(),
@@ -263,6 +342,7 @@ impl Weights {
             d_acc,
             d_hidden,
             content: s.content,
+            content_factors: s.content_factors,
             mix: s.mix,
             mix_bias: s.mix_bias,
             forced: s.forced,
@@ -336,6 +416,9 @@ impl Weights {
         if c.lines == Some(true) {
             spec += " lines";
         }
+        if let Some(rank) = c.content_rank {
+            spec += &format!(" rank {rank}");
+        }
         Self::assemble(spec, [c.d_embed, c.d_acc, c.d_hidden], &model.ends(), trunk)
     }
 
@@ -359,6 +442,15 @@ impl Weights {
             assert_eq!(d.bias.len(), rows, "{name} bias");
         };
         shape(&self.content, CONTENTS + 1, e, "content");
+        if let Some(f) = &self.content_factors {
+            let rank = f.proj.rows;
+            shape(&f.low, OPEN_CONTENTS, rank, "content_low");
+            shape(&f.proj, rank, e, "content_proj");
+            shape(&f.rest, CONTENT_ROWS - OPEN_CONTENTS, e, "content rest");
+            if let Some(lines) = &f.lines {
+                shape(lines, LINE_ROWS, e, "content_lines");
+            }
+        }
         assert_eq!(self.mix.len(), BOARDS);
         for (k, m) in self.mix.iter().enumerate() {
             shape(m, a, e, &format!("mix[{k}]"));
@@ -437,8 +529,10 @@ impl Weights {
     /// Every array in a fixed order: the matrices one row per output, the biases as one row.
     /// The tables are cut into the pieces the Haskell record holds, so that its decoder never
     /// splits a long list: the per-content tables into `_open` (the open contents) and
-    /// `_decided` (the three decided kinds), the content table also into its no-forced row,
-    /// cell rows and pad; the first layer's slices into pieces of [`CHUNK`] rows
+    /// `_decided` (the three decided kinds), the token table also into its no-forced row; a
+    /// low-rank content table ships its tensors instead (see [`ContentFactors`]):
+    /// `content_low`, `content_proj`, the embedding's decided, no-forced, cell and padding
+    /// rows, and `content_lines` if there are line rows; the first layer's slices into pieces of [`CHUNK`] rows
     /// (`mix{k}_{p}`, `forced_{p}`); the feature rows into their four tables, one per line.
     /// A hidden layer's arrays are `hidden{i}` and `hidden{i}_bias`, or for a gated one
     /// `hidden{i}_gate` (and bias), `hidden{i}_up` (and bias) and `hidden{i}_down`; the head
@@ -478,11 +572,29 @@ impl Weights {
                 .collect()
         }
         let (open, decided) = (0..OPEN_CONTENTS, OPEN_CONTENTS..CONTENTS);
-        let mut out = vec![
-            part("content_open", &self.content, open.clone()),
-            part("content_decided", &self.content, decided.clone()),
-            part("content_no_forced", &self.content, NO_FORCED..NO_FORCED + 1),
-        ];
+        let mut out = match &self.content_factors {
+            None => vec![
+                part("content_open", &self.content, open.clone()),
+                part("content_decided", &self.content, decided.clone()),
+                part("content_no_forced", &self.content, NO_FORCED..NO_FORCED + 1),
+            ],
+            // The tensors as they are, the embedding's rows cut by kind.
+            Some(f) => {
+                let rest = |name: &str, rows: Range<usize>| {
+                    part(name, &f.rest, rows.start - OPEN_CONTENTS..rows.end - OPEN_CONTENTS)
+                };
+                let mut out = vec![
+                    m("content_low", &f.low),
+                    m("content_proj", &f.proj),
+                    rest("content_decided", decided.clone()),
+                    rest("content_no_forced", NO_FORCED..NO_FORCED + 1),
+                    rest("content_cells", CELL_BASE..CELL_PAD),
+                    rest("content_pad", CELL_PAD..CELL_PAD + 1),
+                ];
+                out.extend(f.lines.as_ref().map(|l| m("content_lines", l)));
+                out
+            }
+        };
         for (k, w) in self.mix.iter().enumerate() {
             out.extend(pieces(&format!("mix{k}"), w));
         }
@@ -527,7 +639,14 @@ impl Weights {
     /// Every buffer [`Weights::arrays`] reads, in its order: the arrays are these buffers cut
     /// into consecutive pieces.
     pub(super) fn buffers_mut(&mut self) -> Vec<&mut Vec<f32>> {
-        let mut out = vec![&mut self.content.data];
+        let mut out = match &mut self.content_factors {
+            None => vec![&mut self.content.data],
+            Some(f) => {
+                let mut out = vec![&mut f.low.data, &mut f.proj.data, &mut f.rest.data];
+                out.extend(f.lines.as_mut().map(|l| &mut l.data));
+                out
+            }
+        };
         out.extend(self.mix.iter_mut().map(|m| &mut m.data));
         out.extend([
             &mut self.mix_bias,
@@ -550,6 +669,68 @@ impl Weights {
             out.extend([&mut g.weight.data, &mut g.bias]);
         }
         out
+    }
+}
+
+impl Weights {
+    /// Writes the per-content tables, the feature rows and the first layer these weights hold
+    /// back into a model's parameters, the inverse of how they were read from it: after the
+    /// export's quantisation round trip ([`Weights::dequantised`]) the model computes with what
+    /// the export ships. Whole tokens go into the content rows, with the cell, padding and
+    /// line rows zeroed, which computes the same; a low-rank table's tensors go back as they
+    /// are. The trunk and the heads keep the model's own values.
+    pub fn write_tables(&self, t: TablesMut<'_>) {
+        let device = t.content.weight.device();
+        let tensor = |m: &Matrix| {
+            Tensor::<2>::from_data(TensorData::new(m.data.clone(), [m.rows, m.cols]), &device)
+        };
+        fn set<const D: usize>(p: &mut burn::module::Param<Tensor<D>>, v: Tensor<D>) {
+            *p = p.clone().map(move |_| v);
+        }
+        match (&self.content_factors, t.content_low) {
+            (None, None) => {
+                let [rows, d] = t.content.weight.dims();
+                let zeros = Tensor::<2>::zeros([rows - (CONTENTS + 1), d], &device);
+                set(
+                    &mut t.content.weight,
+                    Tensor::cat(vec![tensor(&self.content), zeros], 0),
+                );
+                if let Some(lines) = t.lines {
+                    let dims = lines.weight.dims();
+                    set(&mut lines.weight, Tensor::zeros(dims, &device));
+                }
+            }
+            (Some(f), Some(low)) => {
+                set(&mut low.low.weight, tensor(&f.low));
+                set(&mut low.proj.weight, tensor(&f.proj));
+                set(&mut t.content.weight, tensor(&f.rest));
+                if let (Some(lines), Some(rows)) = (t.lines, &f.lines) {
+                    set(&mut lines.weight, tensor(rows));
+                }
+            }
+            _ => panic!("the weights' content table and the model's differ in kind"),
+        }
+        let mix: Vec<Tensor<2>> = self.mix.iter().map(|m| tensor(&m.transposed())).collect();
+        set(&mut t.mix.weight, Tensor::cat(mix, 0));
+        if let Some(bias) = &mut t.mix.bias {
+            let b = Tensor::<1>::from_data(
+                TensorData::new(self.mix_bias.clone(), [self.mix_bias.len()]),
+                &device,
+            );
+            set(bias, b);
+        }
+        set(&mut t.forced_mix.weight, tensor(&self.forced.transposed()));
+        set(&mut t.features.weight, tensor(&self.features));
+        set(&mut t.local_policy.weight, tensor(&self.local));
+        let send = Matrix::new(self.send.len(), 1, self.send.clone());
+        set(&mut t.send_policy.weight, tensor(&send));
+    }
+
+    /// Whether [`Weights::write_tables`] writes array `name` back.
+    pub fn is_table(name: &str) -> bool {
+        ["content", "mix", "forced", "features", "local", "send"]
+            .iter()
+            .any(|p| name.starts_with(p))
     }
 }
 
