@@ -370,6 +370,18 @@ impl AnyModel {
         with_model!(self, |m| super::train::evaluate(m, device, samples))
     }
 
+    /// How far the model is from respecting the board's symmetries over `samples` (see
+    /// [`super::train::evaluate_symmetries`]).
+    pub fn evaluate_symmetries(
+        &self,
+        device: &Device,
+        samples: &[super::train::Sample],
+    ) -> super::train::SymmetryEvaluation {
+        with_model!(self, |m| super::train::evaluate_symmetries(
+            m, device, samples
+        ))
+    }
+
     pub fn predict_host(&self, states: &[BitState], device: &Device) -> HostPrediction {
         with_model!(self, |m| predict_host(m, states, device))
     }

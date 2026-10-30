@@ -1103,56 +1103,202 @@ fn best_validation_epoch(artifact_dir: &std::path::Path, epochs: usize) -> Optio
 
 /// Evaluates `model` over `samples`; zeros if there are none.
 pub fn evaluate<M: Model>(model: &M, device: &Device, samples: &[Sample]) -> Evaluation {
-    if samples.is_empty() {
-        return Evaluation::default();
-    }
-    let mut verdict_hits = 0usize;
-    let mut verdict_total = 0usize;
-    let mut policy_hits = 0usize;
-    let mut value_err = 0.0f64;
-    let (mut wdl_loss, mut policy_loss, mut policy_entropy) = (0.0f64, 0.0f64, 0.0f64);
+    let mut sums = EvalSums::default();
     let mut states = Vec::new();
     for chunk in samples.chunks(1024) {
         states.clear();
         states.extend(chunk.iter().map(|s| s.state));
         let prediction = predict_host(model, &states, device);
-        let best_moves = prediction.best_moves();
         for (i, s) in chunk.iter().enumerate() {
-            let p = &prediction.wdl[i];
-            if let Some(target) = s.verdict() {
-                verdict_total += 1;
-                verdict_hits += usize::from(most_likely(p) == target);
-            }
-            if let Some(target) = &s.wdl {
-                wdl_loss += f64::from(cross_entropy(target, p));
-            }
-            policy_hits += usize::from(best_moves[i] == s.best_move());
-            value_err += (expected_value(p) - s.value_target()).powi(2) as f64;
-            policy_entropy += target_entropy(&s.policy);
-            let moves = &prediction.policy[i];
-            policy_loss -= s
-                .policy
-                .iter()
-                .map(|&(mv, t)| {
-                    let q = moves.iter().find(|m| m.0 == mv).map_or(0.0, |m| m.1);
-                    f64::from(t) * f64::from(q.max(1e-12)).ln()
-                })
-                .sum::<f64>();
+            sums.add(s, &prediction.wdl[i], &prediction.policy[i]);
         }
     }
-    let n = samples.len();
-    Evaluation {
-        verdict_accuracy: if verdict_total == 0 {
-            0.0
-        } else {
-            verdict_hits as f32 / verdict_total as f32
-        },
-        value_mse: (value_err / n as f64) as f32,
-        policy_accuracy: policy_hits as f32 / n as f32,
-        wdl_loss: (wdl_loss / verdict_total.max(1) as f64) as f32,
-        policy_loss: (policy_loss / n as f64) as f32,
-        policy_entropy: (policy_entropy / n as f64) as f32,
+    sums.finish()
+}
+
+/// The sums behind an [`Evaluation`], one prediction at a time.
+#[derive(Default)]
+struct EvalSums {
+    n: usize,
+    verdict_hits: usize,
+    verdict_total: usize,
+    policy_hits: usize,
+    value_err: f64,
+    wdl_loss: f64,
+    policy_loss: f64,
+    policy_entropy: f64,
+}
+
+impl EvalSums {
+    /// Adds a prediction for `s`: win/draw/loss probabilities and the legal moves'.
+    fn add(&mut self, s: &Sample, p: &[f32; 3], moves: &[(Move, f32)]) {
+        self.n += 1;
+        if let Some(target) = s.verdict() {
+            self.verdict_total += 1;
+            self.verdict_hits += usize::from(most_likely(p) == target);
+        }
+        if let Some(target) = &s.wdl {
+            self.wdl_loss += f64::from(cross_entropy(target, p));
+        }
+        let best = moves
+            .iter()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(mv, _)| *mv)
+            .expect("at least one legal move");
+        self.policy_hits += usize::from(best == s.best_move());
+        self.value_err += (expected_value(p) - s.value_target()).powi(2) as f64;
+        self.policy_entropy += target_entropy(&s.policy);
+        self.policy_loss -= s
+            .policy
+            .iter()
+            .map(|&(mv, t)| {
+                let q = moves.iter().find(|m| m.0 == mv).map_or(0.0, |m| m.1);
+                f64::from(t) * f64::from(q.max(1e-12)).ln()
+            })
+            .sum::<f64>();
     }
+
+    fn finish(&self) -> Evaluation {
+        if self.n == 0 {
+            return Evaluation::default();
+        }
+        let n = self.n as f64;
+        Evaluation {
+            verdict_accuracy: if self.verdict_total == 0 {
+                0.0
+            } else {
+                self.verdict_hits as f32 / self.verdict_total as f32
+            },
+            value_mse: (self.value_err / n) as f32,
+            policy_accuracy: (self.policy_hits as f64 / n) as f32,
+            wdl_loss: (self.wdl_loss / self.verdict_total.max(1) as f64) as f32,
+            policy_loss: (self.policy_loss / n) as f32,
+            policy_entropy: (self.policy_entropy / n) as f32,
+        }
+    }
+}
+
+/// How far a model is from respecting the board's eight symmetries, over `samples`: the model
+/// run on every symmetric image of each position, its outputs mapped back.
+#[derive(Clone, Debug, Default)]
+pub struct SymmetryEvaluation {
+    /// Each image evaluated on its own, averaged over the eight.
+    pub each: Evaluation,
+    /// The eight images' probabilities averaged.
+    pub mean_probabilities: Evaluation,
+    /// The eight images' log-probabilities averaged (and renormalised): their logits averaged.
+    pub mean_logits: Evaluation,
+    /// Largest and RMS deviation of an image's outputs from the eight's mean probabilities:
+    /// win/draw/loss probabilities, value, legal move probabilities.
+    pub largest: [f32; 3],
+    pub rms: [f32; 3],
+}
+
+/// The model's [`SymmetryEvaluation`] over `samples`.
+pub fn evaluate_symmetries<M: Model>(
+    model: &M,
+    device: &Device,
+    samples: &[Sample],
+) -> SymmetryEvaluation {
+    let (mut each, mut mean_p, mut mean_log) =
+        (EvalSums::default(), EvalSums::default(), EvalSums::default());
+    let mut largest = [0f32; 3];
+    let mut squares = [(0f64, 0usize); 3];
+    let mut deviate = |k: usize, d: f32| {
+        largest[k] = largest[k].max(d.abs());
+        squares[k].0 += f64::from(d) * f64::from(d);
+        squares[k].1 += 1;
+    };
+    for chunk in samples.chunks(1024) {
+        let predictions: Vec<_> = Symmetry::ALL
+            .iter()
+            .map(|&g| {
+                let states: Vec<BitState> = chunk.iter().map(|s| s.state.transform(g)).collect();
+                predict_host(model, &states, device)
+            })
+            .collect();
+        for (i, s) in chunk.iter().enumerate() {
+            // Each image's outputs in the position's own frame, the moves in index order so
+            // that the images line up.
+            let images: Vec<([f32; 3], Vec<(Move, f32)>)> = Symmetry::ALL
+                .iter()
+                .zip(&predictions)
+                .map(|(&g, p)| {
+                    let back = g.inverse();
+                    let mut moves: Vec<(Move, f32)> = p.policy[i]
+                        .iter()
+                        .map(|&(mv, q)| (back.apply_move(mv), q))
+                        .collect();
+                    moves.sort_by_key(|m| m.0.index());
+                    (p.wdl[i], moves)
+                })
+                .collect();
+            for (wdl, moves) in &images {
+                each.add(s, wdl, moves);
+            }
+            let k = images.len() as f32;
+            let mut wdl = [0f32; 3];
+            let mut log_wdl = [0f32; 3];
+            for (w, _) in &images {
+                for c in 0..3 {
+                    wdl[c] += w[c] / k;
+                    log_wdl[c] += w[c].max(1e-12).ln() / k;
+                }
+            }
+            let (moves0, n_moves) = (&images[0].1, images[0].1.len());
+            let mut moves: Vec<(Move, f32)> = moves0.iter().map(|&(mv, _)| (mv, 0.0)).collect();
+            let mut log_moves = moves.clone();
+            for (_, m) in &images {
+                debug_assert_eq!(m.len(), n_moves);
+                for j in 0..n_moves {
+                    debug_assert_eq!(m[j].0, moves[j].0);
+                    moves[j].1 += m[j].1 / k;
+                    log_moves[j].1 += m[j].1.max(1e-12).ln() / k;
+                }
+            }
+            mean_p.add(s, &wdl, &moves);
+            mean_log.add(s, &normalised_exp(log_wdl), &normalised_exp_moves(log_moves));
+            let value = expected_value(&wdl);
+            for (w, m) in &images {
+                for c in 0..3 {
+                    deviate(0, w[c] - wdl[c]);
+                }
+                deviate(1, expected_value(w) - value);
+                for (a, b) in m.iter().zip(&moves) {
+                    deviate(2, a.1 - b.1);
+                }
+            }
+        }
+    }
+    let rms = |(sum, n): (f64, usize)| (sum / n.max(1) as f64).sqrt() as f32;
+    SymmetryEvaluation {
+        each: each.finish(),
+        mean_probabilities: mean_p.finish(),
+        mean_logits: mean_log.finish(),
+        largest,
+        rms: squares.map(rms),
+    }
+}
+
+/// Probabilities from log-probabilities that need renormalising.
+fn normalised_exp(logs: [f32; 3]) -> [f32; 3] {
+    let top = logs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let e = logs.map(|l| (l - top).exp());
+    let total: f32 = e.iter().sum();
+    e.map(|x| x / total)
+}
+
+fn normalised_exp_moves(mut moves: Vec<(Move, f32)>) -> Vec<(Move, f32)> {
+    let top = moves.iter().map(|m| m.1).fold(f32::NEG_INFINITY, f32::max);
+    let mut total = 0.0;
+    for m in &mut moves {
+        m.1 = (m.1 - top).exp();
+        total += m.1;
+    }
+    for m in &mut moves {
+        m.1 /= total;
+    }
+    moves
 }
 
 /// `-sum p ln p` of a move distribution.

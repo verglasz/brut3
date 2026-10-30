@@ -57,6 +57,7 @@ pub use train::{
     Dataset,
     Evaluation,
     Sample,
+    SymmetryEvaluation,
     TrainOptions,
     TrainReport,
     generate,

@@ -69,6 +69,11 @@ enum Command {
         /// low-rank one could keep without retraining.
         #[arg(long, value_delimiter = ',')]
         content_rank: Vec<usize>,
+        /// Also run each model on the eight symmetric images of every position and report how
+        /// far their outputs differ, the images evaluated one by one, and their outputs averaged
+        /// (probabilities, and log-probabilities: logits). Eight times the work.
+        #[arg(long)]
+        symmetries: bool,
         /// Model stems (`<stem>.bpk` + `<stem>.json`).
         #[arg(required = true, num_args = 1..)]
         models: Vec<std::path::PathBuf>,
@@ -680,6 +685,7 @@ fn main() -> ExitCode {
             backend,
             int8_only,
             content_rank,
+            symmetries,
             models,
         } => evaluate_models(
             &data,
@@ -688,6 +694,7 @@ fn main() -> ExitCode {
             backend.as_deref(),
             &brut3::nn::export::Int8Arrays(int8_only),
             &content_rank,
+            symmetries,
             &models,
         ),
         #[cfg(feature = "nn")]
@@ -1398,6 +1405,7 @@ fn evaluate_models(
     backend: Option<&str>,
     int8: &brut3::nn::export::Int8Arrays,
     content_ranks: &[usize],
+    symmetries: bool,
     models: &[std::path::PathBuf],
 ) -> Result<(), String> {
     use brut3::nn::{AnyModel, BackendKind};
@@ -1454,6 +1462,18 @@ fn evaluate_models(
             &model.evaluate(&device, &valid.samples),
             &path.display().to_string(),
         );
+        if symmetries {
+            let name = path.display();
+            let e = model.evaluate_symmetries(&device, &valid.samples);
+            row(&e.each, &format!("{name} (each of the 8 symmetries)"));
+            row(&e.mean_probabilities, &format!("{name} (8 symmetries, probabilities averaged)"));
+            row(&e.mean_logits, &format!("{name} (8 symmetries, logits averaged)"));
+            println!(
+                "    an image's deviation from the 8's mean (largest / rms): wdl {:.2e} / {:.2e}, \
+                 value {:.2e} / {:.2e}, policy {:.2e} / {:.2e}",
+                e.largest[0], e.rms[0], e.largest[1], e.rms[1], e.largest[2], e.rms[2]
+            );
+        }
         for &rank in content_ranks {
             let mut truncated = AnyModel::load(path, &device)?;
             truncated.set_qat(int8);
