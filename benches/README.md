@@ -11,7 +11,8 @@ benches/run.sh [FILTER...]
 runs `micro.rs` and writes its output to `results/micro-<date>-<commit>[-dirty].txt`, so runs
 at different commits can be diffed. A filter keeps the benchmarks whose name contains it
 (`benches/run.sh mcts/ pick/`); filtered runs go to a file named after the filters too, so they
-do not replace a full run. `cargo bench --features full --bench micro [-- FILTER...]` runs
+do not replace a full run. Without filters everything runs but the `deep/` benchmarks, which
+take seconds and run only when a filter names them (`benches/run.sh deep/`). `cargo bench --features full --bench micro [-- FILTER...]` runs
 the same thing without saving it.
 
 ## How it measures
@@ -43,6 +44,7 @@ the same thing without saving it.
 | `mcts/search 1k ..., reset tree` | the 1k search in one tree reset between searches, as a game's moves reuse it |
 | `mcts/game 256 per move` | whole games from 2 roots, 256 simulations per move in one reset tree, per simulation run |
 | `mem/search`, `mem/game` | not timed: bytes per simulation of the nodes and edges in use and allocated, after the 1k and 10k searches and at the largest allocation over the games' searches |
+| `deep/...` | only when named (`benches/run.sh deep/`), seconds rather than milliseconds: a 100k-simulation search, games at 4096 simulations per move, and the 100k tree's bytes per simulation |
 | `mcts/dirichlet` | root noise for 81 moves |
 | `nn/encode_into`, `nn/nnue_ids`, `nn/folded_ids` | network inputs for one position (with the `nn` feature); `folded_ids` is the folded NNUE's 21 table rows |
 

@@ -75,8 +75,13 @@ impl Harness {
         );
     }
 
+    /// Whether a filter names `name`; with none, every benchmark but the `deep/` ones, which
+    /// run only when a filter names them.
     fn selects(&self, name: &str) -> bool {
-        self.filters.is_empty() || self.filters.iter().any(|w| name.contains(w.as_str()))
+        if self.filters.is_empty() {
+            return !name.starts_with("deep/");
+        }
+        self.filters.iter().any(|w| name.contains(w.as_str()))
     }
 
     /// Prints a measurement that is not a time (`text`, computed only if `name` is selected).
@@ -360,6 +365,7 @@ fn main() {
         |s| game(s, GAME_SIMULATIONS, 16, Some(&row), &mut states, &mut evals, |_| {}).1,
     );
     tree_memory(&h, roots, &row);
+    deep_trees(&h, roots, &row);
 
     let alphas = [0.3f32; 64];
     let mut noise_rng = SmallRng::seed_from_u64(5);
@@ -429,6 +435,41 @@ fn tree_memory(h: &Harness, roots: &[BitState], row: &[f32; Move::COUNT]) {
             );
         }
         per_sim(&peak, u64::from(GAME_SIMULATIONS))
+    });
+}
+
+/// Large trees, out of cache, and games at match strength: seconds rather than milliseconds,
+/// so they run only when named (`benches/run.sh deep/`).
+fn deep_trees(h: &Harness, roots: &[BitState], row: &[f32; Move::COUNT]) {
+    let (mut states, mut evals) = (Vec::new(), Evaluations::default());
+    const DEEP: u32 = 100_000;
+    h.bench(
+        "deep/search 100k per sim, prior rows, batch 16",
+        u64::from(DEEP),
+        &roots[..2],
+        |s| search(s, DEEP, 16, Some(row), &mut states, &mut evals),
+    );
+    let game_roots = &roots[..2];
+    let sims: u64 = game_roots
+        .iter()
+        .map(|s| game(s, 4096, 16, Some(row), &mut states, &mut evals, |_| {}).0)
+        .sum();
+    h.bench(
+        "deep/game 4096 per move, per sim, batch 16",
+        sims / game_roots.len() as u64,
+        game_roots,
+        |s| game(s, 4096, 16, Some(row), &mut states, &mut evals, |_| {}).1,
+    );
+    h.report("deep/mem search 100k", || {
+        let mut tree = SearchTree::new(roots[0], DEEP, 1.4, 1.0);
+        drive(&mut tree, 16, Some(row), &mut states, &mut evals);
+        let f = tree.footprint();
+        let sims = f64::from(tree.completed());
+        format!(
+            "{:>7.1} B/sim used  {:>7.1} B/sim allocated",
+            f.bytes() as f64 / sims,
+            f.allocated() as f64 / sims
+        )
     });
 }
 
