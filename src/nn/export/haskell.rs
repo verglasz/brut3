@@ -175,32 +175,12 @@ pub fn write_all(
         emit("SelfTest", codegen::selftest_module(&names, &opts.prefix))?;
         report.stream_bytes = stream_bytes;
         report.chunks = chunks;
-        // Sums of squared deviations and their counts, for the root mean squares.
-        let mut squares = [(0.0f64, 0usize); 3];
-        let mut add = |k: usize, d: f32| {
-            squares[k].0 += f64::from(d) * f64::from(d);
-            squares[k].1 += 1;
-        };
         let measured = error_positions(opts.seed, opts.error_positions);
+        let d = deviations(weights, &rounded, &measured);
         report.error_positions = measured.len();
-        for state in &measured {
-            let exact = weights.evaluate(state);
-            let other = rounded.evaluate(state);
-            for (a, b) in exact.wdl.iter().zip(&other.wdl) {
-                report.wdl_error = report.wdl_error.max((a - b).abs());
-                add(0, a - b);
-            }
-            let value = exact.value() - other.value();
-            report.value_error = report.value_error.max(value.abs());
-            add(1, value);
-            for (a, b) in exact.policy.iter().zip(&other.policy) {
-                report.policy_error = report.policy_error.max((a.2 - b.2).abs());
-                add(2, a.2 - b.2);
-            }
-        }
-        let rms = |(sum, n): (f64, usize)| (sum / n.max(1) as f64).sqrt() as f32;
-        (report.wdl_rms, report.value_rms, report.policy_rms) =
-            (rms(squares[0]), rms(squares[1]), rms(squares[2]));
+        (report.wdl_error, report.value_error, report.policy_error) =
+            (d.largest[0], d.largest[1], d.largest[2]);
+        (report.wdl_rms, report.value_rms, report.policy_rms) = (d.rms[0], d.rms[1], d.rms[2]);
     }
     // FixedVec: the network's shapes, plus the extra ones for hand-written code.
     let vec_spec = match (weights, &opts.vec_extra) {
@@ -560,6 +540,42 @@ pub fn spec_module(weights: &Weights, prefix: &str) -> String {
     let _ = writeln!(s, "foldedMacs = {}", weights.folded_macs());
     bundle_body_end(&mut s);
     s
+}
+
+/// How far one network's outputs are from another's: per win/draw/loss probability, position
+/// value (`p_win - p_loss`) and legal move probability, the largest deviation and the root mean
+/// square, in that order.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Deviations {
+    pub largest: [f32; 3],
+    pub rms: [f32; 3],
+}
+
+/// The [`Deviations`] of `b`'s outputs from `a`'s over `positions`, each network evaluated by
+/// the scalar evaluator.
+pub fn deviations(a: &Weights, b: &Weights, positions: &[BitState]) -> Deviations {
+    let mut largest = [0.0f32; 3];
+    let mut squares = [(0.0f64, 0usize); 3];
+    let mut add = |k: usize, d: f32| {
+        largest[k] = largest[k].max(d.abs());
+        squares[k].0 += f64::from(d) * f64::from(d);
+        squares[k].1 += 1;
+    };
+    for state in positions {
+        let (x, y) = (a.evaluate(state), b.evaluate(state));
+        for (p, q) in x.wdl.iter().zip(&y.wdl) {
+            add(0, p - q);
+        }
+        add(1, x.value() - y.value());
+        for (p, q) in x.policy.iter().zip(&y.policy) {
+            add(2, p.2 - q.2);
+        }
+    }
+    let rms = |(sum, n): (f64, usize)| (sum / n.max(1) as f64).sqrt() as f32;
+    Deviations {
+        largest,
+        rms: squares.map(rms),
+    }
 }
 
 /// `n` positions for measuring the quantisation error: one every few plies (from the fourth)

@@ -21,7 +21,7 @@ pub mod scalar;
 pub mod vecgen;
 pub mod weights;
 
-pub use haskell::{ExportOptions, write_all};
+pub use haskell::{Deviations, ExportOptions, deviations, error_positions, write_all};
 pub use quant::Int8Arrays;
 pub use scalar::Evaluation;
 pub use vecgen::VecSpec;

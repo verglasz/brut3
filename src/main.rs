@@ -68,6 +68,31 @@ enum Command {
         #[arg(required = true, num_args = 1..)]
         models: Vec<std::path::PathBuf>,
     },
+    /// How far a model's outputs are from a reference model's, over positions from seeded
+    /// random games: e.g. a fine-tuned model with its tables on the int8 grid, as it would be
+    /// exported, against the float model it came from. Prints the largest and the RMS
+    /// deviation of the win/draw/loss and legal move probabilities and of the value.
+    #[cfg(feature = "nn")]
+    Compare {
+        /// The reference model's stem, evaluated as float.
+        reference: std::path::PathBuf,
+        /// The compared model's stem.
+        model: std::path::PathBuf,
+        /// Evaluate the compared model with the tables whose export arrays start with one of
+        /// these prefixes on the int8 grid, rounded to nearest (as `export --int8-only ...
+        /// --nearest-rounding` ships them).
+        #[arg(long, value_delimiter = ',')]
+        int8_only: Vec<String>,
+        /// Positions to compare over.
+        #[arg(long, default_value_t = 1024)]
+        positions: usize,
+        /// Seed of the random games the positions come from.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Backend to load the models with (default: fastest compiled in).
+        #[arg(long)]
+        backend: Option<String>,
+    },
     /// Convert the uttt.ai text datasets (stage1-mcts, stage2-nmcts) into a games file for
     /// `train --data`: e.g. `import-utttai --out datasets/stage1.games datasets/stage1-mcts`.
     #[cfg(feature = "nn")]
@@ -626,6 +651,22 @@ fn main() -> ExitCode {
         Command::BookStats { book } => book_stats(&book),
         #[cfg(feature = "nn")]
         Command::ImportUtttai { paths, out } => import_utttai(&paths, &out),
+        #[cfg(feature = "nn")]
+        Command::Compare {
+            reference,
+            model,
+            int8_only,
+            positions,
+            seed,
+            backend,
+        } => compare_models(
+            &reference,
+            &model,
+            &brut3::nn::export::Int8Arrays(int8_only),
+            positions,
+            seed,
+            backend.as_deref(),
+        ),
         #[cfg(feature = "nn")]
         Command::Evaluate {
             data,
@@ -1296,6 +1337,50 @@ fn play(spec: &[String]) -> Result<(), String> {
     };
     let stdin = io::stdin();
     repl::run(stdin.lock(), io::stdout().lock(), spec).map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "nn")]
+fn compare_models(
+    reference: &std::path::Path,
+    model: &std::path::Path,
+    int8: &brut3::nn::export::Int8Arrays,
+    positions: usize,
+    seed: u64,
+    backend: Option<&str>,
+) -> Result<(), String> {
+    use brut3::nn::export::{Weights, deviations, error_positions};
+    use brut3::nn::{AnyModel, BackendKind};
+
+    let backend = match backend {
+        Some(name) => name.parse::<BackendKind>()?,
+        None => BackendKind::preferred(),
+    };
+    let load = |path: &std::path::Path| {
+        Weights::from_any(&AnyModel::load(path, &backend.device())?)
+            .map_err(|e| format!("{} is {e}", path.display()))
+    };
+    let a = load(reference)?;
+    let b = load(model)?.dequantised(int8, false);
+    let states = error_positions(seed, positions);
+    let d = deviations(&a, &b, &states);
+    println!(
+        "{} vs {}{}, over {} positions (largest / rms): wdl {:.2e} / {:.2e}, value {:.2e} / {:.2e}, policy {:.2e} / {:.2e}",
+        model.display(),
+        reference.display(),
+        if int8.0.is_empty() {
+            String::new()
+        } else {
+            format!(" (tables {} int8)", int8.0.join(","))
+        },
+        states.len(),
+        d.largest[0],
+        d.rms[0],
+        d.largest[1],
+        d.rms[1],
+        d.largest[2],
+        d.rms[2]
+    );
+    Ok(())
 }
 
 #[cfg(feature = "nn")]
