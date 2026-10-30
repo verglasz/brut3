@@ -510,19 +510,9 @@ impl Weights {
         out.push(v("policy_bias", &self.policy.bias));
         out.push(part("local_open", &self.local, open.clone()));
         out.push(part("local_decided", &self.local, decided.clone()));
-        // One value per content: a column, not a row.
-        out.push(Array {
-            name: "send_open".into(),
-            rows: open.len(),
-            cols: 1,
-            data: &self.send[open],
-        });
-        out.push(Array {
-            name: "send_decided".into(),
-            rows: decided.len(),
-            cols: 1,
-            data: &self.send[decided],
-        });
+        // One value per content, shipped as one row (so int8 gives it one scale).
+        out.push(v("send_open", &self.send[open]));
+        out.push(v("send_decided", &self.send[decided]));
         if let Some(g) = &self.gates {
             out.push(m("gates", &g.weight));
             out.push(v("gates_bias", &g.bias));

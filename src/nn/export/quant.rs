@@ -1,12 +1,11 @@
 //! Quantisation of the weights and their base64 text for `Gen/Weights.hs`.
 //!
 //! Every array of [`Weights::arrays`] is shipped on its own, row-major, base64-encoded with
-//! the standard alphabet and padding, in one of two formats (see [`Format`]):
+//! the standard alphabet and padding, in one of two formats for the whole export:
 //! - int16: little-endian `Int16` values with one scale for the array, `max |w| / 32767`;
-//! - int8, with `--int8`, for the matrices and tables ([`Format::of`]): one signed byte per
-//!   value, each row with its own scale, `max |row| / 127` (rounded up, so that no value
-//!   overflows), the scales shipped as an int16 array `<name>_scales` right after it. Half the
-//!   text of int16, and per-row scales keep the rows of small values precise.
+//! - int8 (`--int8`, see [`quantise_int8`]): each row an exponent byte then its values as signed
+//!   bytes, the row's scale the array's base scale (`max |w| / 127`) times `2^(-e / 8)`.
+//!   About half the text of int16, and every row keeps its own precision.
 
 use super::weights::{Array, Weights};
 
@@ -34,64 +33,47 @@ fn dequantise(data: &[f32]) -> Vec<f32> {
     q.values.iter().map(|&v| v as f32 * q.scale).collect()
 }
 
-/// How an array ships.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Format {
-    Int16,
-    /// Signed bytes with a scale per row.
-    Int8Rows,
-}
+/// The int8 rows' scales step by this factor's inverse: `2^(1/8)`, about 9%.
+pub const INT8_STEPS_PER_OCTAVE: f32 = 8.0;
 
-impl Format {
-    /// The format of an array of `rows x cols` values: with `int8`, int8 for matrices and
-    /// tables (more than one row, at least eight values a row), int16 for biases and columns,
-    /// where per-row scales would cost as much as they save.
-    pub fn of(rows: usize, cols: usize, int8: bool) -> Format {
-        match int8 && rows > 1 && cols >= 8 {
-            true => Format::Int8Rows,
-            false => Format::Int16,
+/// Int8 quantisation of `rows` rows of `cols` values: the bytes as shipped (each row its
+/// exponent byte `e`, then its values as signed bytes), the base scale, and the values as the
+/// decoder gets them back. Row `r`'s scale is `base * 2^(-e / 8)` with the largest `e` whose
+/// scale still covers the row's largest value in 127 steps (so at least about 116 are used),
+/// and `e = 255` for a row of zeros.
+pub fn quantise_int8(data: &[f32], cols: usize) -> (Vec<u8>, f32, Vec<f32>) {
+    let max = data.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+    let base = if max > 0.0 { max / 127.0 } else { 1.0 };
+    let mut bytes = Vec::with_capacity(data.len() + data.len() / cols.max(1));
+    let mut values = Vec::with_capacity(data.len());
+    for row in data.chunks(cols) {
+        let need = row.iter().fold(0.0f32, |m, &x| m.max(x.abs())) / 127.0;
+        let e = if need > 0.0 {
+            ((base / need).log2() * INT8_STEPS_PER_OCTAVE)
+                .floor()
+                .clamp(0.0, 254.0) as u8
+        } else {
+            255
+        };
+        let scale = int8_row_scale(base, e);
+        bytes.push(e);
+        for &x in row {
+            let q = (x / scale).round().clamp(-127.0, 127.0) as i8;
+            bytes.push(q as u8);
+            values.push(f32::from(q) * scale);
         }
     }
+    (bytes, base, values)
 }
 
-/// Int8 quantisation of `rows` rows of `cols` values: the values, each row's scale as
-/// shipped (an int16 array of its own), and that array's quantisation. Each row's scale is
-/// rounded up to the next one the int16 array can hold, so that no value exceeds 127 steps.
-pub fn quantise_rows(data: &[f32], cols: usize) -> (Vec<i8>, Vec<f32>, Quantised) {
-    let raw: Vec<f32> = data
-        .chunks(cols)
-        .map(|row| row.iter().fold(0.0f32, |m, &x| m.max(x.abs())) / 127.0)
-        .collect();
-    let top = raw.iter().fold(0.0f32, |m, &x| m.max(x));
-    let step = if top > 0.0 { top / Q_MAX } else { 1.0 };
-    let scale_values: Vec<i16> = raw
-        .iter()
-        .map(|&s| (s / step).ceil().clamp(0.0, Q_MAX) as i16)
-        .collect();
-    let scales: Vec<f32> = scale_values.iter().map(|&q| q as f32 * step).collect();
-    let values = data
-        .chunks(cols)
-        .zip(&scales)
-        .flat_map(|(row, &s)| {
-            row.iter().map(move |&x| {
-                if s > 0.0 {
-                    (x / s).round().clamp(-127.0, 127.0) as i8
-                } else {
-                    0
-                }
-            })
-        })
-        .collect();
-    let quantised_scales = Quantised {
-        values: scale_values,
-        scale: step,
-    };
-    (values, scales, quantised_scales)
+/// The scale of an int8 row with exponent byte `e`, as the Haskell decoder computes it.
+pub fn int8_row_scale(base: f32, e: u8) -> f32 {
+    base * 2f32.powf(-f32::from(e) / INT8_STEPS_PER_OCTAVE)
 }
 
-/// One array as the Haskell decoder sees it: name, shape, scale, and its values as bytes:
-/// little-endian `Int16`, or for an int8 array signed bytes (its scale then unused, the rows'
-/// scales being the next array).
+/// One array as the Haskell decoder sees it: name, shape, scale, and its bytes: little-endian
+/// `Int16` values, or for int8 each row's exponent byte and values (see [`quantise_int8`]),
+/// `scale` then being the base scale.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuantisedArray {
     pub name: String,
@@ -128,50 +110,42 @@ impl Weights {
         out
     }
 
-    /// The weights after the round trip of the export's quantisation (int8 for the
-    /// matrices and tables with `int8`): what the Haskell evaluator computes with.
+    /// The weights after the round trip of the export's quantisation (int16, or int8 with
+    /// `int8`): what the Haskell evaluator computes with.
     pub fn dequantised(&self, int8: bool) -> Self {
-        self.map_arrays(|a| match Format::of(a.rows, a.cols, int8) {
-            Format::Int16 => dequantise(a.data),
-            Format::Int8Rows => {
-                let (values, scales, _) = quantise_rows(a.data, a.cols);
-                values
-                    .chunks(a.cols)
-                    .zip(&scales)
-                    .flat_map(|(row, &s)| row.iter().map(move |&q| f32::from(q) * s))
-                    .collect()
-            }
+        self.map_arrays(|a| match int8 {
+            true => quantise_int8(a.data, a.cols).2,
+            false => dequantise(a.data),
         })
     }
 
-    /// Every array quantised, in [`Weights::arrays`] order, each int8 array followed by its
-    /// rows' scales.
+    /// Every array quantised, in [`Weights::arrays`] order.
     pub fn quantised(&self, int8: bool) -> Vec<QuantisedArray> {
-        let int16 = |name: String, rows, cols, q: Quantised| QuantisedArray {
-            name,
-            rows,
-            cols,
-            scale: q.scale,
-            bytes: q.values.iter().flat_map(|v| v.to_le_bytes()).collect(),
-        };
-        let mut out = Vec::new();
-        for a in self.arrays() {
-            match Format::of(a.rows, a.cols, int8) {
-                Format::Int16 => out.push(int16(a.name, a.rows, a.cols, quantise(a.data))),
-                Format::Int8Rows => {
-                    let (values, _, scales) = quantise_rows(a.data, a.cols);
-                    out.push(QuantisedArray {
-                        name: a.name.clone(),
-                        rows: a.rows,
-                        cols: a.cols,
-                        scale: 1.0,
-                        bytes: values.iter().map(|&v| v as u8).collect(),
-                    });
-                    out.push(int16(format!("{}_scales", a.name), a.rows, 1, scales));
+        self.arrays()
+            .into_iter()
+            .map(|a| {
+                let (scale, bytes) = match int8 {
+                    true => {
+                        let (bytes, base, _) = quantise_int8(a.data, a.cols);
+                        (base, bytes)
+                    }
+                    false => {
+                        let q = quantise(a.data);
+                        (
+                            q.scale,
+                            q.values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                        )
+                    }
+                };
+                QuantisedArray {
+                    name: a.name,
+                    rows: a.rows,
+                    cols: a.cols,
+                    scale,
+                    bytes,
                 }
-            }
-        }
-        out
+            })
+            .collect()
     }
 }
 
@@ -296,22 +270,25 @@ mod tests {
     #[test]
     fn int8_rows_round_trip_within_their_own_step() {
         // Rows of very different magnitudes keep their own precision.
-        let data = [1.0f32, -0.5, 0.25, 0.0, 0.001, -0.002, 0.0005, 0.0];
-        let (values, scales, shipped) = quantise_rows(&data, 4);
-        assert_eq!(values[0], 127);
-        for (row, (q, &s)) in data.chunks(4).zip(values.chunks(4).zip(&scales)) {
-            assert!(s >= row.iter().fold(0.0f32, |m, &x| m.max(x.abs())) / 127.0);
-            for (&x, &v) in row.iter().zip(q) {
-                assert!(
-                    (x - f32::from(v) * s).abs() <= s / 2.0 + 1e-9,
-                    "{x} vs {v} x {s}"
-                );
+        let data = [
+            1.0f32, -0.5, 0.25, 0.0, 0.001, -0.002, 0.0005, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
+        let (bytes, base, values) = quantise_int8(&data, 4);
+        assert_eq!(bytes.len(), 3 * 5);
+        assert_eq!(base, 1.0 / 127.0);
+        for (r, row) in data.chunks(4).enumerate() {
+            let e = bytes[r * 5];
+            let scale = int8_row_scale(base, e);
+            let need = row.iter().fold(0.0f32, |m, &x| m.max(x.abs())) / 127.0;
+            // The scale covers the row, within one step of 2^(1/8).
+            assert!(scale >= need && (need == 0.0 || scale <= need * 2f32.powf(0.125) * 1.0001));
+            for (c, &x) in row.iter().enumerate() {
+                let q = bytes[r * 5 + 1 + c] as i8;
+                assert_eq!(values[r * 4 + c], f32::from(q) * scale);
+                assert!((x - values[r * 4 + c]).abs() <= scale / 2.0 + 1e-9, "{x}");
             }
         }
-        // The scales are exactly what their int16 array decodes to.
-        for (&s, &q) in scales.iter().zip(&shipped.values) {
-            assert_eq!(s, q as f32 * shipped.scale);
-        }
+        assert_eq!(bytes[10], 255, "a row of zeros");
     }
 
     #[test]

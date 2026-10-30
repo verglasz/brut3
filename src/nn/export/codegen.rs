@@ -13,7 +13,6 @@
 use std::fmt::Write as _;
 
 use super::haskell::{bundle_body_begin, bundle_body_end, bundle_imports};
-use super::quant::Format;
 use super::vecgen::SPARSE_K;
 use super::vecgen::VecSpec;
 use super::weights::{Layer, Weights};
@@ -101,7 +100,7 @@ pub struct Names {
     pub trunk: Vec<Kind>,
     /// Whether the heads are gated.
     pub gated: bool,
-    /// Whether the matrices and tables ship as int8 (see [`Format`]).
+    /// Whether the weights ship as int8 (see [`super::quant::quantise_int8`]).
     pub int8: bool,
 }
 
@@ -249,8 +248,12 @@ pub fn net_module(names: &Names, prefix: &str, manifest_names: &[String]) -> Str
     );
     let _ = writeln!(
         s,
-        "import Decode (chunksOf, {}decodeFloats, decodeRowsWith)",
-        if names.int8 { "decodeBytes, " } else { "" }
+        "import Decode (chunksOf, {})",
+        if names.int8 {
+            "decodeBytes"
+        } else {
+            "decodeFloats, decodeRowsWith"
+        }
     );
     let _ = writeln!(s, "import {prefix}.FixedVec");
     let _ = writeln!(s, "import {prefix}.Weights (Array (..), arrays)");
@@ -510,11 +513,14 @@ data OpenClosed a = OpenClosed
             .position(|n| n == name)
             .unwrap_or_else(|| panic!("{name} array"))
     };
-    // The rows of array `i`, `m` of width `n`, as a list: an int8 array with its scales in
-    // array `i + 1`, or an int16 one.
-    let rows_at = |m: usize, n: usize, i: usize| match Format::of(m, n, names.int8) {
-        Format::Int8Rows => format!("int8Rows {m} {n} fromListRest{n} a{i} a{}", i + 1),
-        Format::Int16 => format!("rows {m} {n} fromListRest{n} a{i}"),
+    // Array `i` as `m` rows of width `n` (a list), or as its `m * n` values.
+    let rows_at = |m: usize, n: usize, i: usize| match names.int8 {
+        true => format!("int8Rows {m} {n} fromListRest{n} a{i}"),
+        false => format!("rows {m} {n} fromListRest{n} a{i}"),
+    };
+    let floats_at = |m: usize, n: usize, i: usize| match names.int8 {
+        true => format!("int8Values {m} {n} a{i}"),
+        false => format!("floats {m} {n} a{i}"),
     };
     let _ = writeln!(
         s,
@@ -526,26 +532,35 @@ data OpenClosed a = OpenClosed
         s,
         "  let shaped r c a = if arrayRows a == r && arrayCols a == c then a else error (\"weights: \" ++ arrayName a ++ \" is not \" ++ show r ++ \"x\" ++ show c)"
     );
-    let _ = writeln!(
-        s,
-        "      rows r c split a = let a' = shaped r c a in decodeRowsWith (arrayName a') r c (arrayScale a') split (arrayText a')"
-    );
-    let _ = writeln!(
-        s,
-        "      floats r c a = let a' = shaped r c a in decodeFloats (arrayName a') (r * c) (arrayScale a') (arrayText a')"
-    );
     if names.int8 {
         let _ = writeln!(
             s,
-            "      -- Signed bytes, each times its row's scale (the next array). The text's pieces are\n\
-             \x20     -- whole groups of four characters, so they decode one by one.\n\
-             \x20     int8Rows r c split a scales =\n\
+            "      -- Each row an exponent byte e, then its values as signed bytes, each worth the\n\
+             \x20     -- array's scale times 2^(-e/8). The text's pieces are whole groups of four characters,\n\
+             \x20     -- so they decode one by one.\n\
+             \x20     int8Values r c a =\n\
              \x20       let a' = shaped r c a\n\
-             \x20           values = [fromIntegral (fromIntegral w :: Int8) | piece <- arrayText a', w <- decodeBytes piece]\n\
-             \x20           go 0 [] = []\n\
-             \x20           go 0 _ = error (\"weights: \" ++ arrayName a' ++ \" has more values than rows * cols\")\n\
+             \x20           bad what = error (\"weights: \" ++ arrayName a' ++ \" has \" ++ what ++ \" values than rows * cols\")\n\
+             \x20           go 0 _ _ [] = []\n\
+             \x20           go 0 _ _ _ = bad \"more\"\n\
+             \x20           go n 0 _ (e : rest) = go n c (arrayScale a' * 2 ** negate (fromIntegral e / 8)) rest\n\
+             \x20           go n k sc (w : rest) =\n\
+             \x20             sc * fromIntegral (fromIntegral w :: Int8) : (if k == 1 then go (n - 1) 0 sc rest else go n (k - 1) sc rest)\n\
+             \x20           go _ _ _ [] = bad \"fewer\"\n\
+             \x20        in go r 0 0 (concatMap decodeBytes (arrayText a'))\n\
+             \x20     int8Rows r c split a =\n\
+             \x20       let go 0 _ = []\n\
              \x20           go n xs = case split xs of (v, rest) -> v `seq` (v : go (n - 1 :: Int) rest)\n\
-             \x20        in go r (zipWith (*) (concatMap (replicate c) (floats r 1 scales)) values)"
+             \x20        in go r (int8Values r c a)"
+        );
+    } else {
+        let _ = writeln!(
+            s,
+            "      rows r c split a = let a' = shaped r c a in decodeRowsWith (arrayName a') r c (arrayScale a') split (arrayText a')"
+        );
+        let _ = writeln!(
+            s,
+            "      floats r c a = let a' = shaped r c a in decodeFloats (arrayName a') (r * c) (arrayScale a') (arrayText a')"
         );
     }
     let _ = writeln!(
@@ -571,7 +586,8 @@ data OpenClosed a = OpenClosed
     );
     let _ = writeln!(
         s,
-        "              policyBiases = map fromList{CELLS} (chunksOf {CELLS} (floats 1 {MOVES} a{policy_bias}))"
+        "              policyBiases = map fromList{CELLS} (chunksOf {CELLS} ({}))",
+        floats_at(1, MOVES, policy_bias)
     );
     if names.gated {
         let (gates, gates_bias) = (position("gates"), position("gates_bias"));
@@ -580,26 +596,21 @@ data OpenClosed a = OpenClosed
             "              (valueGate, localGates, sendGates) = case {} of\n\
              \x20               v : rest | (l, r) <- splitAt {CELLS} rest -> (v, l, r)\n\
              \x20               _ -> error \"net: array gates is not {GATES} rows\"\n\
-             \x20             (valueGateBias, localGatesBias, sendGatesBias) = case floats 1 {GATES} a{gates_bias} of\n\
+             \x20             (valueGateBias, localGatesBias, sendGatesBias) = case {} of\n\
              \x20               v : rest | (l, r) <- splitAt {CELLS} rest -> (v, l, r)\n\
              \x20               _ -> error \"net: array gates_bias is not {GATES} values\"",
-            rows_at(GATES, h, gates)
+            rows_at(GATES, h, gates),
+            floats_at(1, GATES, gates_bias)
         );
     }
     let _ = writeln!(s, "           in Net");
     // Every array decodes straight into its field, in order: `step` counts the arrays taken.
     let step = std::cell::Cell::new(0usize);
     let next = || step.replace(step.get() + 1);
-    // The next array's `m` rows of width `n` as a list (with its scales, if int8).
-    let list = |m: usize, n: usize| {
-        let i = next();
-        if Format::of(m, n, names.int8) == Format::Int8Rows {
-            next();
-        }
-        rows_at(m, n, i)
-    };
+    // The next array's `m` rows of width `n` as a list.
+    let list = |m: usize, n: usize| rows_at(m, n, next());
     let matrix = |m: usize, n: usize| format!("fromListRows{m}_{n} ({})", list(m, n));
-    let vector = |n: usize| format!("fromList{n} (floats 1 {n} a{})", next());
+    let vector = |n: usize| format!("fromList{n} ({})", floats_at(1, n, next()));
     let mut inits = Vec::new();
     let open = list(OPEN_CONTENTS, e);
     let decided = list(CONTENTS - OPEN_CONTENTS, e);
@@ -663,12 +674,9 @@ data OpenClosed a = OpenClosed
     let open = list(OPEN_CONTENTS, CELLS);
     let decided = list(CONTENTS - OPEN_CONTENTS, CELLS);
     inits.push(format!("netLocal = table \"local\" ({open}) ({decided})"));
-    inits.push(format!(
-        "netSend = table \"send\" (floats {OPEN_CONTENTS} 1 a{}) (floats {} 1 a{})",
-        next(),
-        CONTENTS - OPEN_CONTENTS,
-        next()
-    ));
+    let open = floats_at(1, OPEN_CONTENTS, next());
+    let decided = floats_at(1, CONTENTS - OPEN_CONTENTS, next());
+    inits.push(format!("netSend = table \"send\" ({open}) ({decided})"));
     if names.gated {
         // One row (and bias) for the value, then nine per board for each policy table,
         // decoded above.
